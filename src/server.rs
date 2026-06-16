@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -82,7 +82,7 @@ fn parse_error(msg: String) -> JsonRpcResponse {
 
 /// Process one parsed JSON-RPC message. `None` means "no reply" — the message
 /// was a notification (no `id`), per JSON-RPC.
-pub fn process_value(value: Value, kg: &Mutex<KnowledgeGraph>) -> Option<Value> {
+pub fn process_value(value: Value, kg: &RwLock<KnowledgeGraph>) -> Option<Value> {
     let req: JsonRpcRequest = match serde_json::from_value(value) {
         Ok(r) => r,
         Err(e) => return Some(to_value(parse_error(e.to_string()))),
@@ -100,7 +100,7 @@ pub fn process_value(value: Value, kg: &Mutex<KnowledgeGraph>) -> Option<Value> 
 
 /// Dispatch one framed line (stdio / tcp). Returns the serialized response, or
 /// `None` for a notification.
-pub fn dispatch_line(line: &str, kg: &Mutex<KnowledgeGraph>) -> Option<String> {
+pub fn dispatch_line(line: &str, kg: &RwLock<KnowledgeGraph>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Some(serde_json::to_string(&parse_error("Empty request".into())).unwrap());
@@ -117,7 +117,7 @@ pub fn dispatch_line(line: &str, kg: &Mutex<KnowledgeGraph>) -> Option<String> {
 /// 202, empty body); `Err` means the body was not valid JSON.
 pub fn dispatch_http_body(
     body: &str,
-    kg: &Mutex<KnowledgeGraph>,
+    kg: &RwLock<KnowledgeGraph>,
 ) -> std::result::Result<Option<Value>, String> {
     let value: Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
     match value {
@@ -137,7 +137,7 @@ fn to_value(resp: JsonRpcResponse) -> Value {
 
 pub struct MCPServer {
     _config: Arc<Config>,
-    kg: Arc<Mutex<KnowledgeGraph>>,
+    kg: Arc<RwLock<KnowledgeGraph>>,
 }
 
 impl MCPServer {
@@ -148,12 +148,12 @@ impl MCPServer {
 
         Ok(Self {
             _config: Arc::new(config),
-            kg: Arc::new(Mutex::new(kg)),
+            kg: Arc::new(RwLock::new(kg)),
         })
     }
 
     /// Expose the shared graph handle (used to drive the HTTP transport).
-    pub fn graph(&self) -> Arc<Mutex<KnowledgeGraph>> {
+    pub fn graph(&self) -> Arc<RwLock<KnowledgeGraph>> {
         Arc::clone(&self.kg)
     }
 
@@ -193,7 +193,7 @@ impl MCPServer {
 /// Drive one line-framed connection (stdio or a single TCP socket): read
 /// newline-delimited JSON-RPC requests, write newline-delimited responses.
 /// Notifications produce no output. Returns when the peer closes the stream.
-async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: &Mutex<KnowledgeGraph>) -> Result<()>
+async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: &RwLock<KnowledgeGraph>) -> Result<()>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -232,7 +232,7 @@ where
     Ok(())
 }
 
-fn process_request(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+fn process_request(req: &JsonRpcRequest, kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
     match req.method.as_str() {
         "initialize" => handle_initialize(),
         "tools/list" => handle_tools_list(),
@@ -278,7 +278,7 @@ fn handle_tools_list() -> Result<Value> {
     Ok(result)
 }
 
-fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+fn handle_tools_call(req: &JsonRpcRequest, kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
     let tool_name = req
         .params
         .as_ref()
@@ -323,12 +323,12 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn setup_kg() -> (Arc<Mutex<KnowledgeGraph>>, String) {
+    fn setup_kg() -> (Arc<RwLock<KnowledgeGraph>>, String) {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = format!("/tmp/mcp_mem_test_{pid}_{seq}.bin");
         let kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-        (Arc::new(Mutex::new(kg)), path)
+        (Arc::new(RwLock::new(kg)), path)
     }
 
     fn cleanup(path: &str) {

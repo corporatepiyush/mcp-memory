@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use serde_json::{Value, json};
 
@@ -44,12 +44,16 @@ macro_rules! text_content {
     };
 }
 
-fn lock_graph<'a>(kg: &'a Mutex<KnowledgeGraph>) -> Result<std::sync::MutexGuard<'a, KnowledgeGraph>> {
-    kg.lock().map_err(|e| MCSError::MemoryError(e.to_string()))
+fn lock_graph_read<'a>(kg: &'a RwLock<KnowledgeGraph>) -> Result<std::sync::RwLockReadGuard<'a, KnowledgeGraph>> {
+    kg.read().map_err(|e| MCSError::MemoryError(e.to_string()))
 }
 
-pub fn handle_read_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
-    let graph = lock_graph(kg)?;
+fn lock_graph_write<'a>(kg: &'a RwLock<KnowledgeGraph>) -> Result<std::sync::RwLockWriteGuard<'a, KnowledgeGraph>> {
+    kg.write().map_err(|e| MCSError::MemoryError(e.to_string()))
+}
+
+pub fn handle_read_graph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+    let graph = lock_graph_read(kg)?;
     // Fast path: no filters/pagination → the full graph (legacy behavior).
     let params = args.unwrap_or(&Value::Null);
     let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
@@ -66,7 +70,7 @@ pub fn handle_read_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
     Ok(text_content!(text))
 }
 
-pub fn handle_create_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_create_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entities_val = params
         .get("entities")
@@ -93,14 +97,17 @@ pub fn handle_create_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) 
         }
     }
 
-    let mut graph = lock_graph(kg)?;
-    let result = graph.create_entities(&input_entities)?;
-    graph.flush_and_sync()?;
+    let result;
+    {
+        let mut graph = lock_graph_write(kg)?;
+        result = graph.create_entities(&input_entities)?;
+        graph.flush_and_sync()?;
+    }
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_create_relations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_create_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let relations_val = params
         .get("relations")
@@ -120,14 +127,14 @@ pub fn handle_create_relations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>)
         validate_name(&rel.relation_type)?;
     }
 
-    let mut graph = lock_graph(kg)?;
+    let mut graph = lock_graph_write(kg)?;
     let result = graph.create_relations(&input_relations)?;
     graph.flush_and_sync()?;
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_add_observations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_add_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let observations_val = params
         .get("observations")
@@ -136,8 +143,9 @@ pub fn handle_add_observations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>)
     let observations: Vec<Value> = serde_json::from_value(observations_val.clone())
         .map_err(|e| MCSError::InvalidParams(format!("Invalid observations: {e}")))?;
 
-    let mut graph = lock_graph(kg)?;
     let mut results = Vec::new();
+
+    let mut graph = lock_graph_write(kg)?;
 
     for obs in &observations {
         let entity_name = obs
@@ -168,13 +176,12 @@ pub fn handle_add_observations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>)
             "addedObservations": added
         }));
     }
-
     graph.flush_and_sync()?;
     let text = serde_json::to_string(&json!({"results": results})).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_delete_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entity_names: Vec<String> = params
         .get("entityNames")
@@ -182,21 +189,21 @@ pub fn handle_delete_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) 
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .ok_or_else(|| MCSError::InvalidParams("Missing or invalid 'entityNames' parameter".into()))?;
 
-    let mut graph = lock_graph(kg)?;
+    let mut graph = lock_graph_write(kg)?;
     graph.delete_entities(&entity_names)?;
     graph.flush_and_sync()?;
 
     Ok(text_content!("Entities deleted successfully"))
 }
 
-pub fn handle_delete_observations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let deletions = params
         .get("deletions")
         .and_then(|v| v.as_array())
         .ok_or_else(|| MCSError::InvalidParams("Missing or invalid 'deletions' parameter".into()))?;
 
-    let mut graph = lock_graph(kg)?;
+    let mut graph = lock_graph_write(kg)?;
 
     for deletion in deletions {
         let entity_name = deletion
@@ -216,7 +223,7 @@ pub fn handle_delete_observations(kg: &Mutex<KnowledgeGraph>, args: Option<&Valu
     Ok(text_content!("Observations deleted successfully"))
 }
 
-pub fn handle_delete_relations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let relations_val = params
         .get("relations")
@@ -225,14 +232,14 @@ pub fn handle_delete_relations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>)
     let input_relations: Vec<crate::types::Relation> = serde_json::from_value(relations_val.clone())
         .map_err(|e| MCSError::InvalidParams(format!("Invalid relation: {e}")))?;
 
-    let mut graph = lock_graph(kg)?;
+    let mut graph = lock_graph_write(kg)?;
     graph.delete_relations(&input_relations)?;
     graph.flush_and_sync()?;
 
     Ok(text_content!("Relations deleted successfully"))
 }
 
-pub fn handle_search_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_search_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let query = params
         .get("query")
@@ -243,13 +250,13 @@ pub fn handle_search_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> 
     let offset = opt_usize(params, "offset", 0)?;
     let limit = opt_usize(params, "limit", usize::MAX)?;
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let view = graph.search_nodes_view(query, entity_type, offset, limit);
     let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_open_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_open_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let names: Vec<String> = params
         .get("names")
@@ -257,7 +264,7 @@ pub fn handle_open_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .ok_or_else(|| MCSError::InvalidParams("Missing or invalid 'names' parameter".into()))?;
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let view = graph.open_nodes_view(&names);
     let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
@@ -265,14 +272,14 @@ pub fn handle_open_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
 
 // ---------- New extended tools ----------
 
-pub fn handle_get_entity(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_get_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     match graph.get_entity(name) {
         Some(entity) => {
             let text = serde_json::to_string(&entity).map_err(MCSError::JsonError)?;
@@ -282,27 +289,27 @@ pub fn handle_get_entity(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
     }
 }
 
-pub fn handle_graph_stats(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
-    let graph = lock_graph(kg)?;
+pub fn handle_graph_stats(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+    let graph = lock_graph_read(kg)?;
     let stats = graph.graph_stats();
     let text = serde_json::to_string(&stats).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_search_relations(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_search_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.unwrap_or(&serde_json::Value::Null);
 
     let from = params.get("from").and_then(|v| v.as_str());
     let to = params.get("to").and_then(|v| v.as_str());
     let rtype = params.get("relationType").and_then(|v| v.as_str());
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let results = graph.search_relations(from, to, rtype);
     let text = serde_json::to_string(&results).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_find_path(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_find_path(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let from = params
         .get("from")
@@ -313,14 +320,14 @@ pub fn handle_find_path(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Res
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'to' parameter".into()))?;
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let path = graph.find_path(from, to)?;
     let text = serde_json::to_string(&path).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_compact(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
-    let mut graph = lock_graph(kg)?;
+pub fn handle_compact(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+    let mut graph = lock_graph_write(kg)?;
     graph.compact()?;
     graph.flush_and_sync()?;
     Ok(text_content!("Log compacted successfully"))
@@ -339,7 +346,7 @@ fn opt_usize(params: &Value, key: &str, default: usize) -> Result<usize> {
     }
 }
 
-pub fn handle_get_neighbors(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_get_neighbors(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
@@ -356,13 +363,13 @@ pub fn handle_get_neighbors(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) ->
         )));
     }
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let result = graph.neighbors(name, direction, rtype, depth as u32)?;
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_describe_entity(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_describe_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
@@ -370,14 +377,14 @@ pub fn handle_describe_entity(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) 
         .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
     validate_name(name)?;
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let result = graph.describe_entity(name)?;
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_list_entity_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
-    let graph = lock_graph(kg)?;
+pub fn handle_list_entity_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+    let graph = lock_graph_read(kg)?;
     let counts = graph.entity_type_counts();
     let arr: Vec<Value> = counts
         .into_iter()
@@ -387,8 +394,8 @@ pub fn handle_list_entity_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
     Ok(text_content!(text))
 }
 
-pub fn handle_list_relation_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
-    let graph = lock_graph(kg)?;
+pub fn handle_list_relation_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+    let graph = lock_graph_read(kg)?;
     let counts = graph.relation_type_counts();
     let arr: Vec<Value> = counts
         .into_iter()
@@ -398,7 +405,7 @@ pub fn handle_list_relation_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
     Ok(text_content!(text))
 }
 
-pub fn handle_upsert_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_upsert_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entities_val = params
         .get("entities")
@@ -425,20 +432,20 @@ pub fn handle_upsert_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) 
         }
     }
 
-    let mut graph = lock_graph(kg)?;
+    let mut graph = lock_graph_write(kg)?;
     let results = graph.upsert_entities(&input_entities)?;
     graph.flush_and_sync()?;
     let text = serde_json::to_string(&json!({ "results": results })).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_export_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_export_graph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let format = args
         .and_then(|p| p.get("format"))
         .and_then(|v| v.as_str())
         .unwrap_or("json");
 
-    let graph = lock_graph(kg)?;
+    let graph = lock_graph_read(kg)?;
     let text = graph.export(format)?;
     Ok(text_content!(text))
 }

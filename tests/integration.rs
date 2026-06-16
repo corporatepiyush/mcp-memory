@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use mcp_memory::kg::KnowledgeGraph;
 use mcp_memory::types::{Entity, Relation};
@@ -15,9 +15,9 @@ fn setup() -> (KnowledgeGraph, String) {
     (kg, path)
 }
 
-fn setup_mutex() -> (Arc<Mutex<KnowledgeGraph>>, String) {
+fn setup_mutex() -> (Arc<RwLock<KnowledgeGraph>>, String) {
     let (kg, path) = setup();
-    (Arc::new(Mutex::new(kg)), path)
+    (Arc::new(RwLock::new(kg)), path)
 }
 
 fn cleanup(path: &str) {
@@ -1010,7 +1010,7 @@ fn test_concurrent_create_entities() {
                 entity_type: "concurrent".into(),
                 observations: vec![format!("obs_{i}")],
             };
-            let mut guard = kg.lock().unwrap();
+            let mut guard = kg.write().unwrap();
             guard.create_entities(&[entity]).unwrap();
         }));
     }
@@ -1019,7 +1019,7 @@ fn test_concurrent_create_entities() {
         h.join().unwrap();
     }
 
-    let guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read().unwrap();
     let stats = guard.graph_stats();
     assert_eq!(stats["entities"], 10);
     drop(guard);
@@ -1031,7 +1031,7 @@ fn test_concurrent_read_write() {
     let (kg_mutex, path) = setup_mutex();
     // Pre-populate an entity.
     {
-        let mut guard = kg_mutex.lock().unwrap();
+        let mut guard = kg_mutex.write().unwrap();
         guard.create_entities(&[alice()]).unwrap();
     }
 
@@ -1043,7 +1043,7 @@ fn test_concurrent_read_write() {
         let kg = Arc::clone(&kg);
         handles.push(std::thread::spawn(move || {
             for _ in 0..20 {
-                let mut guard = kg.lock().unwrap();
+                let guard = kg.read().unwrap();
                 let _ = guard.get_entity("Alice");
                 let _ = guard.graph_stats();
             }
@@ -1060,7 +1060,7 @@ fn test_concurrent_read_write() {
                     entity_type: "writer".into(),
                     observations: vec![],
                 };
-                let mut guard = kg.lock().unwrap();
+                let mut guard = kg.write().unwrap();
                 guard.create_entities(&[entity]).unwrap();
             }
         }));
@@ -1070,7 +1070,7 @@ fn test_concurrent_read_write() {
         h.join().unwrap();
     }
 
-    let guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read().unwrap();
     let stats = guard.graph_stats();
     // Alice + 5 writers × 10 entities = 51
     assert_eq!(stats["entities"], 51);
@@ -1083,7 +1083,7 @@ fn test_concurrent_relations() {
     let (kg_mutex, path) = setup_mutex();
     // Pre-populate entities.
     {
-        let mut guard = kg_mutex.lock().unwrap();
+        let mut guard = kg_mutex.write().unwrap();
         guard.create_entities(&[alice(), bob(), charlie()]).unwrap();
     }
 
@@ -1098,7 +1098,7 @@ fn test_concurrent_relations() {
             } else {
                 knows_bob()
             };
-            let mut guard = kg.lock().unwrap();
+            let mut guard = kg.write().unwrap();
             let _ = guard.create_relations(&[relation]);
         }));
     }
@@ -1107,7 +1107,7 @@ fn test_concurrent_relations() {
         h.join().unwrap();
     }
 
-    let mut guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read().unwrap();
     // Only 2 unique relations (duplicates are skipped)
     let rels = guard.search_relations(None, None, None);
     assert!(!rels.is_empty());
@@ -1505,4 +1505,136 @@ fn test_compact_rebuild_preserves_state() {
     let reopened = serde_json::to_string(&kg2.read_graph_view()).unwrap();
     assert_eq!(after, reopened);
     cleanup(&path);
+}
+
+// =========================================================================
+// Proof: RwLock readers do not block each other (unlike Mutex)
+// =========================================================================
+
+use std::time::Instant;
+
+/// Prove that concurrent readers finish in parallel rather than serially.
+/// With RwLock, N readers should complete in ~1x the time of a single reader
+/// (they execute concurrently). With the old Mutex, they'd take N×.
+#[test]
+fn test_rwlock_concurrent_reads_are_not_serialized() {
+    let path = {
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("/tmp/mcp_mem_proof_{pid}_{seq}.bin")
+    };
+    let kg = Arc::new(RwLock::new(KnowledgeGraph::new(Path::new(&path)).unwrap()));
+    // Populate graph with enough data to make reads non-trivial.
+    {
+        let mut guard = kg.write().unwrap();
+        for i in 0..100 {
+            guard
+                .create_entities(&[Entity {
+                    name: format!("E{i}"),
+                    entity_type: "proof".into(),
+                    observations: (0..10).map(|j| format!("obs_{i}_{j}")).collect(),
+                }])
+                .unwrap();
+        }
+    }
+
+    // Time a single read as baseline.
+    let single_start = Instant::now();
+    {
+        let guard = kg.read().unwrap();
+        let _stats = guard.graph_stats();
+        let _graph = guard.read_graph();
+    }
+    let single_elapsed = single_start.elapsed();
+
+    // Time 8 concurrent readers.
+    let concurrent_start = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let kg = Arc::clone(&kg);
+        handles.push(std::thread::spawn(move || {
+            let guard = kg.read().unwrap();
+            let _stats = guard.graph_stats();
+            let _graph = guard.read_graph();
+            // Hold the read lock for a brief period to prove parallelism.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let concurrent_elapsed = concurrent_start.elapsed();
+
+    // With RwLock, 8 concurrent readers should take roughly the same time
+    // as 1 reader + 5ms sleep (they run in parallel, not serialized).
+    // If they were serialized (Mutex), they'd take ~8× longer.
+    // Allow generous headroom for OS scheduling jitter.
+    let expected_max = (single_elapsed + std::time::Duration::from_millis(10))
+        .max(std::time::Duration::from_millis(50));
+
+    assert!(
+        concurrent_elapsed < expected_max,
+        "8 concurrent readers were serialized! took {concurrent_elapsed:?}, expected < {expected_max:?}\n\
+         Hint: this suggests RwLock is not allowing parallel reads — \
+         single read took {single_elapsed:?}"
+    );
+
+    drop(kg);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Prove that readers do not block other readers (only writers do).
+/// Starts a long-running read, then spawns more reads — they should
+/// all acquire the lock immediately without waiting.
+#[test]
+fn test_rwlock_readers_do_not_block_readers() {
+    let path = {
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("/tmp/mcp_mem_proof_{pid}_{seq}.bin")
+    };
+    let kg = Arc::new(RwLock::new(KnowledgeGraph::new(Path::new(&path)).unwrap()));
+    {
+        let mut guard = kg.write().unwrap();
+        guard.create_entities(&[Entity {
+            name: "Proof".into(),
+            entity_type: "test".into(),
+            observations: vec!["data".into()],
+        }])
+        .unwrap();
+    }
+
+    // Thread A: hold the read lock for 100ms.
+    let kg_a = Arc::clone(&kg);
+    let handle_a = std::thread::spawn(move || {
+        let _guard = kg_a.read().unwrap();
+        let stats = _guard.graph_stats();
+        assert_eq!(stats["entities"], 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+
+    // Give thread A time to acquire the read lock.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Thread B: try to acquire the read lock while A holds it.
+    // With RwLock, B should succeed immediately (readers don't block readers).
+    let kg_b = Arc::clone(&kg);
+    let handle_b = std::thread::spawn(move || {
+        let start = Instant::now();
+        let guard = kg_b.read().unwrap();
+        let elapsed = start.elapsed();
+        let _stats = guard.graph_stats();
+        // B should acquire the read lock in well under 100ms (A's hold time),
+        // proving readers aren't blocked by readers.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "Reader B was blocked by Reader A for {elapsed:?} — RwLock serialized reads!"
+        );
+    });
+
+    handle_a.join().unwrap();
+    handle_b.join().unwrap();
+
+    drop(kg);
+    let _ = std::fs::remove_file(&path);
 }
