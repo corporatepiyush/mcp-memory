@@ -54,14 +54,15 @@ pub fn handle_read_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
     let params = args.unwrap_or(&Value::Null);
     let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let has_paging = params.get("limit").is_some() || params.get("offset").is_some();
-    let result = if entity_type.is_none() && !has_paging {
-        graph.read_graph()
+    // Serialize a borrowing view directly (M6) — no owned intermediate graph.
+    let view = if entity_type.is_none() && !has_paging {
+        graph.read_graph_view()
     } else {
         let offset = opt_usize(params, "offset", 0)?;
         let limit = opt_usize(params, "limit", usize::MAX)?;
-        graph.read_graph_filtered(entity_type, offset, limit)
+        graph.read_graph_filtered_view(entity_type, offset, limit)
     };
-    let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
+    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
@@ -243,8 +244,8 @@ pub fn handle_search_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> 
     let limit = opt_usize(params, "limit", usize::MAX)?;
 
     let graph = lock_graph(kg)?;
-    let result = graph.search_nodes_filtered(query, entity_type, offset, limit);
-    let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
+    let view = graph.search_nodes_view(query, entity_type, offset, limit);
+    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
@@ -257,8 +258,8 @@ pub fn handle_open_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Re
         .ok_or_else(|| MCSError::InvalidParams("Missing or invalid 'names' parameter".into()))?;
 
     let graph = lock_graph(kg)?;
-    let result = graph.open_nodes(&names);
-    let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
+    let view = graph.open_nodes_view(&names);
+    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 

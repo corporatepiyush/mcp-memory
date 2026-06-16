@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
+
 use crate::errors::{MCSError, Result};
 use crate::intern::{StrId, StringInterner};
 use crate::types::{Entity, Relation, KnowledgeGraphOut};
@@ -55,6 +57,101 @@ struct StoredRelation {
     from: StrId,
     to: StrId,
     relation_type: StrId,
+}
+
+// ---------------------------------------------------------------------------
+// Borrowing serialization views (M6).
+//
+// Read tools used to build owned `Entity`/`Relation` vecs (a fresh `String`
+// per name/type/observation) and *then* serialize them — roughly 2-3x the
+// graph resident at once. These views instead hold references to the selected
+// stored records and emit their interned `&str` directly during
+// serialization, with no intermediate owned strings. The emitted JSON is
+// byte-for-byte identical to serializing `KnowledgeGraphOut`.
+// ---------------------------------------------------------------------------
+
+/// A borrowing view over a selected slice of the graph. Serializes to
+/// `{"entities":[...],"relations":[...]}`.
+pub struct GraphView<'a> {
+    kg: &'a KnowledgeGraph,
+    entities: Vec<&'a StoredEntity>,
+    relations: Vec<&'a StoredRelation>,
+}
+
+impl GraphView<'_> {
+    /// Materialize into the owned [`KnowledgeGraphOut`]. Used by the direct
+    /// (non-serializing) callers and tests; the server's read handlers
+    /// serialize the view directly instead.
+    pub fn to_owned_out(&self) -> KnowledgeGraphOut {
+        KnowledgeGraphOut {
+            entities: self.entities.iter().map(|e| self.kg.entity_to_output(e)).collect(),
+            relations: self.relations.iter().map(|r| self.kg.relation_to_output(r)).collect(),
+        }
+    }
+}
+
+impl Serialize for GraphView<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("KnowledgeGraphOut", 2)?;
+        st.serialize_field("entities", &EntityListRef { kg: self.kg, items: &self.entities })?;
+        st.serialize_field("relations", &RelationListRef { kg: self.kg, items: &self.relations })?;
+        st.end()
+    }
+}
+
+struct EntityListRef<'a> { kg: &'a KnowledgeGraph, items: &'a [&'a StoredEntity] }
+impl Serialize for EntityListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &e in self.items {
+            seq.serialize_element(&EntityRef { kg: self.kg, e })?;
+        }
+        seq.end()
+    }
+}
+
+struct RelationListRef<'a> { kg: &'a KnowledgeGraph, items: &'a [&'a StoredRelation] }
+impl Serialize for RelationListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &r in self.items {
+            seq.serialize_element(&RelationRef { kg: self.kg, r })?;
+        }
+        seq.end()
+    }
+}
+
+struct EntityRef<'a> { kg: &'a KnowledgeGraph, e: &'a StoredEntity }
+impl Serialize for EntityRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Entity", 3)?;
+        st.serialize_field("name", self.kg.interner.lookup(self.e.name))?;
+        st.serialize_field("entityType", self.kg.interner.lookup(self.e.entity_type))?;
+        st.serialize_field("observations", &ObsRef { kg: self.kg, obs: &self.e.observations })?;
+        st.end()
+    }
+}
+
+struct ObsRef<'a> { kg: &'a KnowledgeGraph, obs: &'a [StrId] }
+impl Serialize for ObsRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.obs.len()))?;
+        for &o in self.obs {
+            seq.serialize_element(self.kg.interner.lookup(o))?;
+        }
+        seq.end()
+    }
+}
+
+struct RelationRef<'a> { kg: &'a KnowledgeGraph, r: &'a StoredRelation }
+impl Serialize for RelationRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Relation", 3)?;
+        st.serialize_field("from", self.kg.interner.lookup(self.r.from))?;
+        st.serialize_field("to", self.kg.interner.lookup(self.r.to))?;
+        st.serialize_field("relationType", self.kg.interner.lookup(self.r.relation_type))?;
+        st.end()
+    }
 }
 
 /// Edge-following direction for neighborhood queries.
@@ -115,7 +212,6 @@ const fn h1(hash: u64, mask: usize) -> usize {
 
 struct NameTableShard {
     ctrl: Vec<u8>,      // 0xFF = empty; 0x00-0x7F = h2 stamp (bit 7 always clear)
-    hashes: Vec<u64>,   // full 64-bit hash (used only during grow/rehash)
     names: Vec<StrId>,
     slots: Vec<u32>,
     mask: usize,
@@ -127,7 +223,6 @@ impl NameTableShard {
         let cap = capacity.next_power_of_two().max(16);
         Self {
             ctrl: vec![EMPTY_SLOT; cap],
-            hashes: vec![0; cap],
             names: vec![StrId::EMPTY; cap],
             slots: vec![u32::MAX; cap],
             mask: cap - 1,
@@ -167,9 +262,9 @@ impl NameTableShard {
         None
     }
 
-    fn insert(&mut self, hash: u64, name: StrId, slot: u32) {
+    fn insert(&mut self, interner: &StringInterner, hash: u64, name: StrId, slot: u32) {
         if self.count * 4 > self.ctrl.len() * 3 {
-            self.grow();
+            self.grow(interner);
         }
         let stamp = h2(hash);
         let mask = self.mask;
@@ -179,7 +274,6 @@ impl NameTableShard {
             unsafe {
                 if *self.ctrl.get_unchecked(idx) & 0x80 != 0 {
                     *self.ctrl.get_unchecked_mut(idx) = stamp;
-                    *self.hashes.get_unchecked_mut(idx) = hash;
                     *self.names.get_unchecked_mut(idx) = name;
                     *self.slots.get_unchecked_mut(idx) = slot;
                     self.count += 1;
@@ -190,7 +284,7 @@ impl NameTableShard {
         }
     }
 
-    fn remove(&mut self, hash: u64, name: StrId) {
+    fn remove(&mut self, interner: &StringInterner, hash: u64, name: StrId) {
         let stamp = h2(hash);
         let mask = self.mask;
         let mut idx = h1(hash, mask);
@@ -202,18 +296,18 @@ impl NameTableShard {
             if self.ctrl[idx] == stamp && self.names[idx] == name {
                 // Found — remove with shift-back to preserve probe chains.
                 self.ctrl[idx] = EMPTY_SLOT;
-                self.hashes[idx] = 0;
                 self.names[idx] = StrId::EMPTY;
                 self.slots[idx] = u32::MAX;
                 self.count -= 1;
 
                 let mut next = (idx + 1) & mask;
                 while self.ctrl[next] & 0x80 == 0 {
-                    let nh = self.hashes[next];
                     let nn = self.names[next];
                     let ns = self.slots[next];
+                    // Hash is no longer stored (M4) — recompute it from the
+                    // interned name to find the entry's ideal bucket.
+                    let nh = interner.get_hash(nn);
                     self.ctrl[next] = EMPTY_SLOT;
-                    self.hashes[next] = 0;
                     self.names[next] = StrId::EMPTY;
                     self.slots[next] = u32::MAX;
                     self.count -= 1;
@@ -225,7 +319,6 @@ impl NameTableShard {
                         re_idx = (re_idx + 1) & mask;
                     }
                     self.ctrl[re_idx] = nstamp;
-                    self.hashes[re_idx] = nh;
                     self.names[re_idx] = nn;
                     self.slots[re_idx] = ns;
                     self.count += 1;
@@ -238,31 +331,30 @@ impl NameTableShard {
         }
     }
 
-    fn grow(&mut self) {
+    fn grow(&mut self, interner: &StringInterner) {
         let new_cap = self.ctrl.len() * 2;
         let new_mask = new_cap - 1;
         let mut new_ctrl = vec![EMPTY_SLOT; new_cap];
-        let mut new_hashes = vec![0u64; new_cap];
         let mut new_names = vec![StrId::EMPTY; new_cap];
         let mut new_slots = vec![u32::MAX; new_cap];
 
         for i in 0..self.ctrl.len() {
             if self.ctrl[i] & 0x80 == 0 {
-                let hash = self.hashes[i];
+                // Recompute the hash from the interned name (M4: not stored).
+                let name = self.names[i];
+                let hash = interner.get_hash(name);
                 let stamp = h2(hash);
                 let mut idx = h1(hash, new_mask);
                 while new_ctrl[idx] & 0x80 == 0 {
                     idx = (idx + 1) & new_mask;
                 }
                 new_ctrl[idx] = stamp;
-                new_hashes[idx] = hash;
-                new_names[idx] = self.names[i];
+                new_names[idx] = name;
                 new_slots[idx] = self.slots[i];
             }
         }
 
         self.ctrl = new_ctrl;
-        self.hashes = new_hashes;
         self.names = new_names;
         self.slots = new_slots;
         self.mask = new_mask;
@@ -296,13 +388,13 @@ impl ShardedNameTable {
     }
 
     #[inline(always)]
-    fn insert(&mut self, hash: u64, name: StrId, slot: u32) {
-        self.shards[Self::shard(hash)].insert(hash, name, slot);
+    fn insert(&mut self, interner: &StringInterner, hash: u64, name: StrId, slot: u32) {
+        self.shards[Self::shard(hash)].insert(interner, hash, name, slot);
     }
 
     #[inline(always)]
-    fn remove(&mut self, hash: u64, name: StrId) {
-        self.shards[Self::shard(hash)].remove(hash, name);
+    fn remove(&mut self, interner: &StringInterner, hash: u64, name: StrId) {
+        self.shards[Self::shard(hash)].remove(interner, hash, name);
     }
 }
 
@@ -312,6 +404,9 @@ impl ShardedNameTable {
 pub struct KnowledgeGraph {
     interner: StringInterner,
     entity_slots: Vec<Option<StoredEntity>>,
+    /// Tombstoned slot indices available for reuse on the next create (M2),
+    /// so create/delete churn doesn't grow `entity_slots` without bound.
+    free_slots: Vec<u32>,
     name_table: ShardedNameTable,
     relations: Vec<StoredRelation>,
     search: SearchIndex,
@@ -384,9 +479,18 @@ impl KnowledgeGraph {
             }
         })?;
 
+        // Slots tombstoned by deletes during replay are available for reuse (M2).
+        let free_slots: Vec<u32> = entity_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_none())
+            .map(|(i, _)| i as u32)
+            .collect();
+
         Ok(Self {
             interner,
             entity_slots,
+            free_slots,
             name_table,
             relations,
             search,
@@ -419,7 +523,7 @@ impl KnowledgeGraph {
             observations: obs_ids.clone(),
         }));
         let hash = interner.get_hash(name_id);
-        name_table.insert(hash, name_id, slot);
+        name_table.insert(&*interner, hash, name_id, slot);
         search.index_entity(interner, slot, name_id, type_id, &obs_ids);
     }
 
@@ -468,7 +572,7 @@ impl KnowledgeGraph {
         {
             entities[slot as usize] = None;
             search.remove_entity(slot);
-            name_table.remove(hash, name_id);
+            name_table.remove(&*interner, hash, name_id);
         }
         rels.retain(|r| r.from != name_id && r.to != name_id);
     }
@@ -702,8 +806,13 @@ impl KnowledgeGraph {
         // 3. Atomically rename over the original (atomic on POSIX)
         std::fs::rename(&tmp_path, self.store.path()).map_err(MCSError::IoError)?;
 
-        // 4. Reopen the store with the new file
-        self.store = BinaryStore::new(self.store.path()).map_err(MCSError::IoError)?;
+        // 4. Rebuild the entire in-memory graph from the compacted log (M1/M2).
+        //    Replaying into fresh structures reclaims the interner arena (stale
+        //    strings from deleted/edited entities), tombstoned entity slots, and
+        //    stale search-index entries — none of which the old reopen-only path
+        //    reclaimed.
+        let path = self.store.path().clone();
+        *self = KnowledgeGraph::new(&path).map_err(MCSError::IoError)?;
 
         Ok(())
     }
@@ -745,16 +854,23 @@ impl KnowledgeGraph {
                 .iter()
                 .map(|o| self.interner.intern(o))
                 .collect();
-            let slot = self.entity_slots.len() as u32;
+            // Reuse a tombstoned slot if one is free (M2); its old search-index
+            // entries were cleared on delete, so the slot starts clean.
+            let reused = self.free_slots.pop();
+            let slot = reused.unwrap_or(self.entity_slots.len() as u32);
             self.search
                 .index_entity(&mut self.interner, slot, name_id, type_id, &obs_ids);
-            self.entity_slots.push(Some(StoredEntity {
+            let stored = Some(StoredEntity {
                 state: ENTITY_SLOT_LIVE,
                 name: name_id,
                 entity_type: type_id,
                 observations: obs_ids,
-            }));
-            self.name_table.insert(hash, name_id, slot);
+            });
+            match reused {
+                Some(s) => self.entity_slots[s as usize] = stored,
+                None => self.entity_slots.push(stored),
+            }
+            self.name_table.insert(&self.interner, hash, name_id, slot);
             created.push(Entity {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
@@ -867,8 +983,9 @@ impl KnowledgeGraph {
                         .map_err(MCSError::IoError)?;
 
                     self.entity_slots[slot as usize] = None;
+                    self.free_slots.push(slot);
                     self.search.remove_entity(slot);
-                    self.name_table.remove(hash, name_id);
+                    self.name_table.remove(&self.interner, hash, name_id);
                     deleted_names.push(name.clone());
                 }
             }
@@ -937,22 +1054,20 @@ impl KnowledgeGraph {
     }
 
     pub fn read_graph(&self) -> KnowledgeGraphOut {
-        let entities: Vec<Entity> = self
+        self.read_graph_view().to_owned_out()
+    }
+
+    /// Borrowing, allocation-light view of the full graph (M6). Serializing it
+    /// streams interned `&str` directly instead of materializing a `String`
+    /// per name/type/observation.
+    pub fn read_graph_view(&self) -> GraphView<'_> {
+        let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
-            .map(|stored| self.entity_to_output(stored))
             .collect();
-        let rels: Vec<Relation> = self
-            .relations
-            .iter()
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
-            .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        let relations: Vec<&StoredRelation> = self.relations.iter().collect();
+        GraphView { kg: self, entities, relations }
     }
 
     /// Relevance-ranked substring search returning all matches (no pagination).
@@ -962,36 +1077,29 @@ impl KnowledgeGraph {
     }
 
     pub fn open_nodes(&self, names: &[String]) -> KnowledgeGraphOut {
+        self.open_nodes_view(names).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`open_nodes`] (M6).
+    pub fn open_nodes_view(&self, names: &[String]) -> GraphView<'_> {
         let name_ids: HashSet<StrId> = names.iter()
             .filter_map(|n| self.interner.get_optional(n))
             .collect();
-        let entities: Vec<Entity> = self
+        let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
             .filter_map(|s| {
-                s.as_ref().and_then(|stored| {
-                    if stored.is_live() && name_ids.contains(&stored.name) {
-                        Some(self.entity_to_output(stored))
-                    } else {
-                        None
-                    }
-                })
+                s.as_ref()
+                    .filter(|stored| stored.is_live() && name_ids.contains(&stored.name))
             })
             .collect();
-        let matched_names: HashSet<StrId> = entities.iter()
-            .filter_map(|e| self.interner.get_optional(&e.name))
-            .collect();
-        let rels: Vec<Relation> = self
+        let matched_names: HashSet<StrId> = entities.iter().map(|e| e.name).collect();
+        let relations: Vec<&StoredRelation> = self
             .relations
             .iter()
             .filter(|r| matched_names.contains(&r.from) || matched_names.contains(&r.to))
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
             .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        GraphView { kg: self, entities, relations }
     }
 
     // -----------------------------------------------------------------------
@@ -1080,17 +1188,28 @@ impl KnowledgeGraph {
         offset: usize,
         limit: usize,
     ) -> KnowledgeGraphOut {
+        self.search_nodes_view(query, entity_type, offset, limit).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`search_nodes_filtered`] (M6).
+    pub fn search_nodes_view(
+        &self,
+        query: &str,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GraphView<'_> {
         let type_id = match entity_type {
             Some(t) => match self.interner.get_optional(t) {
                 Some(id) => Some(id),
-                None => return KnowledgeGraphOut { entities: Vec::new(), relations: Vec::new() },
+                None => return GraphView { kg: self, entities: Vec::new(), relations: Vec::new() },
             },
             None => None,
         };
 
         let ranked = self.search.search_ranked(query, &self.interner);
         let mut selected: HashSet<StrId> = HashSet::new();
-        let mut entities = Vec::new();
+        let mut entities: Vec<&StoredEntity> = Vec::new();
         let mut skipped = 0usize;
         for (slot, _score) in ranked {
             let Some(st) = self
@@ -1112,16 +1231,15 @@ impl KnowledgeGraph {
                 break;
             }
             selected.insert(st.name);
-            entities.push(self.entity_to_output(st));
+            entities.push(st);
         }
 
-        let relations = self
+        let relations: Vec<&StoredRelation> = self
             .relations
             .iter()
             .filter(|r| selected.contains(&r.from) || selected.contains(&r.to))
-            .map(|r| self.relation_to_output(r))
             .collect();
-        KnowledgeGraphOut { entities, relations }
+        GraphView { kg: self, entities, relations }
     }
 
     /// Type-filtered, paginated view of the whole graph. Unlike [`read_graph`],
@@ -1133,16 +1251,26 @@ impl KnowledgeGraph {
         offset: usize,
         limit: usize,
     ) -> KnowledgeGraphOut {
+        self.read_graph_filtered_view(entity_type, offset, limit).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`read_graph_filtered`] (M6).
+    pub fn read_graph_filtered_view(
+        &self,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GraphView<'_> {
         let type_id = match entity_type {
             Some(t) => match self.interner.get_optional(t) {
                 Some(id) => Some(id),
-                None => return KnowledgeGraphOut { entities: Vec::new(), relations: Vec::new() },
+                None => return GraphView { kg: self, entities: Vec::new(), relations: Vec::new() },
             },
             None => None,
         };
 
         let mut selected: HashSet<StrId> = HashSet::new();
-        let mut entities = Vec::new();
+        let mut entities: Vec<&StoredEntity> = Vec::new();
         let mut skipped = 0usize;
         for st in self
             .entity_slots
@@ -1161,16 +1289,15 @@ impl KnowledgeGraph {
                 break;
             }
             selected.insert(st.name);
-            entities.push(self.entity_to_output(st));
+            entities.push(st);
         }
 
-        let relations = self
+        let relations: Vec<&StoredRelation> = self
             .relations
             .iter()
             .filter(|r| selected.contains(&r.from) && selected.contains(&r.to))
-            .map(|r| self.relation_to_output(r))
             .collect();
-        KnowledgeGraphOut { entities, relations }
+        GraphView { kg: self, entities, relations }
     }
 
     /// Neighborhood expansion around `name` out to `depth` hops, following

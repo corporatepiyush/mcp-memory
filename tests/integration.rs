@@ -1430,3 +1430,79 @@ fn test_export_graph_formats() {
     assert!(kg.export("yaml").is_err());
     cleanup(&path);
 }
+
+// =========================================================================
+// Optimization regression tests (M1/M2/M6)
+// =========================================================================
+
+/// M6: the borrowing serialize views must produce byte-identical JSON to
+/// serializing the owned `KnowledgeGraphOut`.
+#[test]
+fn test_view_json_matches_owned() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let owned = serde_json::to_string(&kg.read_graph()).unwrap();
+    let view = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    assert_eq!(owned, view);
+
+    let owned_s = serde_json::to_string(&kg.search_nodes("coffee")).unwrap();
+    let view_s = serde_json::to_string(&kg.search_nodes_view("coffee", None, 0, usize::MAX)).unwrap();
+    assert_eq!(owned_s, view_s);
+
+    let owned_o = serde_json::to_string(&kg.open_nodes(&["Alice".into()])).unwrap();
+    let view_o = serde_json::to_string(&kg.open_nodes_view(&["Alice".into()])).unwrap();
+    assert_eq!(owned_o, view_o);
+    cleanup(&path);
+}
+
+/// M2: a deleted entity's slot is reused by the next create. After many
+/// create/delete cycles the graph must remain correct (and slots bounded).
+#[test]
+fn test_slot_reuse_after_delete() {
+    let (mut kg, path) = setup();
+    for i in 0..50 {
+        let e = Entity {
+            name: format!("E{i}"),
+            entity_type: "t".into(),
+            observations: vec![format!("obs {i}")],
+        };
+        kg.create_entities(&[e]).unwrap();
+        kg.delete_entities(&[format!("E{i}")]).unwrap();
+    }
+    // Only the never-deleted survivor remains live.
+    kg.create_entities(&[alice()]).unwrap();
+    let g = kg.read_graph();
+    assert_eq!(g.entities.len(), 1);
+    assert_eq!(g.entities[0].name, "Alice");
+    assert_eq!(kg.get_entity("Alice").unwrap().observations.len(), 2);
+    cleanup(&path);
+}
+
+/// M1: compact rebuilds in-memory state from the compacted log. After deletes
+/// + churn, compacting must preserve live data and keep lookups/search working.
+#[test]
+fn test_compact_rebuild_preserves_state() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+    kg.add_observations("Alice", &["extra fact".into()]).unwrap();
+    kg.delete_entities(&["Bob".into()]).unwrap();
+
+    let before = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    kg.compact().unwrap();
+    let after = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    assert_eq!(before, after, "compact must not change observable state");
+
+    // Lookups, search, and relations still work post-rebuild.
+    assert!(kg.get_entity("Alice").unwrap().observations.contains(&"extra fact".to_string()));
+    assert!(kg.get_entity("Bob").is_none());
+    assert!(!kg.search_nodes("coffee").entities.is_empty());
+
+    // Survives reopen too (the compacted log on disk is authoritative).
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let reopened = serde_json::to_string(&kg2.read_graph_view()).unwrap();
+    assert_eq!(after, reopened);
+    cleanup(&path);
+}

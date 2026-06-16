@@ -49,7 +49,6 @@ const fn h1(hash: u64, mask: usize) -> usize {
 pub struct StringInterner {
     arena: String,
     offsets: Vec<u32>,
-    hashes: Vec<u64>,
     // Dedup hash table — ctrl-byte buckets with parallel arrays.
     ctrl: Vec<u8>,
     table_hashes: Vec<u64>,
@@ -65,7 +64,6 @@ impl StringInterner {
         Self {
             arena: String::with_capacity(8192),
             offsets: vec![0],
-            hashes: Vec::with_capacity(128),
             ctrl: vec![EMPTY; CAP],
             table_hashes: vec![0; CAP],
             table_ids: vec![StrId::EMPTY; CAP],
@@ -80,7 +78,6 @@ impl StringInterner {
         Self {
             arena: String::with_capacity(string_capacity),
             offsets: vec![0],
-            hashes: Vec::with_capacity(estimated_strings),
             ctrl: vec![EMPTY; cap],
             table_hashes: vec![0; cap],
             table_ids: vec![StrId::EMPTY; cap],
@@ -107,7 +104,6 @@ impl StringInterner {
                 let id = self.offsets.len() as u32 - 1;
                 self.arena.push_str(s);
                 self.offsets.push(self.arena.len() as u32);
-                self.hashes.push(hash);
                 self.ctrl[idx] = stamp;
                 self.table_hashes[idx] = hash;
                 self.table_ids[idx] = StrId(id);
@@ -170,12 +166,16 @@ impl StringInterner {
         unsafe { self.arena.get_unchecked(start..end) }
     }
 
+    /// Recompute the hash of an interned string on demand. The per-string hash
+    /// is no longer stored (M4) — it is cheaply re-derived from the interned
+    /// bytes with the same hasher, saving 8 bytes per unique string. Used to
+    /// key the (separate) entity name table.
     #[inline]
     pub fn get_hash(&self, id: StrId) -> u64 {
         if id.is_empty() {
             return 0;
         }
-        self.hashes[id.0 as usize]
+        self.hasher.hash_one(self.lookup(id))
     }
 
     pub const fn len(&self) -> usize {
