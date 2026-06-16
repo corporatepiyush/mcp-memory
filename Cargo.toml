@@ -5,6 +5,11 @@ edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted via custom binary log"
 license = "MIT"
+repository = "https://github.com/corporatepiyush/mcp-memory"
+readme = "README.md"
+keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent"]
+categories = ["database-implementations", "command-line-utilities"]
+exclude = ["/target", "OPTIMIZATION_PLAN.md", "*.bin"]
 
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
@@ -18,7 +23,7 @@ clap = { version = "4.5", features = ["derive"] }
 ahash = "0.8"
 
 [dev-dependencies]
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [[bin]]
 name = "mcp-memory"

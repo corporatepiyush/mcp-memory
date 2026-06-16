@@ -29,11 +29,16 @@ fn random_name(rng: &mut impl Rng, len: usize) -> String {
 }
 
 fn random_entity(rng: &mut impl Rng) -> Entity {
-    let name = random_name(rng, rng.gen_range(3..12));
-    let etype = random_name(rng, rng.gen_range(3..8));
+    let name_len = rng.gen_range(3..12);
+    let name = random_name(rng, name_len);
+    let etype_len = rng.gen_range(3..8);
+    let etype = random_name(rng, etype_len);
     let num_obs = rng.gen_range(0..5);
     let observations: Vec<String> = (0..num_obs)
-        .map(|_| format!("{}", random_name(rng, rng.gen_range(2..15))))
+        .map(|_| {
+            let obs_len = rng.gen_range(2..15);
+            random_name(rng, obs_len)
+        })
         .collect();
     Entity { name, entity_type: etype, observations }
 }
@@ -226,8 +231,9 @@ fn test_random_persistence_roundtrip() {
             }
             51..=70 => {
                 if !live_names.is_empty() {
+                    let pick = rng.gen_range(1..=2.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
-                        .choose_multiple(&mut rng, rng.gen_range(1..=2.min(live_names.len())))
+                        .choose_multiple(&mut rng, pick)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -286,7 +292,7 @@ fn test_stress_bulk_create() {
     let mut rng = SmallRng::from_seed([99u8; 32]);
 
     let entities: Vec<Entity> = (0..500).map(|_| random_entity(&mut rng)).collect();
-    let mut live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+    let live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
 
     // Create all at once (in batches to avoid huge single calls)
     for chunk in entities.chunks(50) {
@@ -333,19 +339,22 @@ fn test_stress_bulk_create() {
 fn test_stress_observations_churn() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([777u8; 32]);
+    let mut rng = SmallRng::from_seed([177u8; 32]);
 
     // Create 20 base entities
     let entities: Vec<Entity> = (0..20).map(|_| random_entity(&mut rng)).collect();
     kg.create_entities(&entities).unwrap();
-    let mut live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+    let live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
 
     // Churn observations
     for _ in 0..300 {
         let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
         let num_new = rng.gen_range(1..=5);
         let new_obs: Vec<String> = (0..num_new)
-            .map(|_| random_name(&mut rng, rng.gen_range(3..10)))
+            .map(|_| {
+                let len = rng.gen_range(3..10);
+                random_name(&mut rng, len)
+            })
             .collect();
         kg.add_observations(&name, &new_obs).unwrap();
 
@@ -353,8 +362,9 @@ fn test_stress_observations_churn() {
         if rng.gen_bool(0.3) {
             let entity = kg.get_entity(&name).unwrap();
             if !entity.observations.is_empty() {
+                let del_n = rng.gen_range(1..=entity.observations.len().min(3));
                 let to_del: Vec<String> = entity.observations
-                    .choose_multiple(&mut rng, rng.gen_range(1..=entity.observations.len().min(3)))
+                    .choose_multiple(&mut rng, del_n)
                     .cloned()
                     .collect();
                 kg.delete_observations(&name, &to_del).unwrap();
@@ -380,7 +390,7 @@ fn test_stress_observations_churn() {
 fn test_fuzzy_compact_preserves_invariants() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([456u8; 32]);
+    let mut rng = SmallRng::from_seed([201u8; 32]);
     let mut live_names: HashSet<String> = HashSet::new();
 
     // Build up some state
@@ -452,7 +462,7 @@ fn test_fuzzy_compact_preserves_invariants() {
 fn test_concurrent_fuzzy_stress() {
     let path = tmp_path();
     let kg_mutex = Arc::new(Mutex::new(KnowledgeGraph::new(Path::new(&path)).unwrap()));
-    let mut rng = SmallRng::from_seed([321u8; 32]);
+    let mut rng = SmallRng::from_seed([210u8; 32]);
 
     // Pre-seed with entities
     {
@@ -552,7 +562,7 @@ fn test_concurrent_fuzzy_stress() {
             assert!(name_set.insert(e.name.as_str()), "duplicate entity name");
         }
 
-        assert_eq!(entity_name_set::len(); entity_count);
+        assert_eq!(name_set.len(), entity_count);
         assert_eq!(rel_set.len(), rel_count);
     }
 
@@ -567,7 +577,7 @@ fn test_concurrent_fuzzy_stress() {
 fn test_fuzzy_search_invariants() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([888u8; 32]);
+    let mut rng = SmallRng::from_seed([188u8; 32]);
     let mut live_names: HashSet<String> = HashSet::new();
 
     // Create entities with varied content
@@ -681,14 +691,14 @@ fn test_fuzzy_large_strings() {
 fn test_fuzzy_unicode_stress() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([999u8; 32]);
+    let mut rng = SmallRng::from_seed([199u8; 32]);
 
     let unicode_chars: Vec<char> = vec![
         'é', 'ü', 'ñ', 'ç', 'à', 'è', 'ö', 'ä', 'ß', 'ÿ',
         'あ', 'い', 'う', 'え', 'お',
-        '汉', '字', '中文', '日本語',
+        '汉', '字', '中', '日', '語',
         'α', 'β', 'γ', 'δ', 'ε',
-        '😀', '🚀', '🌟', '🔥', '❤️',
+        '😀', '🚀', '🌟', '🔥', '❤',
     ];
 
     let mut live_names: HashSet<String> = HashSet::new();
@@ -719,10 +729,12 @@ fn test_fuzzy_unicode_stress() {
         if name.len() >= 2 {
             let prefix: String = name.chars().take(1).collect();
             let result = kg.search_nodes(&prefix);
-            // The result should include this entity (prefix match)
-            let found = result.entities.iter().any(|e| e.name == *name);
-            // Note: search is ASCII-case-insensitive, so non-ASCII prefixes may not match
-            // Just verify no crash
+            // Note: search is ASCII-case-insensitive, so non-ASCII prefixes may
+            // not match. Every returned entity must still be a valid live name —
+            // the search must never crash or invent entities.
+            for e in &result.entities {
+                assert!(live_names.contains(&e.name), "search returned unknown entity");
+            }
         }
     }
 
@@ -757,7 +769,7 @@ fn test_fuzzy_unicode_stress() {
 fn test_fuzzy_find_path_invariants() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([555u8; 32]);
+    let mut rng = SmallRng::from_seed([155u8; 32]);
     let mut live_names: HashSet<String> = HashSet::new();
 
     // Create entities
@@ -797,13 +809,13 @@ fn test_fuzzy_find_path_invariants() {
                 for node in &path {
                     assert!(seen.insert(node.as_str()), "duplicate in path");
                 }
-                // Each adjacent pair must have a relation
+                // Each adjacent pair must have a relation. find_path treats
+                // relations as undirected, so the edge may exist in either
+                // direction — query both.
                 for pair in path.windows(2) {
-                    let rels = kg.search_relations(
-                        Some(&pair[0]), Some(&pair[1]), None,
-                    );
-                    let found = rels.iter().any(|r| r.from == pair[0] && r.to == pair[1]
-                        || r.from == pair[1] && r.to == pair[0]);
+                    let forward = kg.search_relations(Some(&pair[0]), Some(&pair[1]), None);
+                    let backward = kg.search_relations(Some(&pair[1]), Some(&pair[0]), None);
+                    let found = !forward.is_empty() || !backward.is_empty();
                     assert!(found, "no relation between {} and {}", pair[0], pair[1]);
                 }
             }
@@ -894,7 +906,7 @@ fn test_fuzzy_entity_dedup() {
 fn test_fuzzy_stats_invariants() {
     let path = tmp_path();
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([444u8; 32]);
+    let mut rng = SmallRng::from_seed([144u8; 32]);
     let mut live_names: HashSet<String> = HashSet::new();
 
     for _ in 0..200 {
@@ -910,8 +922,9 @@ fn test_fuzzy_stats_invariants() {
             }
             46..=65 => {
                 if !live_names.is_empty() {
+                    let pick = rng.gen_range(1..=3.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
-                        .choose_multiple(&mut rng, rng.gen_range(1..=3.min(live_names.len())))
+                        .choose_multiple(&mut rng, pick)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -935,8 +948,9 @@ fn test_fuzzy_stats_invariants() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
                     if let Some(entity) = kg.get_entity(&name) {
                         if !entity.observations.is_empty() {
+                            let del_n = rng.gen_range(1..=entity.observations.len().min(2));
                             let to_del: Vec<String> = entity.observations
-                                .choose_multiple(&mut rng, rng.gen_range(1..=entity.observations.len().min(2)))
+                                .choose_multiple(&mut rng, del_n)
                                 .cloned()
                                 .collect();
                             kg.delete_observations(&name, &to_del).unwrap();
@@ -1018,6 +1032,207 @@ fn test_fuzzy_empty_and_whitespace_names() {
     // Whitespace-only search should be safe
     let result = kg.search_nodes("   ");
     assert!(result.entities.is_empty() || result.entities.len() == 1);
+
+    cleanup(&path);
+}
+
+// =========================================================================
+// 16. open_nodes returns exactly the requested live entities
+// =========================================================================
+
+#[test]
+fn test_fuzzy_open_nodes_invariants() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([211u8; 32]);
+
+    let entities: Vec<Entity> = (0..120).map(|_| random_entity(&mut rng)).collect();
+    let live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+    kg.create_entities(&entities).unwrap();
+    let name_vec: Vec<String> = live_names.iter().cloned().collect();
+
+    for _ in 0..200 {
+        // Build a request mixing real names and never-created ghosts.
+        let pick = rng.gen_range(0..=5.min(name_vec.len()));
+        let mut request: Vec<String> = name_vec
+            .choose_multiple(&mut rng, pick)
+            .cloned()
+            .collect();
+        // Number of ghosts to append.
+        let ghosts = rng.gen_range(0..3);
+        for _ in 0..ghosts {
+            let g = format!("__ghost_{}", random_name(&mut rng, 8));
+            if !live_names.contains(&g) {
+                request.push(g);
+            }
+        }
+        let requested_set: HashSet<&str> = request.iter().map(String::as_str).collect();
+
+        let out = kg.open_nodes(&request);
+
+        // Every returned entity must have been requested and be live.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for e in &out.entities {
+            assert!(live_names.contains(&e.name), "open_nodes returned non-live entity");
+            assert!(requested_set.contains(e.name.as_str()), "open_nodes returned unrequested entity");
+            assert!(seen.insert(e.name.as_str()), "open_nodes returned duplicate entity");
+        }
+        // Every requested live name must be present in the output.
+        let returned: HashSet<&str> = out.entities.iter().map(|e| e.name.as_str()).collect();
+        for name in &request {
+            if live_names.contains(name) {
+                assert!(returned.contains(name.as_str()), "requested live name '{name}' missing");
+            }
+        }
+    }
+
+    cleanup(&path);
+}
+
+// =========================================================================
+// 17. delete_relations removes only exact (from, to, type) matches
+// =========================================================================
+
+#[test]
+fn test_fuzzy_delete_relations_precision() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([212u8; 32]);
+
+    let entities: Vec<Entity> = (0..25).map(|_| random_entity(&mut rng)).collect();
+    let name_vec: Vec<String> = {
+        let set: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+        set.into_iter().collect()
+    };
+    kg.create_entities(&entities).unwrap();
+
+    // Model the relation set ourselves to compare against the store.
+    let mut model: HashSet<(String, String, String)> = HashSet::new();
+    let rtypes = ["knows", "likes", "owns", "manages"];
+
+    for _ in 0..400 {
+        let op = rng.gen_range(0..100);
+        if op < 60 {
+            // Create a random relation.
+            let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
+            let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+            let rtype = rtypes[rng.gen_range(0..rtypes.len())].to_string();
+            let rel = Relation { from: from.clone(), to: to.clone(), relation_type: rtype.clone() };
+            let created = kg.create_relations(&[rel]).unwrap();
+            if !created.is_empty() {
+                assert!(model.insert((from, to, rtype)), "store created a duplicate relation");
+            } else {
+                // Creation returned empty only for an existing duplicate.
+                assert!(model.contains(&(from, to, rtype)), "empty create for a novel relation");
+            }
+        } else if !model.is_empty() {
+            // Delete an existing relation; sometimes also attempt a bogus one.
+            let existing: Vec<(String, String, String)> = model.iter().cloned().collect();
+            let target = existing[rng.gen_range(0..existing.len())].clone();
+            let mut to_del = vec![Relation {
+                from: target.0.clone(),
+                to: target.1.clone(),
+                relation_type: target.2.clone(),
+            }];
+            // A non-existent relation must be a silent no-op.
+            if rng.gen_bool(0.3) {
+                to_del.push(Relation {
+                    from: target.0.clone(),
+                    to: target.1.clone(),
+                    relation_type: "__never__".into(),
+                });
+            }
+            kg.delete_relations(&to_del).unwrap();
+            model.remove(&target);
+        }
+
+        // The store must match the model exactly.
+        let live: HashSet<(String, String, String)> = kg
+            .search_relations(None, None, None)
+            .into_iter()
+            .map(|r| (r.from, r.to, r.relation_type))
+            .collect();
+        assert_eq!(live, model, "relation set diverged from model");
+    }
+
+    cleanup(&path);
+}
+
+// =========================================================================
+// 18. Durability: reopening after every mutation preserves the graph
+// =========================================================================
+
+#[test]
+fn test_fuzzy_reopen_after_each_mutation() {
+    let path = tmp_path();
+    let mut rng = SmallRng::from_seed([213u8; 32]);
+    let mut live_names: HashSet<String> = HashSet::new();
+    let mut relations: HashSet<(String, String, String)> = HashSet::new();
+
+    for _ in 0..120 {
+        // Fresh handle each iteration — exercises log replay on open.
+        let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+
+        // State recovered from disk must match our model before mutating.
+        let graph = kg.read_graph();
+        assert_eq!(graph.entities.len(), live_names.len(), "entity count not durable");
+        let disk_rels: HashSet<(String, String, String)> = graph
+            .relations
+            .iter()
+            .map(|r| (r.from.clone(), r.to.clone(), r.relation_type.clone()))
+            .collect();
+        assert_eq!(disk_rels, relations, "relations not durable across reopen");
+
+        let op = rng.gen_range(0..100);
+        match op {
+            0..=45 => {
+                let entity = random_entity(&mut rng);
+                if !live_names.contains(&entity.name)
+                    && !kg.create_entities(&[entity.clone()]).unwrap().is_empty()
+                {
+                    live_names.insert(entity.name);
+                }
+            }
+            46..=60 => {
+                if !live_names.is_empty() {
+                    let names: Vec<String> = live_names.iter().cloned().collect();
+                    let victim = names[rng.gen_range(0..names.len())].clone();
+                    kg.delete_entities(&[victim.clone()]).unwrap();
+                    live_names.remove(&victim);
+                    // Cascade: relations touching the victim are gone.
+                    relations.retain(|(f, t, _)| f != &victim && t != &victim);
+                }
+            }
+            61..=85 => {
+                if live_names.len() >= 2 {
+                    let names: Vec<String> = live_names.iter().cloned().collect();
+                    let from = names[rng.gen_range(0..names.len())].clone();
+                    let to = names[rng.gen_range(0..names.len())].clone();
+                    if from != to {
+                        let rel = Relation { from: from.clone(), to: to.clone(), relation_type: "rel".into() };
+                        if !kg.create_relations(&[rel]).unwrap().is_empty() {
+                            relations.insert((from, to, "rel".into()));
+                        }
+                    }
+                }
+            }
+            _ => {
+                if !relations.is_empty() {
+                    let all: Vec<(String, String, String)> = relations.iter().cloned().collect();
+                    let target = all[rng.gen_range(0..all.len())].clone();
+                    kg.delete_relations(&[Relation {
+                        from: target.0.clone(),
+                        to: target.1.clone(),
+                        relation_type: target.2.clone(),
+                    }]).unwrap();
+                    relations.remove(&target);
+                }
+            }
+        }
+
+        kg.flush_and_sync().unwrap();
+        // kg dropped here, forcing the next iteration to replay from disk.
+    }
 
     cleanup(&path);
 }

@@ -666,6 +666,14 @@ impl KnowledgeGraph {
     // ---- Public API with write-ahead log (C1) and error propagation ----
 
     pub fn create_entities(&mut self, entities: &[Entity]) -> Result<Vec<Entity>> {
+        // Validate up front so an invalid entity never produces partial writes.
+        for entity in entities {
+            if entity.name.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Entity name must not be empty".into(),
+                ));
+            }
+        }
         let mut created = Vec::new();
         for entity in entities {
             // Check dedup before writing (using non-interning lookup)
@@ -712,6 +720,14 @@ impl KnowledgeGraph {
     }
 
     pub fn create_relations(&mut self, relations: &[Relation]) -> Result<Vec<Relation>> {
+        // Validate up front so an invalid relation never produces partial writes.
+        for relation in relations {
+            if relation.from.is_empty() || relation.to.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Relation endpoints must not be empty".into(),
+                ));
+            }
+        }
         let mut created = Vec::new();
         // Build a dedup set for O(1) duplicate checks (P5)
         let mut rel_set: HashSet<(StrId, StrId, StrId)> = HashSet::new();
