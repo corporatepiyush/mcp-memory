@@ -1,0 +1,224 @@
+[
+  {
+    "name": "create_entities",
+    "description": "Create multiple new entities in the knowledge graph. Entities that already exist (by name) are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "The unique name of the entity" },
+              "entityType": { "type": "string", "description": "The type of the entity (e.g. person, organization, event)" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "An array of observation contents associated with the entity" }
+            },
+            "required": ["name", "entityType", "observations"]
+          }
+        }
+      },
+      "required": ["entities"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "create_relations",
+    "description": "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. Relations that already exist (same from, to, relationType) are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string", "description": "The name of the entity where the relation starts" },
+              "to": { "type": "string", "description": "The name of the entity where the relation ends" },
+              "relationType": { "type": "string", "description": "The type of the relation" }
+            },
+            "required": ["from", "to", "relationType"]
+          }
+        }
+      },
+      "required": ["relations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "add_observations",
+    "description": "Add new observations to existing entities in the knowledge graph. Observations that already exist on the entity are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entityName": { "type": "string", "description": "The name of the entity to add observations to" },
+              "contents": { "type": "array", "items": { "type": "string" }, "description": "An array of observation contents to add" }
+            },
+            "required": ["entityName", "contents"]
+          }
+        }
+      },
+      "required": ["observations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "delete_entities",
+    "description": "Delete multiple entities and their associated relations from the knowledge graph. Relations referencing deleted entities (from either endpoint) are also removed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityNames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "An array of entity names to delete"
+        }
+      },
+      "required": ["entityNames"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "delete_observations",
+    "description": "Delete specific observations from entities in the knowledge graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "deletions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entityName": { "type": "string", "description": "The name of the entity containing the observations" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "An array of observations to delete" }
+            },
+            "required": ["entityName", "observations"]
+          }
+        }
+      },
+      "required": ["deletions"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "delete_relations",
+    "description": "Delete multiple relations from the knowledge graph. Each relation must match on from, to, and relationType to be deleted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string", "description": "The name of the entity where the relation starts" },
+              "to": { "type": "string", "description": "The name of the entity where the relation ends" },
+              "relationType": { "type": "string", "description": "The type of the relation" }
+            },
+            "required": ["from", "to", "relationType"]
+          }
+        }
+      },
+      "required": ["relations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "read_graph",
+    "description": "Read the entire knowledge graph, returning all entities and relations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "search_nodes",
+    "description": "Search for entities in the knowledge graph. Matches against entity names, types, and observation content (case-insensitive). Also returns any relations connected to matching entities.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Search query to match against entity names, types, and observation content" }
+      },
+      "required": ["query"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "open_nodes",
+    "description": "Open specific nodes in the knowledge graph by their entity names. Returns the requested entities along with any relations connected to them (from either endpoint).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "An array of entity names to retrieve"
+        }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "get_entity",
+    "description": "Retrieve a single entity by its exact name. Returns the entity with its observations but no associated relations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The exact name of the entity to retrieve" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "graph_stats",
+    "description": "Return aggregate statistics about the knowledge graph: entity count, relation count, total observations, search index size, and interner utilization.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "search_relations",
+    "description": "Search for relations by optional from/to/relationType filters. Omitted or empty fields match all values.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "Filter by the source entity name (optional)" },
+        "to": { "type": "string", "description": "Filter by the target entity name (optional)" },
+        "relationType": { "type": "string", "description": "Filter by relation type (optional)" }
+      }
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "find_path",
+    "description": "Find the shortest path (via relations) between two entities using BFS. Returns the sequence of entity names connecting them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "The starting entity name" },
+        "to": { "type": "string", "description": "The target entity name" }
+      },
+      "required": ["from", "to"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "compact",
+    "description": "Rewrite the binary log from the current in-memory state, discarding all tombstone/delete records. Produces a fresh minimal log containing only the current entities and relations. Use periodically to reclaim space.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  }
+]
