@@ -98,6 +98,59 @@ impl SearchIndex {
         matched
     }
 
+    /// Like [`search`], but returns `(entity_idx, score)` pairs sorted by
+    /// descending score (then ascending idx for stability). `score` is the
+    /// number of indexed-token hits the entity accumulated for the query —
+    /// a cheap relevance proxy so callers can surface the best matches first.
+    ///
+    /// The scan is a single linear pass over the flat `entries` vec (no
+    /// per-entity allocation until the final compaction), keeping it
+    /// cache-friendly. A small `Vec<(idx, score)>` is gathered then sorted.
+    pub fn search_ranked(&self, query: &str, interner: &crate::intern::StringInterner) -> Vec<(u32, u32)> {
+        if query.is_empty() || self.entries.is_empty() {
+            return Vec::new();
+        }
+
+        let lower_query: String = query.to_ascii_lowercase();
+        let qbytes = lower_query.as_bytes();
+        let qlen = qbytes.len();
+
+        // Exact-token id (if the query is itself an interned token) lets us
+        // score exact hits without a string compare.
+        let exact_id = interner.get_optional(&lower_query);
+
+        // (idx, score) gathered in one pass, idx-major so equal idxs are adjacent.
+        let mut hits: Vec<(u32, u32)> = Vec::new();
+        for &(token_id, entity_idx) in &self.entries {
+            let matches = if Some(token_id) == exact_id {
+                true
+            } else {
+                let token = interner.lookup(token_id);
+                token.len() >= qlen && token.as_bytes().starts_with(qbytes)
+            };
+            if matches {
+                match hits.last_mut() {
+                    Some(last) if last.0 == entity_idx => last.1 += 1,
+                    _ => hits.push((entity_idx, 1)),
+                }
+            }
+        }
+
+        // entries are sorted by (token, idx), so a single entity_idx may appear
+        // in non-adjacent groups (once per matching token). Merge by idx, then
+        // rank by score desc.
+        hits.sort_unstable_by_key(|&(idx, _)| idx);
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(hits.len());
+        for (idx, score) in hits {
+            match merged.last_mut() {
+                Some(last) if last.0 == idx => last.1 += score,
+                _ => merged.push((idx, score)),
+            }
+        }
+        merged.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        merged
+    }
+
     fn tokenize_and_insert(
         &mut self,
         interner: &mut crate::intern::StringInterner,
@@ -270,6 +323,36 @@ mod tests {
         let interner = StringInterner::new();
         let index = SearchIndex::new();
         assert!(index.search("anything", &interner).is_empty());
+    }
+
+    #[test]
+    fn test_search_ranked_orders_by_score() {
+        let mut interner = StringInterner::new();
+        let mut index = SearchIndex::new();
+        // Entity 0: "coffee" appears in both name and observation → score 2.
+        let n0 = interner.intern("coffee");
+        let t0 = interner.intern("drink");
+        let o0 = interner.intern("coffee beans");
+        index.index_entity(&mut interner, 0, n0, t0, &[o0]);
+        // Entity 1: "coffee" appears once (observation only) → score 1.
+        let n1 = interner.intern("Bob");
+        let t1 = interner.intern("person");
+        let o1 = interner.intern("likes coffee");
+        index.index_entity(&mut interner, 1, n1, t1, &[o1]);
+
+        let ranked = index.search_ranked("coffee", &interner);
+        assert_eq!(ranked.len(), 2);
+        // Higher score first.
+        assert_eq!(ranked[0].0, 0);
+        assert!(ranked[0].1 >= ranked[1].1);
+        assert_eq!(ranked[1].0, 1);
+    }
+
+    #[test]
+    fn test_search_ranked_empty_query() {
+        let interner = StringInterner::new();
+        let index = SearchIndex::new();
+        assert!(index.search_ranked("", &interner).is_empty());
     }
 
     #[test]

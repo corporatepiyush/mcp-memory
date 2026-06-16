@@ -18,6 +18,12 @@ pub const ALL_TOOLS: &[ToolMeta] = &[
     ToolMeta { name: "search_relations",   write: false },
     ToolMeta { name: "find_path",          write: false },
     ToolMeta { name: "compact",            write: true  },
+    ToolMeta { name: "get_neighbors",      write: false },
+    ToolMeta { name: "describe_entity",    write: false },
+    ToolMeta { name: "list_entity_types",  write: false },
+    ToolMeta { name: "list_relation_types",write: false },
+    ToolMeta { name: "upsert_entities",    write: true  },
+    ToolMeta { name: "export_graph",       write: false },
 ];
 
 #[inline]
@@ -60,5 +66,25 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), ALL_TOOLS.len(), "Duplicate tool names");
+    }
+
+    #[test]
+    fn test_tools_json_matches_all_tools() {
+        let tools_json = include_str!("../tools.json");
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(tools_json).expect("tools.json must be valid JSON");
+
+        let mut json_names: Vec<&str> = parsed
+            .iter()
+            .map(|t| t["name"].as_str().expect("each tool needs a name"))
+            .collect();
+        let mut meta_names: Vec<&str> = ALL_TOOLS.iter().map(|t| t.name).collect();
+        json_names.sort_unstable();
+        meta_names.sort_unstable();
+
+        assert_eq!(
+            json_names, meta_names,
+            "tools.json and ALL_TOOLS must declare the same tool names"
+        );
     }
 }

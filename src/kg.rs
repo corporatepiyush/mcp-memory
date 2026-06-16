@@ -47,6 +47,41 @@ struct StoredRelation {
     relation_type: StrId,
 }
 
+/// Edge-following direction for neighborhood queries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Follow `from -> to` (outgoing edges).
+    Out,
+    /// Follow `to -> from` (incoming edges).
+    In,
+    /// Follow edges regardless of orientation.
+    Both,
+}
+
+impl Direction {
+    /// Parse a direction string; anything other than `"out"`/`"in"` is `Both`.
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("out") => Direction::Out,
+            Some("in") => Direction::In,
+            _ => Direction::Both,
+        }
+    }
+}
+
+/// Escape a string for embedding inside a Mermaid/DOT quoted label.
+fn sanitize_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push('\''),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // ShardedNameTable – open-addressing hash map split into N independent shards.
 //
@@ -909,32 +944,10 @@ impl KnowledgeGraph {
         KnowledgeGraphOut { entities, relations: rels }
     }
 
+    /// Relevance-ranked substring search returning all matches (no pagination).
+    /// Equivalent to `search_nodes_filtered(query, None, 0, usize::MAX)`.
     pub fn search_nodes(&self, query: &str) -> KnowledgeGraphOut {
-        let matched = self.search.search(query, &self.interner);
-        let entities: Vec<Entity> = matched
-            .iter()
-            .filter_map(|&slot| {
-                self.entity_slots
-                    .get(slot as usize)?
-                    .as_ref()
-                    .filter(|e| e.is_live())
-                    .map(|stored| self.entity_to_output(stored))
-            })
-            .collect();
-        let entity_names: HashSet<StrId> = entities.iter()
-            .filter_map(|e| self.interner.get_optional(&e.name))
-            .collect();
-        let rels: Vec<Relation> = self
-            .relations
-            .iter()
-            .filter(|r| entity_names.contains(&r.from) || entity_names.contains(&r.to))
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
-            .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        self.search_nodes_filtered(query, None, 0, usize::MAX)
     }
 
     pub fn open_nodes(&self, names: &[String]) -> KnowledgeGraphOut {
@@ -984,6 +997,401 @@ impl KnowledgeGraph {
                 .map(|o| self.interner.lookup(*o).to_string())
                 .collect(),
         }
+    }
+
+    #[inline]
+    fn relation_to_output(&self, r: &StoredRelation) -> Relation {
+        Relation {
+            from: self.interner.lookup(r.from).to_string(),
+            to: self.interner.lookup(r.to).to_string(),
+            relation_type: self.interner.lookup(r.relation_type).to_string(),
+        }
+    }
+
+    /// Resolve a name to its live entity slot, or `None` if absent/deleted.
+    fn lookup_live_slot(&self, name: &str) -> Option<u32> {
+        let name_id = self.interner.get_optional(name)?;
+        let hash = self.interner.get_hash(name_id);
+        let slot = self.name_table.lookup(hash, name_id)?;
+        let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
+        stored.is_live().then_some(slot)
+    }
+
+    /// Materialize a live entity from its interned name id.
+    fn entity_by_name_id(&self, name_id: StrId) -> Option<Entity> {
+        let hash = self.interner.get_hash(name_id);
+        let slot = self.name_table.lookup(hash, name_id)?;
+        let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
+        stored.is_live().then(|| self.entity_to_output(stored))
+    }
+
+    /// Tally distinct entity types and their live-entity counts, ranked by
+    /// count descending (ties broken by name). One linear pass over the dense
+    /// slot vec; only the final names are allocated.
+    pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<StrId, usize> = HashMap::new();
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            *counts.entry(st.entity_type).or_insert(0) += 1;
+        }
+        self.rank_counts(counts)
+    }
+
+    /// Tally distinct relation types and their counts, ranked by count desc.
+    pub fn relation_type_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<StrId, usize> = HashMap::new();
+        for r in &self.relations {
+            *counts.entry(r.relation_type).or_insert(0) += 1;
+        }
+        self.rank_counts(counts)
+    }
+
+    fn rank_counts(&self, counts: HashMap<StrId, usize>) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(id, c)| (self.interner.lookup(id).to_string(), c))
+            .collect();
+        out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Relevance-ranked, optionally type-filtered, paginated node search.
+    /// Entities come back best-match-first (see [`SearchIndex::search_ranked`]).
+    /// Relations touching any returned entity (either endpoint) are included.
+    pub fn search_nodes_filtered(
+        &self,
+        query: &str,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> KnowledgeGraphOut {
+        let type_id = match entity_type {
+            Some(t) => match self.interner.get_optional(t) {
+                Some(id) => Some(id),
+                None => return KnowledgeGraphOut { entities: Vec::new(), relations: Vec::new() },
+            },
+            None => None,
+        };
+
+        let ranked = self.search.search_ranked(query, &self.interner);
+        let mut selected: HashSet<StrId> = HashSet::new();
+        let mut entities = Vec::new();
+        let mut skipped = 0usize;
+        for (slot, _score) in ranked {
+            let Some(st) = self
+                .entity_slots
+                .get(slot as usize)
+                .and_then(|s| s.as_ref())
+                .filter(|e| e.is_live())
+            else {
+                continue;
+            };
+            if type_id.is_some_and(|tid| st.entity_type != tid) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if entities.len() >= limit {
+                break;
+            }
+            selected.insert(st.name);
+            entities.push(self.entity_to_output(st));
+        }
+
+        let relations = self
+            .relations
+            .iter()
+            .filter(|r| selected.contains(&r.from) || selected.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        KnowledgeGraphOut { entities, relations }
+    }
+
+    /// Type-filtered, paginated view of the whole graph. Unlike [`read_graph`],
+    /// relations are restricted to those whose **both** endpoints fall in the
+    /// returned entity page, so the slice is internally consistent.
+    pub fn read_graph_filtered(
+        &self,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> KnowledgeGraphOut {
+        let type_id = match entity_type {
+            Some(t) => match self.interner.get_optional(t) {
+                Some(id) => Some(id),
+                None => return KnowledgeGraphOut { entities: Vec::new(), relations: Vec::new() },
+            },
+            None => None,
+        };
+
+        let mut selected: HashSet<StrId> = HashSet::new();
+        let mut entities = Vec::new();
+        let mut skipped = 0usize;
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            if type_id.is_some_and(|tid| st.entity_type != tid) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if entities.len() >= limit {
+                break;
+            }
+            selected.insert(st.name);
+            entities.push(self.entity_to_output(st));
+        }
+
+        let relations = self
+            .relations
+            .iter()
+            .filter(|r| selected.contains(&r.from) && selected.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        KnowledgeGraphOut { entities, relations }
+    }
+
+    /// Neighborhood expansion around `name` out to `depth` hops, following
+    /// edges in the requested [`Direction`] and (optionally) of one relation
+    /// type. Returns the origin plus reached entities, and every relation
+    /// (passing the type filter) whose endpoints are both inside that set.
+    ///
+    /// `depth == 1` (the common case) is a single linear pass over the flat
+    /// relation vec; deeper queries build an adjacency map once (O(E)) and BFS.
+    pub fn neighbors(
+        &self,
+        name: &str,
+        direction: Direction,
+        rtype: Option<&str>,
+        depth: u32,
+    ) -> Result<KnowledgeGraphOut> {
+        self.lookup_live_slot(name)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+        // Safe: lookup_live_slot succeeded, so the name is interned.
+        let start = self.interner.get_optional(name).unwrap();
+
+        // An unknown relation-type filter can match nothing: return just origin.
+        let rtype_id = match rtype {
+            Some(r) => match self.interner.get_optional(r) {
+                Some(id) => Some(id),
+                None => {
+                    let entities = self.entity_by_name_id(start).into_iter().collect();
+                    return Ok(KnowledgeGraphOut { entities, relations: Vec::new() });
+                }
+            },
+            None => None,
+        };
+
+        let mut visited: HashSet<StrId> = HashSet::new();
+        visited.insert(start);
+
+        let type_ok = |r: &StoredRelation| rtype_id.is_none_or(|rt| r.relation_type == rt);
+
+        if depth == 1 {
+            for r in self.relations.iter().filter(|r| type_ok(r)) {
+                match direction {
+                    Direction::Out => {
+                        if r.from == start {
+                            visited.insert(r.to);
+                        }
+                    }
+                    Direction::In => {
+                        if r.to == start {
+                            visited.insert(r.from);
+                        }
+                    }
+                    Direction::Both => {
+                        if r.from == start {
+                            visited.insert(r.to);
+                        } else if r.to == start {
+                            visited.insert(r.from);
+                        }
+                    }
+                }
+            }
+        } else if depth >= 2 {
+            // Build a direction-aware adjacency map once, then BFS.
+            let mut adj: HashMap<StrId, Vec<StrId>> = HashMap::new();
+            for r in self.relations.iter().filter(|r| type_ok(r)) {
+                match direction {
+                    Direction::Out => adj.entry(r.from).or_default().push(r.to),
+                    Direction::In => adj.entry(r.to).or_default().push(r.from),
+                    Direction::Both => {
+                        adj.entry(r.from).or_default().push(r.to);
+                        adj.entry(r.to).or_default().push(r.from);
+                    }
+                }
+            }
+            let mut queue: VecDeque<(StrId, u32)> = VecDeque::new();
+            queue.push_back((start, 0));
+            while let Some((node, d)) = queue.pop_front() {
+                if d >= depth {
+                    continue;
+                }
+                if let Some(nbrs) = adj.get(&node) {
+                    for &nb in nbrs {
+                        if visited.insert(nb) {
+                            queue.push_back((nb, d + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut entities = Vec::with_capacity(visited.len());
+        for &nid in &visited {
+            if let Some(e) = self.entity_by_name_id(nid) {
+                entities.push(e);
+            }
+        }
+        let relations = self
+            .relations
+            .iter()
+            .filter(|r| type_ok(r) && visited.contains(&r.from) && visited.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        Ok(KnowledgeGraphOut { entities, relations })
+    }
+
+    /// One-shot context bundle for a single entity: the entity itself, every
+    /// incident relation, its distinct neighbor names, and its degree. Saves an
+    /// agent the get_entity + two search_relations round-trips.
+    pub fn describe_entity(&self, name: &str) -> Result<serde_json::Value> {
+        let name_id = self
+            .interner
+            .get_optional(name)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+        let entity = self
+            .entity_by_name_id(name_id)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+
+        let mut incident: Vec<Relation> = Vec::new();
+        let mut neighbor_seen: HashSet<StrId> = HashSet::new();
+        let mut neighbors: Vec<&str> = Vec::new();
+        for r in &self.relations {
+            if r.from == name_id || r.to == name_id {
+                incident.push(self.relation_to_output(r));
+                let other = if r.from == name_id { r.to } else { r.from };
+                if other != name_id && neighbor_seen.insert(other) {
+                    neighbors.push(self.interner.lookup(other));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "entity": entity,
+            "relations": incident,
+            "neighbors": neighbors,
+            "degree": incident.len(),
+        }))
+    }
+
+    /// Create-or-merge a batch of entities idempotently. Missing entities are
+    /// created; existing ones keep their type and gain any new observations
+    /// (deduplicated). Returns a per-entity outcome. The caller is responsible
+    /// for flushing — every underlying op is already write-ahead logged.
+    pub fn upsert_entities(&mut self, entities: &[Entity]) -> Result<Vec<serde_json::Value>> {
+        for e in entities {
+            if e.name.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Entity name must not be empty".into(),
+                ));
+            }
+        }
+        let mut out = Vec::with_capacity(entities.len());
+        for e in entities {
+            if self.lookup_live_slot(&e.name).is_some() {
+                let added = self.add_observations(&e.name, &e.observations)?;
+                out.push(serde_json::json!({
+                    "name": e.name,
+                    "created": false,
+                    "addedObservations": added,
+                }));
+            } else {
+                let created = self.create_entities(std::slice::from_ref(e))?;
+                out.push(serde_json::json!({
+                    "name": e.name,
+                    "created": !created.is_empty(),
+                    "addedObservations": e.observations,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Serialize the graph in one of: `json` (read_graph), `mermaid`, `dot`.
+    pub fn export(&self, format: &str) -> Result<String> {
+        match format {
+            "json" => serde_json::to_string(&self.read_graph()).map_err(MCSError::JsonError),
+            "mermaid" => Ok(self.export_mermaid()),
+            "dot" => Ok(self.export_dot()),
+            other => Err(MCSError::InvalidParams(format!(
+                "Unknown export format '{other}' (expected json|mermaid|dot)"
+            ))),
+        }
+    }
+
+    /// Assign each live entity a stable `n{k}` node id for diagram output.
+    fn diagram_node_ids(&self) -> (HashMap<StrId, usize>, Vec<(usize, StrId)>) {
+        let mut ids: HashMap<StrId, usize> = HashMap::new();
+        let mut order: Vec<(usize, StrId)> = Vec::new();
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            let n = ids.len();
+            ids.insert(st.name, n);
+            order.push((n, st.name));
+        }
+        (ids, order)
+    }
+
+    fn export_mermaid(&self) -> String {
+        let (ids, order) = self.diagram_node_ids();
+        let mut s = String::with_capacity(64 + order.len() * 32 + self.relations.len() * 32);
+        s.push_str("graph LR\n");
+        for (n, name_id) in &order {
+            let label = sanitize_label(self.interner.lookup(*name_id));
+            s.push_str(&format!("  n{n}[\"{label}\"]\n"));
+        }
+        for r in &self.relations {
+            if let (Some(&a), Some(&b)) = (ids.get(&r.from), ids.get(&r.to)) {
+                let rel = sanitize_label(self.interner.lookup(r.relation_type));
+                s.push_str(&format!("  n{a} -->|{rel}| n{b}\n"));
+            }
+        }
+        s
+    }
+
+    fn export_dot(&self) -> String {
+        let (ids, order) = self.diagram_node_ids();
+        let mut s = String::with_capacity(64 + order.len() * 32 + self.relations.len() * 32);
+        s.push_str("digraph G {\n");
+        for (n, name_id) in &order {
+            let label = sanitize_label(self.interner.lookup(*name_id));
+            s.push_str(&format!("  n{n} [label=\"{label}\"];\n"));
+        }
+        for r in &self.relations {
+            if let (Some(&a), Some(&b)) = (ids.get(&r.from), ids.get(&r.to)) {
+                let rel = sanitize_label(self.interner.lookup(r.relation_type));
+                s.push_str(&format!("  n{a} -> n{b} [label=\"{rel}\"];\n"));
+            }
+        }
+        s.push_str("}\n");
+        s
     }
 
     // --- Flush & sync ---

@@ -16,7 +16,7 @@ any other MCP-compatible client.
   form via an atomic rename.
 - **Fast lookups** — string interning, an open-addressing name table, and an inverted
   search index keep CRUD, substring search, and BFS path-finding cheap.
-- **14 MCP tools** covering reads, writes, search, and graph traversal.
+- **20 MCP tools** covering reads, writes, search, graph traversal, and agent-productivity helpers.
 
 ## Installation
 
@@ -70,13 +70,19 @@ The memory file path is resolved in this order:
 | `delete_observations` | write | Remove specific observations from an entity. |
 | `delete_relations` | write | Remove exact `(from, to, type)` relations. |
 | `compact` | write | Rewrite the log to its minimal form. |
-| `read_graph` | read | Return the full graph. |
-| `search_nodes` | read | Substring search over names/types/observations. |
+| `upsert_entities` | write | Create-or-merge entities idempotently (re-assert facts without losing observations). |
+| `read_graph` | read | Return the graph; optionally filter by `entityType` and paginate. |
+| `search_nodes` | read | Relevance-ranked substring search over names/types/observations; optional type filter + pagination. |
 | `open_nodes` | read | Fetch a specific set of entities and their relations. |
 | `get_entity` | read | Fetch a single entity by name. |
+| `describe_entity` | read | One-shot bundle: entity + incident relations + neighbors + degree. |
+| `get_neighbors` | read | Neighborhood expansion to N hops, by direction and relation type. |
 | `graph_stats` | read | Entity/relation counts and other stats. |
+| `list_entity_types` | read | Distinct entity types with counts, ranked. |
+| `list_relation_types` | read | Distinct relation types with counts, ranked. |
 | `search_relations` | read | Filter relations by `from`, `to`, and/or `type`. |
 | `find_path` | read | Shortest path (BFS, undirected) between two entities. |
+| `export_graph` | read | Export the graph as `json`, `mermaid`, or `dot`. |
 
 ## Development
 

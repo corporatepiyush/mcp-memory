@@ -1241,3 +1241,192 @@ fn test_find_path_undirected_traversal() {
     assert!(result.is_err());
     cleanup(&path);
 }
+
+// =========================================================================
+// Tier-1 productivity tools
+// =========================================================================
+
+use mcp_memory::kg::Direction;
+
+fn names(out: &mcp_memory::types::KnowledgeGraphOut) -> Vec<String> {
+    let mut v: Vec<String> = out.entities.iter().map(|e| e.name.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn test_get_neighbors_depth1_both() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap(); // Alice→Bob, Alice→Charlie
+
+    let out = kg.neighbors("Alice", Direction::Both, None, 1).unwrap();
+    assert_eq!(names(&out), vec!["Alice", "Bob", "Charlie"]);
+    // Both incident edges are among the returned set.
+    assert_eq!(out.relations.len(), 2);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_direction_filters() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap(); // Alice→Bob
+
+    // Outgoing from Alice reaches Bob.
+    let out = kg.neighbors("Alice", Direction::Out, None, 1).unwrap();
+    assert_eq!(names(&out), vec!["Alice", "Bob"]);
+    // Incoming to Alice reaches nobody.
+    let inn = kg.neighbors("Alice", Direction::In, None, 1).unwrap();
+    assert_eq!(names(&inn), vec!["Alice"]);
+    // Incoming to Bob reaches Alice.
+    let bob_in = kg.neighbors("Bob", Direction::In, None, 1).unwrap();
+    assert_eq!(names(&bob_in), vec!["Alice", "Bob"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_depth2_and_rtype() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap(); // Alice→Bob→Charlie
+
+    // Depth 1 from Alice: only Bob.
+    let d1 = kg.neighbors("Alice", Direction::Out, None, 1).unwrap();
+    assert_eq!(names(&d1), vec!["Alice", "Bob"]);
+    // Depth 2 from Alice: Bob and Charlie.
+    let d2 = kg.neighbors("Alice", Direction::Out, None, 2).unwrap();
+    assert_eq!(names(&d2), vec!["Alice", "Bob", "Charlie"]);
+    // Filter on a relation type that exists.
+    let knows = kg.neighbors("Alice", Direction::Out, Some("knows"), 2).unwrap();
+    assert_eq!(names(&knows), vec!["Alice", "Bob", "Charlie"]);
+    // Filter on a type that does not exist → just the origin.
+    let none = kg.neighbors("Alice", Direction::Out, Some("nope"), 2).unwrap();
+    assert_eq!(names(&none), vec!["Alice"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_missing_entity() {
+    let (kg, path) = setup();
+    assert!(kg.neighbors("Ghost", Direction::Both, None, 1).is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_describe_entity() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap();
+
+    let v = kg.describe_entity("Alice").unwrap();
+    assert_eq!(v["entity"]["name"], "Alice");
+    assert_eq!(v["degree"], 2);
+    let neighbors = v["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 2);
+    assert_eq!(v["relations"].as_array().unwrap().len(), 2);
+
+    assert!(kg.describe_entity("Ghost").is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_list_entity_and_relation_types() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap(); // 2 person, 1 ai
+    kg.create_relations(&[knows_alice(), knows_bob(), works_with()]).unwrap(); // 2 knows, 1 works_with
+
+    let etypes = kg.entity_type_counts();
+    assert_eq!(etypes[0], ("person".to_string(), 2)); // ranked by count desc
+    assert!(etypes.contains(&("ai".to_string(), 1)));
+
+    let rtypes = kg.relation_type_counts();
+    assert_eq!(rtypes[0], ("knows".to_string(), 2));
+    assert!(rtypes.contains(&("works_with".to_string(), 1)));
+    cleanup(&path);
+}
+
+#[test]
+fn test_upsert_entities_create_then_merge() {
+    let (mut kg, path) = setup();
+
+    // First upsert creates.
+    let e = Entity { name: "Dave".into(), entity_type: "person".into(), observations: vec!["a".into()] };
+    let out = kg.upsert_entities(&[e]).unwrap();
+    assert_eq!(out[0]["created"], true);
+    assert_eq!(kg.get_entity("Dave").unwrap().observations, vec!["a".to_string()]);
+
+    // Second upsert merges new observations, keeps type, dedupes existing.
+    let e2 = Entity { name: "Dave".into(), entity_type: "robot".into(), observations: vec!["a".into(), "b".into()] };
+    let out2 = kg.upsert_entities(&[e2]).unwrap();
+    assert_eq!(out2[0]["created"], false);
+    assert_eq!(out2[0]["addedObservations"].as_array().unwrap(), &vec![serde_json::json!("b")]);
+    let dave = kg.get_entity("Dave").unwrap();
+    assert_eq!(dave.entity_type, "person"); // type unchanged on merge
+    assert_eq!(dave.observations, vec!["a".to_string(), "b".to_string()]);
+
+    // Empty name rejected.
+    let bad = Entity { name: "".into(), entity_type: "x".into(), observations: vec![] };
+    assert!(kg.upsert_entities(&[bad]).is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_search_nodes_filtered_pagination_and_type() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+
+    // "coffee" matches Alice + Charlie; restrict to type person → Alice only.
+    let only_person = kg.search_nodes_filtered("coffee", Some("person"), 0, usize::MAX);
+    assert_eq!(names(&only_person), vec!["Alice"]);
+
+    // Pagination: limit 1 returns a single entity.
+    let page = kg.search_nodes_filtered("person", None, 0, 1);
+    assert_eq!(page.entities.len(), 1);
+
+    // Unknown type → empty.
+    let empty = kg.search_nodes_filtered("coffee", Some("nope"), 0, usize::MAX);
+    assert!(empty.entities.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_read_graph_filtered() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap();
+
+    // Type filter: only the two persons; only relations between persons.
+    let persons = kg.read_graph_filtered(Some("person"), 0, usize::MAX);
+    assert_eq!(names(&persons), vec!["Alice", "Bob"]);
+    // knows_alice (Alice→Bob) is between persons; works_with (Alice→Charlie) is not.
+    assert_eq!(persons.relations.len(), 1);
+
+    // Pagination caps entity count.
+    let page = kg.read_graph_filtered(None, 0, 2);
+    assert_eq!(page.entities.len(), 2);
+    let rest = kg.read_graph_filtered(None, 2, usize::MAX);
+    assert_eq!(rest.entities.len(), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn test_export_graph_formats() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let json = kg.export("json").unwrap();
+    assert!(json.contains("Alice") && json.contains("Bob"));
+
+    let mermaid = kg.export("mermaid").unwrap();
+    assert!(mermaid.starts_with("graph LR"));
+    assert!(mermaid.contains("knows"));
+
+    let dot = kg.export("dot").unwrap();
+    assert!(dot.starts_with("digraph G {"));
+    assert!(dot.trim_end().ends_with("}"));
+
+    assert!(kg.export("yaml").is_err());
+    cleanup(&path);
+}

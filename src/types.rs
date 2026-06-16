@@ -16,7 +16,7 @@ pub struct Relation {
     pub relation_type: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnowledgeGraphOut {
     pub entities: Vec<Entity>,
     pub relations: Vec<Relation>,

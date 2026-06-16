@@ -223,7 +223,7 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result
         "delete_entities" => memory::handle_delete_entities(kg, tool_args),
         "delete_observations" => memory::handle_delete_observations(kg, tool_args),
         "delete_relations" => memory::handle_delete_relations(kg, tool_args),
-        "read_graph" => memory::handle_read_graph(kg),
+        "read_graph" => memory::handle_read_graph(kg, tool_args),
         "search_nodes" => memory::handle_search_nodes(kg, tool_args),
         "open_nodes" => memory::handle_open_nodes(kg, tool_args),
         "get_entity" => memory::handle_get_entity(kg, tool_args),
@@ -231,6 +231,12 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result
         "search_relations" => memory::handle_search_relations(kg, tool_args),
         "find_path" => memory::handle_find_path(kg, tool_args),
         "compact" => memory::handle_compact(kg),
+        "get_neighbors" => memory::handle_get_neighbors(kg, tool_args),
+        "describe_entity" => memory::handle_describe_entity(kg, tool_args),
+        "list_entity_types" => memory::handle_list_entity_types(kg),
+        "list_relation_types" => memory::handle_list_relation_types(kg),
+        "upsert_entities" => memory::handle_upsert_entities(kg, tool_args),
+        "export_graph" => memory::handle_export_graph(kg, tool_args),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
     }
 }

@@ -10,6 +10,7 @@ const MAX_OBSERVATION_BYTES: usize = 65536;
 const MAX_ENTITIES_PER_REQUEST: usize = 1000;
 const MAX_RELATIONS_PER_REQUEST: usize = 1000;
 const MAX_OBSERVATIONS_PER_ENTITY: usize = 1000;
+const MAX_NEIGHBOR_DEPTH: usize = 16;
 
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -47,9 +48,19 @@ fn lock_graph<'a>(kg: &'a Mutex<KnowledgeGraph>) -> Result<std::sync::MutexGuard
     kg.lock().map_err(|e| MCSError::MemoryError(e.to_string()))
 }
 
-pub fn handle_read_graph(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+pub fn handle_read_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
     let graph = lock_graph(kg)?;
-    let result = graph.read_graph();
+    // Fast path: no filters/pagination → the full graph (legacy behavior).
+    let params = args.unwrap_or(&Value::Null);
+    let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let has_paging = params.get("limit").is_some() || params.get("offset").is_some();
+    let result = if entity_type.is_none() && !has_paging {
+        graph.read_graph()
+    } else {
+        let offset = opt_usize(params, "offset", 0)?;
+        let limit = opt_usize(params, "limit", usize::MAX)?;
+        graph.read_graph_filtered(entity_type, offset, limit)
+    };
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
@@ -227,8 +238,12 @@ pub fn handle_search_nodes(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> 
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'query' parameter".into()))?;
 
+    let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let offset = opt_usize(params, "offset", 0)?;
+    let limit = opt_usize(params, "limit", usize::MAX)?;
+
     let graph = lock_graph(kg)?;
-    let result = graph.search_nodes(query);
+    let result = graph.search_nodes_filtered(query, entity_type, offset, limit);
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
@@ -308,4 +323,121 @@ pub fn handle_compact(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
     graph.compact()?;
     graph.flush_and_sync()?;
     Ok(text_content!("Log compacted successfully"))
+}
+
+// ---------- Tier-1 productivity tools ----------
+
+/// Read an optional non-negative integer parameter, defaulting when absent.
+fn opt_usize(params: &Value, key: &str, default: usize) -> Result<usize> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| MCSError::InvalidParams(format!("'{key}' must be a non-negative integer"))),
+    }
+}
+
+pub fn handle_get_neighbors(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
+    validate_name(name)?;
+
+    let direction = crate::kg::Direction::parse(params.get("direction").and_then(|v| v.as_str()));
+    let rtype = params.get("relationType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let depth = opt_usize(params, "depth", 1)?;
+    if depth > MAX_NEIGHBOR_DEPTH {
+        return Err(MCSError::InvalidParams(format!(
+            "depth too large (max {MAX_NEIGHBOR_DEPTH})"
+        )));
+    }
+
+    let graph = lock_graph(kg)?;
+    let result = graph.neighbors(name, direction, rtype, depth as u32)?;
+    let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+pub fn handle_describe_entity(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
+    validate_name(name)?;
+
+    let graph = lock_graph(kg)?;
+    let result = graph.describe_entity(name)?;
+    let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+pub fn handle_list_entity_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+    let graph = lock_graph(kg)?;
+    let counts = graph.entity_type_counts();
+    let arr: Vec<Value> = counts
+        .into_iter()
+        .map(|(t, c)| json!({ "type": t, "count": c }))
+        .collect();
+    let text = serde_json::to_string(&arr).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+pub fn handle_list_relation_types(kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+    let graph = lock_graph(kg)?;
+    let counts = graph.relation_type_counts();
+    let arr: Vec<Value> = counts
+        .into_iter()
+        .map(|(t, c)| json!({ "type": t, "count": c }))
+        .collect();
+    let text = serde_json::to_string(&arr).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+pub fn handle_upsert_entities(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let entities_val = params
+        .get("entities")
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'entities' parameter".into()))?;
+
+    let input_entities: Vec<crate::types::Entity> = serde_json::from_value(entities_val.clone())
+        .map_err(|e| MCSError::InvalidParams(format!("Invalid entity: {e}")))?;
+
+    if input_entities.len() > MAX_ENTITIES_PER_REQUEST {
+        return Err(MCSError::InvalidParams(format!(
+            "Too many entities (max {MAX_ENTITIES_PER_REQUEST})"
+        )));
+    }
+    for entity in &input_entities {
+        validate_name(&entity.name)?;
+        validate_name(&entity.entity_type)?;
+        if entity.observations.len() > MAX_OBSERVATIONS_PER_ENTITY {
+            return Err(MCSError::InvalidParams(format!(
+                "Too many observations per entity (max {MAX_OBSERVATIONS_PER_ENTITY})"
+            )));
+        }
+        for obs in &entity.observations {
+            validate_observation(obs)?;
+        }
+    }
+
+    let mut graph = lock_graph(kg)?;
+    let results = graph.upsert_entities(&input_entities)?;
+    graph.flush_and_sync()?;
+    let text = serde_json::to_string(&json!({ "results": results })).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+pub fn handle_export_graph(kg: &Mutex<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+    let format = args
+        .and_then(|p| p.get("format"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
+
+    let graph = lock_graph(kg)?;
+    let text = graph.export(format)?;
+    Ok(text_content!(text))
 }

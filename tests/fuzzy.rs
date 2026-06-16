@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use mcp_memory::kg::KnowledgeGraph;
+use mcp_memory::kg::{Direction, KnowledgeGraph};
 use mcp_memory::types::{Entity, Relation};
 use rand::prelude::*;
 
@@ -1234,5 +1234,254 @@ fn test_fuzzy_reopen_after_each_mutation() {
         // kg dropped here, forcing the next iteration to replay from disk.
     }
 
+    cleanup(&path);
+}
+
+// =========================================================================
+// 19. get_neighbors invariants over a random graph
+// =========================================================================
+
+#[test]
+fn test_fuzzy_neighbors_invariants() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([214u8; 32]);
+
+    let entities: Vec<Entity> = (0..40).map(|_| random_entity(&mut rng)).collect();
+    let live_names: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+    kg.create_entities(&entities).unwrap();
+    let name_vec: Vec<String> = live_names.iter().cloned().collect();
+
+    for _ in 0..80 {
+        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        if from != to {
+            let _ = kg.create_relations(&[Relation {
+                from,
+                to,
+                relation_type: "knows".into(),
+            }]);
+        }
+    }
+
+    let dirs = [Direction::Out, Direction::In, Direction::Both];
+    for _ in 0..200 {
+        let origin = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let dir = dirs[rng.gen_range(0..dirs.len())];
+        let depth = rng.gen_range(0..4);
+        let out = kg.neighbors(&origin, dir, None, depth).unwrap();
+
+        // Origin is always present; every entity is live and unique.
+        let returned: HashSet<&str> = out.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(returned.len(), out.entities.len(), "duplicate entity in neighbors");
+        assert!(returned.contains(origin.as_str()), "origin missing from neighbors");
+        for e in &out.entities {
+            assert!(live_names.contains(&e.name), "neighbors returned non-live entity");
+        }
+        // Every returned relation has both endpoints inside the returned set.
+        for r in &out.relations {
+            assert!(returned.contains(r.from.as_str()), "relation from outside neighbor set");
+            assert!(returned.contains(r.to.as_str()), "relation to outside neighbor set");
+        }
+        // depth 0 yields exactly the origin.
+        if depth == 0 {
+            assert_eq!(out.entities.len(), 1);
+            assert!(out.relations.is_empty());
+        }
+    }
+
+    // Unknown entity errors.
+    assert!(kg.neighbors("__never__", Direction::Both, None, 1).is_err());
+    cleanup(&path);
+}
+
+// =========================================================================
+// 20. describe_entity matches search_relations
+// =========================================================================
+
+#[test]
+fn test_fuzzy_describe_entity_consistency() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([215u8; 32]);
+
+    let entities: Vec<Entity> = (0..30).map(|_| random_entity(&mut rng)).collect();
+    let name_vec: Vec<String> = {
+        let s: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+        s.into_iter().collect()
+    };
+    kg.create_entities(&entities).unwrap();
+
+    for _ in 0..100 {
+        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        if from != to {
+            let _ = kg.create_relations(&[Relation {
+                from,
+                to,
+                relation_type: "rel".into(),
+            }]);
+        }
+    }
+
+    for name in &name_vec {
+        let v = kg.describe_entity(name).unwrap();
+        assert_eq!(v["entity"]["name"], name.as_str());
+        let degree = v["degree"].as_u64().unwrap() as usize;
+
+        // Incident degree equals outgoing + incoming relations.
+        let outgoing = kg.search_relations(Some(name), None, None).len();
+        let incoming = kg.search_relations(None, Some(name), None).len();
+        assert_eq!(degree, outgoing + incoming, "degree mismatch for {name}");
+        assert_eq!(v["relations"].as_array().unwrap().len(), degree);
+
+        // Neighbor count never exceeds degree and is unique.
+        let neighbors = v["neighbors"].as_array().unwrap();
+        let uniq: HashSet<&str> = neighbors.iter().filter_map(|n| n.as_str()).collect();
+        assert_eq!(uniq.len(), neighbors.len(), "duplicate neighbor");
+        assert!(neighbors.len() <= degree);
+    }
+
+    cleanup(&path);
+}
+
+// =========================================================================
+// 21. upsert is idempotent and never loses observations
+// =========================================================================
+
+#[test]
+fn test_fuzzy_upsert_idempotent() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([216u8; 32]);
+
+    // Model: name -> set of observations (type fixed at first creation).
+    let mut model: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+
+    for _ in 0..400 {
+        let entity = random_entity(&mut rng);
+        let name = entity.name.clone();
+        let obs_set: HashSet<String> = entity.observations.iter().cloned().collect();
+
+        let out = kg.upsert_entities(&[entity]).unwrap();
+        let created = out[0]["created"].as_bool().unwrap();
+        let existed = model.contains_key(&name);
+        assert_eq!(created, !existed, "created flag disagrees with model");
+
+        model.entry(name.clone()).or_default().extend(obs_set);
+
+        // Store observations must match the model union exactly.
+        let stored = kg.get_entity(&name).unwrap();
+        let stored_set: HashSet<String> = stored.observations.iter().cloned().collect();
+        assert_eq!(&stored_set, model.get(&name).unwrap(), "observation set diverged");
+        // No duplicate observations are ever stored.
+        assert_eq!(stored.observations.len(), stored_set.len(), "duplicate observation stored");
+    }
+
+    // Entity count equals the number of distinct names upserted.
+    let stats = kg.graph_stats();
+    assert_eq!(stats["entities"].as_u64().unwrap() as usize, model.len());
+    cleanup(&path);
+}
+
+// =========================================================================
+// 22. filtered search is a faithful subset of unfiltered search
+// =========================================================================
+
+#[test]
+fn test_fuzzy_filtered_search_subset() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([217u8; 32]);
+
+    let entities: Vec<Entity> = (0..200).map(|_| random_entity(&mut rng)).collect();
+    kg.create_entities(&entities).unwrap();
+
+    // A pool of query tokens drawn from real entity names.
+    let tokens: Vec<String> = entities
+        .iter()
+        .map(|e| e.name.chars().take(2).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for _ in 0..150 {
+        let q = tokens[rng.gen_range(0..tokens.len())].clone();
+        let full = kg.search_nodes(&q);
+        let full_names: HashSet<&str> = full.entities.iter().map(|e| e.name.as_str()).collect();
+
+        // Pagination subset: limit caps the count and never invents entities.
+        let limit = rng.gen_range(0..=full.entities.len().max(1));
+        let page = kg.search_nodes_filtered(&q, None, 0, limit);
+        assert!(page.entities.len() <= limit);
+        for e in &page.entities {
+            assert!(full_names.contains(e.name.as_str()), "filtered search invented an entity");
+        }
+
+        // Skipping `offset` matches yields exactly the remaining count.
+        let offset = rng.gen_range(0..=full.entities.len() + 1);
+        let rest = kg.search_nodes_filtered(&q, None, offset, usize::MAX);
+        assert_eq!(rest.entities.len(), full.entities.len().saturating_sub(offset));
+        for e in &rest.entities {
+            assert!(full_names.contains(e.name.as_str()));
+        }
+
+        // Type filter: every returned entity actually has that type.
+        if !full.entities.is_empty() {
+            let etype = full.entities[0].entity_type.clone();
+            let typed = kg.search_nodes_filtered(&q, Some(&etype), 0, usize::MAX);
+            for e in &typed.entities {
+                assert_eq!(e.entity_type, etype, "type filter leaked a wrong type");
+                assert!(full_names.contains(e.name.as_str()));
+            }
+        }
+    }
+
+    cleanup(&path);
+}
+
+// =========================================================================
+// 23. export round-trips through json and never panics
+// =========================================================================
+
+#[test]
+fn test_fuzzy_export_consistency() {
+    let path = tmp_path();
+    let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let mut rng = SmallRng::from_seed([218u8; 32]);
+
+    let entities: Vec<Entity> = (0..50).map(|_| random_entity(&mut rng)).collect();
+    let name_vec: Vec<String> = {
+        let s: HashSet<String> = entities.iter().map(|e| e.name.clone()).collect();
+        s.into_iter().collect()
+    };
+    kg.create_entities(&entities).unwrap();
+    for _ in 0..60 {
+        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        if from != to {
+            let _ = kg.create_relations(&[Relation { from, to, relation_type: "knows".into() }]);
+        }
+    }
+
+    let graph = kg.read_graph();
+
+    // JSON export deserializes back to the same entity/relation counts.
+    let json = kg.export("json").unwrap();
+    let parsed: mcp_memory::types::KnowledgeGraphOut = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.entities.len(), graph.entities.len());
+    assert_eq!(parsed.relations.len(), graph.relations.len());
+
+    // Mermaid/DOT contain a line per entity plus the header.
+    let mermaid = kg.export("mermaid").unwrap();
+    assert!(mermaid.starts_with("graph LR"));
+    assert_eq!(
+        mermaid.matches("[\"").count(),
+        graph.entities.len(),
+        "mermaid node count mismatch"
+    );
+    let dot = kg.export("dot").unwrap();
+    assert!(dot.starts_with("digraph G {"));
+
+    assert!(kg.export("xml").is_err());
     cleanup(&path);
 }

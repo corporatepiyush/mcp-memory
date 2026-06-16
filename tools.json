@@ -130,20 +130,27 @@
   },
   {
     "name": "read_graph",
-    "description": "Read the entire knowledge graph, returning all entities and relations.",
+    "description": "Read the knowledge graph. With no arguments, returns all entities and relations. Optionally filter by entityType and paginate with offset/limit; when filtered, only relations whose both endpoints fall in the returned page are included.",
     "inputSchema": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "entityType": { "type": "string", "description": "Only return entities of this type (optional)" },
+        "offset": { "type": "integer", "minimum": 0, "description": "Number of matching entities to skip (optional)" },
+        "limit": { "type": "integer", "minimum": 0, "description": "Maximum number of entities to return (optional)" }
+      }
     },
     "annotations": { "readOnlyHint": true }
   },
   {
     "name": "search_nodes",
-    "description": "Search for entities in the knowledge graph. Matches against entity names, types, and observation content (case-insensitive). Also returns any relations connected to matching entities.",
+    "description": "Search for entities in the knowledge graph. Matches against entity names, types, and observation content (case-insensitive), returned best-match-first by relevance. Also returns any relations connected to matching entities. Optionally restrict by entityType and paginate with offset/limit.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "query": { "type": "string", "description": "Search query to match against entity names, types, and observation content" }
+        "query": { "type": "string", "description": "Search query to match against entity names, types, and observation content" },
+        "entityType": { "type": "string", "description": "Only return entities of this type (optional)" },
+        "offset": { "type": "integer", "minimum": 0, "description": "Number of ranked matches to skip (optional)" },
+        "limit": { "type": "integer", "minimum": 0, "description": "Maximum number of entities to return (optional)" }
       },
       "required": ["query"]
     },
@@ -220,5 +227,84 @@
       "properties": {}
     },
     "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "get_neighbors",
+    "description": "Return the neighborhood of an entity: the entity plus all entities reachable within 'depth' hops, and the relations among them. Use this to expand context around a node in one call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The entity to expand around" },
+        "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Follow outgoing (out), incoming (in), or any (both) edges. Defaults to both." },
+        "relationType": { "type": "string", "description": "Only traverse/return relations of this type (optional)" },
+        "depth": { "type": "integer", "minimum": 0, "maximum": 16, "description": "Number of hops to expand (default 1)" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "describe_entity",
+    "description": "One-shot context bundle for a single entity: the entity with its observations, every incident relation, its distinct neighbor names, and its degree. Replaces a get_entity plus two search_relations calls.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The exact name of the entity to describe" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "list_entity_types",
+    "description": "List all distinct entity types present in the graph with their entity counts, ranked by count descending. Use to discover the schema of the memory before querying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "list_relation_types",
+    "description": "List all distinct relation types present in the graph with their counts, ranked by count descending.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "upsert_entities",
+    "description": "Create-or-merge entities idempotently. Entities that do not exist are created; existing entities keep their type and gain any new (deduplicated) observations. Use this to safely re-assert facts without losing new observations. entityType is only applied on creation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "The unique name of the entity" },
+              "entityType": { "type": "string", "description": "The type of the entity (applied only when creating)" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "Observations to add (new ones are merged in)" }
+            },
+            "required": ["name", "entityType", "observations"]
+          }
+        }
+      },
+      "required": ["entities"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "export_graph",
+    "description": "Export the entire knowledge graph as text in the requested format: 'json' (entities and relations), 'mermaid' (a Mermaid graph diagram), or 'dot' (Graphviz DOT). Defaults to json.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "format": { "type": "string", "enum": ["json", "mermaid", "dot"], "description": "Output format (default json)" }
+      }
+    },
+    "annotations": { "readOnlyHint": true }
   }
 ]
