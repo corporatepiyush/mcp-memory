@@ -24,6 +24,10 @@ pub const ALL_TOOLS: &[ToolMeta] = &[
     ToolMeta { name: "list_relation_types",write: false },
     ToolMeta { name: "upsert_entities",    write: true  },
     ToolMeta { name: "export_graph",       write: false },
+    ToolMeta { name: "merge_entities",    write: true  },
+    ToolMeta { name: "extract_subgraph",  write: false },
+    ToolMeta { name: "batch_get_entities",write: false },
+    ToolMeta { name: "find_all_paths",    write: false },
 ];
 
 #[inline]

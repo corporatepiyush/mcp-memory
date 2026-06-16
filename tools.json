@@ -306,5 +306,66 @@
       }
     },
     "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "merge_entities",
+    "description": "Merge source entity into target in O(S + R) time where S = source observations and R = incident relations. Uses add_observations (dedup internally via HashSet) + batch create_relations (dedup via HashSet) + delete_entities. Self-loop relations (source → source becomes target → target) are dropped automatically. All three sub-operations write to the write-ahead log, so a replay from disk reconstructs the merge exactly. Use to collapse duplicate entities the LLM accidentally created.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string", "description": "Entity name to merge FROM (deleted after merge)" },
+        "target": { "type": "string", "description": "Entity name to merge INTO (receives observations + redirected relations)" }
+      },
+      "required": ["source", "target"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false }
+  },
+  {
+    "name": "extract_subgraph",
+    "description": "BFS-based subgraph extraction from N seed nodes out to depth d. Builds adjacency map once (O(R)) then expands BFS queue (worst-case O(V + E) for the reached subgraph). Returns entities and only those relations whose both endpoints are in the reached set. Uses ahash-backed AHashMap/AHashSet for hashing (not SipHash) to minimize per-operation latency. Replaces N serial get_neighbors calls (each O(R) for adjacency) with a single O(R + V) pass.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Seed entity names to expand around (nonexistent names are silently skipped)"
+        },
+        "depth": { "type": "integer", "minimum": 0, "maximum": 16, "description": "BFS expansion depth (0 returns only seeds, default 1)" }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "batch_get_entities",
+    "description": "O(N) batched entity lookup for N names, each resolved via the interned-name → sharded ctrl-byte name table (Swiss-table style, O(1) expected per lookup). Missing names yield null in the corresponding position. Cuts N serial get_entity round-trips (each with its own dispatch + JSON parse + JSON serialize overhead) down to one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Entity names to retrieve (order preserved, null for missing)"
+        }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "find_all_paths",
+    "description": "Exhaustive DFS with backtracking enumerating all simple paths between two entities up to maxDepth hops, capped at maxPaths. Worst-case O(b^d) where b = average branching factor and d = maxDepth; the maxPaths cap prevents combinatorial explosion. Each path is a Vec<String> of entity names inclusive of both endpoints. Unlike find_path (single BFS shortest path), this discovers alternative routes the LLM may not have considered.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "Starting entity name" },
+        "to": { "type": "string", "description": "Target entity name" },
+        "maxDepth": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Max path length; DFS prunes beyond this bound (default 6, cost grows exponentially)" },
+        "maxPaths": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Stop after finding this many paths (default 50, prevents combinatorial explosion)" }
+      },
+      "required": ["from", "to"]
+    },
+    "annotations": { "readOnlyHint": true }
   }
 ]

@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use ahash::{AHashMap, AHashSet};
 use std::path::Path;
 
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
@@ -712,15 +714,15 @@ impl KnowledgeGraph {
         }
 
         // Build adjacency list (P4) — O(E) once, not O(V×E).
-        let mut adj: HashMap<StrId, Vec<(StrId, StrId)>> = HashMap::new();
+        let mut adj: AHashMap<StrId, Vec<(StrId, StrId)>> = AHashMap::new();
         for rel in &self.relations {
             adj.entry(rel.from).or_default().push((rel.to, rel.relation_type));
             adj.entry(rel.to).or_default().push((rel.from, rel.relation_type));
         }
 
         // BFS over adjacency list
-        let mut visited: HashSet<StrId> = HashSet::new();
-        let mut parent: HashMap<StrId, StrId> = HashMap::new();
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        let mut parent: AHashMap<StrId, StrId> = AHashMap::new();
         let mut queue: VecDeque<StrId> = VecDeque::new();
 
         visited.insert(from_id);
@@ -891,7 +893,7 @@ impl KnowledgeGraph {
         }
         let mut created = Vec::new();
         // Build a dedup set for O(1) duplicate checks (P5)
-        let mut rel_set: HashSet<(StrId, StrId, StrId)> = HashSet::new();
+        let mut rel_set: AHashSet<(StrId, StrId, StrId)> = AHashSet::new();
         for rel in &self.relations {
             rel_set.insert((rel.from, rel.to, rel.relation_type));
         }
@@ -937,8 +939,8 @@ impl KnowledgeGraph {
             .and_then(|e| e.as_mut())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
 
-        // Deduplicate new observations (P7) — use HashSet for O(1) lookups
-        let existing: HashSet<StrId> = stored.observations.iter().copied().collect();
+        // Deduplicate new observations (P7) — use AHashSet for O(1) lookups
+        let existing: AHashSet<StrId> = stored.observations.iter().copied().collect();
         let mut added = Vec::new();
         let mut interned_added = Vec::new();
         for content in contents {
@@ -991,8 +993,8 @@ impl KnowledgeGraph {
             }
         }
         if !deleted_names.is_empty() {
-            // Use a HashSet for O(1) retain checks (P5)
-            let deleted_ids: HashSet<StrId> = deleted_names.iter()
+            // Use a AHashSet for O(1) retain checks (P5)
+            let deleted_ids: AHashSet<StrId> = deleted_names.iter()
                 .map(|n| self.interner.intern(n))
                 .collect();
             self.relations
@@ -1014,7 +1016,7 @@ impl KnowledgeGraph {
             .get_mut(slot as usize)
             .and_then(|e| e.as_mut())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
-        let remove_ids: HashSet<StrId> = observations.iter().map(|o| self.interner.intern(o)).collect();
+        let remove_ids: AHashSet<StrId> = observations.iter().map(|o| self.interner.intern(o)).collect();
         stored.observations.retain(|o| !remove_ids.contains(o));
         // Write-ahead: log before re-indexing
         let mut buf = Vec::new();
@@ -1030,8 +1032,8 @@ impl KnowledgeGraph {
     }
 
     pub fn delete_relations(&mut self, relations: &[Relation]) -> Result<()> {
-        // Collect targets into a HashSet for O(1) retain checks (P5)
-        let rels: HashSet<(StrId, StrId, StrId)> = relations
+        // Collect targets into a AHashSet for O(1) retain checks (P5)
+        let rels: AHashSet<(StrId, StrId, StrId)> = relations
             .iter()
             .map(|r| {
                 (
@@ -1082,7 +1084,7 @@ impl KnowledgeGraph {
 
     /// Borrowing view variant of [`open_nodes`] (M6).
     pub fn open_nodes_view(&self, names: &[String]) -> GraphView<'_> {
-        let name_ids: HashSet<StrId> = names.iter()
+        let name_ids: AHashSet<StrId> = names.iter()
             .filter_map(|n| self.interner.get_optional(n))
             .collect();
         let entities: Vec<&StoredEntity> = self
@@ -1093,7 +1095,7 @@ impl KnowledgeGraph {
                     .filter(|stored| stored.is_live() && name_ids.contains(&stored.name))
             })
             .collect();
-        let matched_names: HashSet<StrId> = entities.iter().map(|e| e.name).collect();
+        let matched_names: AHashSet<StrId> = entities.iter().map(|e| e.name).collect();
         let relations: Vec<&StoredRelation> = self
             .relations
             .iter()
@@ -1148,7 +1150,7 @@ impl KnowledgeGraph {
     /// count descending (ties broken by name). One linear pass over the dense
     /// slot vec; only the final names are allocated.
     pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<StrId, usize> = HashMap::new();
+        let mut counts: AHashMap<StrId, usize> = AHashMap::new();
         for st in self
             .entity_slots
             .iter()
@@ -1162,14 +1164,14 @@ impl KnowledgeGraph {
 
     /// Tally distinct relation types and their counts, ranked by count desc.
     pub fn relation_type_counts(&self) -> Vec<(String, usize)> {
-        let mut counts: HashMap<StrId, usize> = HashMap::new();
+        let mut counts: AHashMap<StrId, usize> = AHashMap::new();
         for r in &self.relations {
             *counts.entry(r.relation_type).or_insert(0) += 1;
         }
         self.rank_counts(counts)
     }
 
-    fn rank_counts(&self, counts: HashMap<StrId, usize>) -> Vec<(String, usize)> {
+    fn rank_counts(&self, counts: AHashMap<StrId, usize>) -> Vec<(String, usize)> {
         let mut out: Vec<(String, usize)> = counts
             .into_iter()
             .map(|(id, c)| (self.interner.lookup(id).to_string(), c))
@@ -1208,7 +1210,7 @@ impl KnowledgeGraph {
         };
 
         let ranked = self.search.search_ranked(query, &self.interner);
-        let mut selected: HashSet<StrId> = HashSet::new();
+        let mut selected: AHashSet<StrId> = AHashSet::new();
         let mut entities: Vec<&StoredEntity> = Vec::new();
         let mut skipped = 0usize;
         for (slot, _score) in ranked {
@@ -1269,7 +1271,7 @@ impl KnowledgeGraph {
             None => None,
         };
 
-        let mut selected: HashSet<StrId> = HashSet::new();
+        let mut selected: AHashSet<StrId> = AHashSet::new();
         let mut entities: Vec<&StoredEntity> = Vec::new();
         let mut skipped = 0usize;
         for st in self
@@ -1331,7 +1333,7 @@ impl KnowledgeGraph {
             None => None,
         };
 
-        let mut visited: HashSet<StrId> = HashSet::new();
+        let mut visited: AHashSet<StrId> = AHashSet::new();
         visited.insert(start);
 
         let type_ok = |r: &StoredRelation| rtype_id.is_none_or(|rt| r.relation_type == rt);
@@ -1360,7 +1362,7 @@ impl KnowledgeGraph {
             }
         } else if depth >= 2 {
             // Build a direction-aware adjacency map once, then BFS.
-            let mut adj: HashMap<StrId, Vec<StrId>> = HashMap::new();
+            let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
             for r in self.relations.iter().filter(|r| type_ok(r)) {
                 match direction {
                     Direction::Out => adj.entry(r.from).or_default().push(r.to),
@@ -1415,7 +1417,7 @@ impl KnowledgeGraph {
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
 
         let mut incident: Vec<Relation> = Vec::new();
-        let mut neighbor_seen: HashSet<StrId> = HashSet::new();
+        let mut neighbor_seen: AHashSet<StrId> = AHashSet::new();
         let mut neighbors: Vec<&str> = Vec::new();
         for r in &self.relations {
             if r.from == name_id || r.to == name_id {
@@ -1481,8 +1483,8 @@ impl KnowledgeGraph {
     }
 
     /// Assign each live entity a stable `n{k}` node id for diagram output.
-    fn diagram_node_ids(&self) -> (HashMap<StrId, usize>, Vec<(usize, StrId)>) {
-        let mut ids: HashMap<StrId, usize> = HashMap::new();
+    fn diagram_node_ids(&self) -> (AHashMap<StrId, usize>, Vec<(usize, StrId)>) {
+        let mut ids: AHashMap<StrId, usize> = AHashMap::new();
         let mut order: Vec<(usize, StrId)> = Vec::new();
         for st in self
             .entity_slots
@@ -1530,6 +1532,239 @@ impl KnowledgeGraph {
         }
         s.push_str("}\n");
         s
+    }
+
+    // ------ High-level productivity tools ------
+
+    /// Merge `source` entity into `target` entity. All observations from
+    /// source are moved to target (deduplicated), all relations involving
+    /// source are redirected to target (deduplicated), and source is then
+    /// deleted. Every underlying mutation goes through the write-ahead log.
+    /// Caller is responsible for `flush_and_sync()`.
+    pub fn merge_entities(&mut self, source: &str, target: &str) -> Result<serde_json::Value> {
+        if source == target {
+            return Err(MCSError::InvalidParams(
+                "Source and target must be different entities".into(),
+            ));
+        }
+        self.lookup_live_slot(source).ok_or_else(|| {
+            MCSError::InvalidParams(format!("Source entity '{source}' not found"))
+        })?;
+        self.lookup_live_slot(target).ok_or_else(|| {
+            MCSError::InvalidParams(format!("Target entity '{target}' not found"))
+        })?;
+
+        let source_entity = self.get_entity(source).unwrap();
+        let moved_obs_count = source_entity.observations.len();
+
+        // Move observations to target (dedup via add_observations).
+        let added_count = if !source_entity.observations.is_empty() {
+            self.add_observations(target, &source_entity.observations)?.len()
+        } else {
+            0
+        };
+
+        // Redirect relations: create new ones with target in place of source.
+        let source_id = self.interner.get_optional(source).unwrap();
+        let source_rels: Vec<Relation> = self
+            .relations
+            .iter()
+            .filter(|r| r.from == source_id || r.to == source_id)
+            .filter_map(|r| {
+                let new_from = if r.from == source_id {
+                    target
+                } else {
+                    self.interner.lookup(r.from)
+                };
+                let new_to = if r.to == source_id {
+                    target
+                } else {
+                    self.interner.lookup(r.to)
+                };
+                // Skip self-loops — they are meaningless after redirect.
+                if new_from == new_to {
+                    None
+                } else {
+                    Some(Relation {
+                        from: new_from.to_string(),
+                        to: new_to.to_string(),
+                        relation_type: self.interner.lookup(r.relation_type).to_string(),
+                    })
+                }
+            })
+            .collect();
+
+        let redirected = self.create_relations(&source_rels)?.len() as u32;
+
+        // Delete source entity (also removes stale relations).
+        self.delete_entities(&[source.to_string()])?;
+
+        Ok(serde_json::json!({
+            "source": source,
+            "target": target,
+            "movedObservations": moved_obs_count,
+            "addedObservations": added_count,
+            "redirectedRelations": redirected,
+        }))
+    }
+
+    /// Extract a connected subgraph around one or more seed entity names,
+    /// expanding out to `depth` hops along all relations (undirected). Returns
+    /// the set of reached entities and the relations among them.
+    pub fn extract_subgraph(&self, names: &[String], depth: u32) -> Result<KnowledgeGraphOut> {
+        if names.is_empty() {
+            return Ok(KnowledgeGraphOut {
+                entities: Vec::new(),
+                relations: Vec::new(),
+            });
+        }
+        // Seed the BFS queue from any names that exist.
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        let mut queue: VecDeque<(StrId, u32)> = VecDeque::new();
+        for name in names {
+            if let Some(id) = self.interner.get_optional(name) {
+                if visited.insert(id) {
+                    queue.push_back((id, 0));
+                }
+            }
+        }
+        // Build an undirected adjacency map once.
+        let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
+        for r in &self.relations {
+            adj.entry(r.from).or_default().push(r.to);
+            adj.entry(r.to).or_default().push(r.from);
+        }
+        while let Some((node, d)) = queue.pop_front() {
+            if d >= depth {
+                continue;
+            }
+            if let Some(nbrs) = adj.get(&node) {
+                for &nb in nbrs {
+                    if visited.insert(nb) {
+                        queue.push_back((nb, d + 1));
+                    }
+                }
+            }
+        }
+        let mut entities: Vec<Entity> = Vec::with_capacity(visited.len());
+        for &nid in &visited {
+            if let Some(e) = self.entity_by_name_id(nid) {
+                entities.push(e);
+            }
+        }
+        let relations: Vec<Relation> = self
+            .relations
+            .iter()
+            .filter(|r| visited.contains(&r.from) && visited.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        Ok(KnowledgeGraphOut { entities, relations })
+    }
+
+    /// Return full entities for a list of names. Missing names yield `None`.
+    pub fn batch_get_entities(&self, names: &[String]) -> Vec<Option<Entity>> {
+        names.iter().map(|n| self.get_entity(n)).collect()
+    }
+
+    /// Recursive DFS helper — collects every simple path from `current` to
+    /// `target` up to `max_depth` hops, capped at `max_paths` results.
+    fn dfs_all_paths(
+        adj: &AHashMap<StrId, Vec<StrId>>,
+        current: StrId,
+        target: StrId,
+        max_depth: usize,
+        max_paths: usize,
+        visited: &mut AHashSet<StrId>,
+        current_path: &mut Vec<StrId>,
+        all_paths: &mut Vec<Vec<StrId>>,
+    ) {
+        if all_paths.len() >= max_paths {
+            return;
+        }
+        if current == target && current_path.len() > 1 {
+            all_paths.push(current_path.clone());
+            return;
+        }
+        if current_path.len() > max_depth {
+            return;
+        }
+        if let Some(neighbors) = adj.get(&current) {
+            for &nb in neighbors {
+                if visited.insert(nb) {
+                    current_path.push(nb);
+                    Self::dfs_all_paths(
+                        adj, nb, target, max_depth, max_paths, visited, current_path, all_paths,
+                    );
+                    current_path.pop();
+                    visited.remove(&nb);
+                }
+            }
+        }
+    }
+
+    /// Find all simple paths between `from` and `to` up to `max_depth` hops,
+    /// returning at most `max_paths` results. Paths are found via DFS with
+    /// backtracking and include both endpoints.
+    pub fn find_all_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        max_paths: usize,
+    ) -> Result<Vec<Vec<String>>> {
+        let from_id = self
+            .interner
+            .get_optional(from)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{from}' not found")))?;
+        let to_id = self
+            .interner
+            .get_optional(to)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{to}' not found")))?;
+        // Verify both are live.
+        if self.lookup_live_slot(from).is_none() {
+            return Err(MCSError::InvalidParams(format!("Entity '{from}' not found")));
+        }
+        if self.lookup_live_slot(to).is_none() {
+            return Err(MCSError::InvalidParams(format!("Entity '{to}' not found")));
+        }
+        if from_id == to_id {
+            return Ok(vec![vec![from.to_string()]]);
+        }
+        // Build undirected adjacency.
+        let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
+        for r in &self.relations {
+            adj.entry(r.from).or_default().push(r.to);
+            adj.entry(r.to).or_default().push(r.from);
+        }
+        let mut all_paths: Vec<Vec<StrId>> = Vec::new();
+        let mut current_path = Vec::new();
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        visited.insert(from_id);
+        current_path.push(from_id);
+        Self::dfs_all_paths(
+            &adj,
+            from_id,
+            to_id,
+            max_depth,
+            max_paths,
+            &mut visited,
+            &mut current_path,
+            &mut all_paths,
+        );
+        if all_paths.is_empty() {
+            return Err(MCSError::MemoryError(format!(
+                "No path found between '{from}' and '{to}'"
+            )));
+        }
+        let result: Vec<Vec<String>> = all_paths
+            .into_iter()
+            .map(|path| {
+                path.into_iter()
+                    .map(|id| self.interner.lookup(id).to_string())
+                    .collect()
+            })
+            .collect();
+        Ok(result)
     }
 
     // --- Flush & sync ---

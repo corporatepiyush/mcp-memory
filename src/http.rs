@@ -14,7 +14,8 @@
 //! differs (see [`crate::server::dispatch_http_body`]).
 
 use std::convert::Infallible;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};

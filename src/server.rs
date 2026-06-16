@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -312,6 +314,10 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &RwLock<KnowledgeGraph>) -> Resul
         "list_relation_types" => memory::handle_list_relation_types(kg),
         "upsert_entities" => memory::handle_upsert_entities(kg, tool_args),
         "export_graph" => memory::handle_export_graph(kg, tool_args),
+        "merge_entities" => memory::handle_merge_entities(kg, tool_args),
+        "extract_subgraph" => memory::handle_extract_subgraph(kg, tool_args),
+        "batch_get_entities" => memory::handle_batch_get_entities(kg, tool_args),
+        "find_all_paths" => memory::handle_find_all_paths(kg, tool_args),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
     }
 }

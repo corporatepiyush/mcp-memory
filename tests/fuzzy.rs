@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use mcp_memory::kg::{Direction, KnowledgeGraph};
 use mcp_memory::types::{Entity, Relation};
@@ -466,7 +467,7 @@ fn test_concurrent_fuzzy_stress() {
 
     // Pre-seed with entities
     {
-        let mut guard = kg_mutex.write().unwrap();
+        let mut guard = kg_mutex.write();
         let entities: Vec<Entity> = (0..30).map(|_| random_entity(&mut rng)).collect();
         guard.create_entities(&entities).unwrap();
     }
@@ -482,7 +483,7 @@ fn test_concurrent_fuzzy_stress() {
             let mut rng = SmallRng::from_seed(seed.to_le_bytes().repeat(4).try_into().unwrap());
             for _ in 0..ops_per_thread {
                 let op: u32 = rng.gen_range(0..100);
-                let mut guard = kg.write().unwrap();
+                let mut guard = kg.write();
                 match op {
                     0..=40 => {
                         let entity = random_entity(&mut rng);
@@ -534,7 +535,7 @@ fn test_concurrent_fuzzy_stress() {
 
     // Verify the graph is consistent
     {
-        let guard = kg_mutex.read().unwrap();
+        let guard = kg_mutex.read();
         let stats = guard.graph_stats();
         let entity_count = stats["entities"].as_u64().unwrap() as usize;
         let rel_count = stats["relations"].as_u64().unwrap() as usize;
