@@ -93,4 +93,4 @@ Unicode/large-string handling).
 
 ## License
 
-MIT
+Licensed under the [Apache License, Version 2.0](LICENSE).
