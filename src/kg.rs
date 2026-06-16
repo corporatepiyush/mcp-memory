@@ -842,9 +842,10 @@ impl KnowledgeGraph {
             self.store.write_record(RecordKind::AddObservations, &buf)
                 .map_err(MCSError::IoError)?;
 
-            self.search.remove_entity(slot);
+            // Incrementally index only the new observation tokens (P3) — no
+            // full remove + re-index of the whole entity.
             self.search
-                .index_entity(&mut self.interner, slot, stored.name, stored.entity_type, &stored.observations);
+                .index_additional(&mut self.interner, slot, &interned_added);
         }
         Ok(added)
     }

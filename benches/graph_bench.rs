@@ -120,8 +120,9 @@ fn benches(c: &mut Criterion) {
 
     // Note: point *mutations* (add_observations/delete_observations) resolve a
     // slot via name_table then read/write that single StoredEntity in place —
-    // the same slot-access pattern as `get_entity_random` above, so that bench
-    // is the representative cache-line-straddle case for writes too.
+    // the same slot-access pattern as `get_entity_random` above. add_observations
+    // additionally merges only the *new* tokens into the search index in one
+    // O(index + new) pass rather than removing and re-indexing the whole entity.
 
     let _ = std::fs::remove_file(&path);
 }

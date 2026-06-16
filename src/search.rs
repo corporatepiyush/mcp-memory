@@ -44,11 +44,25 @@ impl SearchIndex {
         entity_type: StrId,
         observations: &[StrId],
     ) {
-        self.tokenize_and_insert(interner, entity_idx, name);
-        self.tokenize_and_insert(interner, entity_idx, entity_type);
-        for &obs in observations {
-            self.tokenize_and_insert(interner, entity_idx, obs);
-        }
+        let mut texts = Vec::with_capacity(2 + observations.len());
+        texts.push(name);
+        texts.push(entity_type);
+        texts.extend_from_slice(observations);
+        self.insert_tokens(interner, entity_idx, &texts);
+    }
+
+    /// Incrementally index additional strings (e.g. newly added observations)
+    /// for an entity that is *already* indexed, without removing and rebuilding
+    /// its existing entries (P3). Token entries that already exist are deduped
+    /// during the merge, so calling this with text that overlaps existing
+    /// tokens is safe.
+    pub fn index_additional(
+        &mut self,
+        interner: &mut crate::intern::StringInterner,
+        entity_idx: u32,
+        texts: &[StrId],
+    ) {
+        self.insert_tokens(interner, entity_idx, texts);
     }
 
     /// Remove all entries for a given entity (before re-indexing).
@@ -151,36 +165,67 @@ impl SearchIndex {
         merged
     }
 
-    fn tokenize_and_insert(
+    /// Tokenize every string in `texts`, collect the resulting
+    /// `(token, entity_idx)` entries, and merge them into the sorted `entries`
+    /// vec in a single O(N + K) pass (P2). This replaces the previous
+    /// per-token `Vec::insert`, which shifted the tail on every token and made
+    /// indexing O(K × N).
+    fn insert_tokens(
         &mut self,
         interner: &mut crate::intern::StringInterner,
         entity_idx: u32,
-        text: StrId,
+        texts: &[StrId],
     ) {
-        let s = interner.lookup(text);
-        if s.is_empty() {
+        let mut additions: Vec<(StrId, u32)> = Vec::new();
+        for &text in texts {
+            let s = interner.lookup(text);
+            if s.is_empty() {
+                continue;
+            }
+            self.lower_buf.clear();
+            self.lower_buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+            let lowered = unsafe { std::str::from_utf8_unchecked(&self.lower_buf) };
+            let tokens: Vec<&str> =
+                lowered.split_whitespace().filter(|t| !t.is_empty()).collect();
+            for token in tokens {
+                additions.push((interner.intern(token), entity_idx));
+            }
+        }
+        if additions.is_empty() {
             return;
         }
-
-        self.lower_buf.clear();
-        self.lower_buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
-        let lowered = unsafe { std::str::from_utf8_unchecked(&self.lower_buf) };
-
-        let tokens: Vec<&str> = lowered.split_whitespace().filter(|t| !t.is_empty()).collect();
-        let interned: Vec<StrId> = tokens.iter().map(|t| interner.intern(t)).collect();
-
-        for token_id in &interned {
-            self.insert_entry(*token_id, entity_idx);
-        }
+        additions.sort_unstable();
+        additions.dedup();
+        self.merge_entries(&additions);
     }
 
-    fn insert_entry(&mut self, token: StrId, entity_idx: u32) {
-        let entry = (token, entity_idx);
-        let pos = match self.entries.binary_search(&entry) {
-            Ok(_) => return,
-            Err(pos) => pos,
-        };
-        self.entries.insert(pos, entry);
+    /// Merge a pre-sorted, deduped slice of new entries into `entries`
+    /// (also sorted and deduped) in one linear pass. Entries already present
+    /// are skipped, preserving the no-duplicate invariant.
+    fn merge_entries(&mut self, additions: &[(StrId, u32)]) {
+        let old = std::mem::take(&mut self.entries);
+        let mut merged = Vec::with_capacity(old.len() + additions.len());
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() && j < additions.len() {
+            match old[i].cmp(&additions[j]) {
+                std::cmp::Ordering::Less => {
+                    merged.push(old[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(additions[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(old[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend_from_slice(&old[i..]);
+        merged.extend_from_slice(&additions[j..]);
+        self.entries = merged;
     }
 }
 
