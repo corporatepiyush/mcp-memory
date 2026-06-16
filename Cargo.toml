@@ -22,12 +22,26 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ahash = "0.8"
 
+[features]
+# Pad/align the hot in-memory records (StoredEntity, StoredRelation) to
+# cache-line-friendly sizes so individual records never straddle a 64-byte
+# line. Helps point lookups/mutations (and any future atomic fields, which
+# would otherwise risk x86 split-locks) at the cost of extra memory and a
+# wider stride on bulk scans. Off by default — enable and benchmark on the
+# target box before adopting (`cargo bench --features cache_align`).
+cache_align = []
+
 [dev-dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bin]]
 name = "mcp-memory"
 path = "src/main.rs"
+
+[[bench]]
+name = "graph_bench"
+harness = false
 
 [profile.release]
 opt-level = 3

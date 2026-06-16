@@ -28,6 +28,12 @@ const unsafe fn prefetch_addr(_addr: *const u8) {}
 // ---------------------------------------------------------------------------
 // StoredEntity / StoredRelation – internal representations using StrId.
 // ---------------------------------------------------------------------------
+// Default layout: 40 B / align 8 (Rust packs `state` into the Vec's padding and
+// the `Option` niche is free). With `cache_align`, the slot is rounded to a full
+// 64-byte line so a point lookup/mutation (name_table -> slot index) touches
+// exactly one cache line instead of occasionally straddling two. Costs +60%
+// memory and a wider stride on bulk scans — measure before enabling.
+#[cfg_attr(feature = "cache_align", repr(align(64)))]
 struct StoredEntity {
     state: u8,
     name: StrId,
@@ -41,6 +47,10 @@ impl StoredEntity {
     }
 }
 
+// Default layout: 12 B / align 4 → ~1 in 5 records straddles a 64-byte line.
+// With `cache_align`, align(16) rounds the size to 16 B so 4 records fill a line
+// exactly (no straddle, AVX2-load-friendly) for +33% memory.
+#[cfg_attr(feature = "cache_align", repr(align(16)))]
 struct StoredRelation {
     from: StrId,
     to: StrId,
