@@ -1,5 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use ahash::{AHashMap, AHashSet};
 use std::path::Path;
+
+use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
 
 use crate::errors::{MCSError, Result};
 use crate::intern::{StrId, StringInterner};
@@ -28,6 +32,12 @@ const unsafe fn prefetch_addr(_addr: *const u8) {}
 // ---------------------------------------------------------------------------
 // StoredEntity / StoredRelation – internal representations using StrId.
 // ---------------------------------------------------------------------------
+// Default layout: 40 B / align 8 (Rust packs `state` into the Vec's padding and
+// the `Option` niche is free). With `cache_align`, the slot is rounded to a full
+// 64-byte line so a point lookup/mutation (name_table -> slot index) touches
+// exactly one cache line instead of occasionally straddling two. Costs +60%
+// memory and a wider stride on bulk scans — measure before enabling.
+#[cfg_attr(feature = "cache_align", repr(align(64)))]
 struct StoredEntity {
     state: u8,
     name: StrId,
@@ -41,10 +51,144 @@ impl StoredEntity {
     }
 }
 
+// Default layout: 12 B / align 4 → ~1 in 5 records straddles a 64-byte line.
+// With `cache_align`, align(16) rounds the size to 16 B so 4 records fill a line
+// exactly (no straddle, AVX2-load-friendly) for +33% memory.
+#[cfg_attr(feature = "cache_align", repr(align(16)))]
 struct StoredRelation {
     from: StrId,
     to: StrId,
     relation_type: StrId,
+}
+
+// ---------------------------------------------------------------------------
+// Borrowing serialization views (M6).
+//
+// Read tools used to build owned `Entity`/`Relation` vecs (a fresh `String`
+// per name/type/observation) and *then* serialize them — roughly 2-3x the
+// graph resident at once. These views instead hold references to the selected
+// stored records and emit their interned `&str` directly during
+// serialization, with no intermediate owned strings. The emitted JSON is
+// byte-for-byte identical to serializing `KnowledgeGraphOut`.
+// ---------------------------------------------------------------------------
+
+/// A borrowing view over a selected slice of the graph. Serializes to
+/// `{"entities":[...],"relations":[...]}`.
+pub struct GraphView<'a> {
+    kg: &'a KnowledgeGraph,
+    entities: Vec<&'a StoredEntity>,
+    relations: Vec<&'a StoredRelation>,
+}
+
+impl GraphView<'_> {
+    /// Materialize into the owned [`KnowledgeGraphOut`]. Used by the direct
+    /// (non-serializing) callers and tests; the server's read handlers
+    /// serialize the view directly instead.
+    pub fn to_owned_out(&self) -> KnowledgeGraphOut {
+        KnowledgeGraphOut {
+            entities: self.entities.iter().map(|e| self.kg.entity_to_output(e)).collect(),
+            relations: self.relations.iter().map(|r| self.kg.relation_to_output(r)).collect(),
+        }
+    }
+}
+
+impl Serialize for GraphView<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("KnowledgeGraphOut", 2)?;
+        st.serialize_field("entities", &EntityListRef { kg: self.kg, items: &self.entities })?;
+        st.serialize_field("relations", &RelationListRef { kg: self.kg, items: &self.relations })?;
+        st.end()
+    }
+}
+
+struct EntityListRef<'a> { kg: &'a KnowledgeGraph, items: &'a [&'a StoredEntity] }
+impl Serialize for EntityListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &e in self.items {
+            seq.serialize_element(&EntityRef { kg: self.kg, e })?;
+        }
+        seq.end()
+    }
+}
+
+struct RelationListRef<'a> { kg: &'a KnowledgeGraph, items: &'a [&'a StoredRelation] }
+impl Serialize for RelationListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &r in self.items {
+            seq.serialize_element(&RelationRef { kg: self.kg, r })?;
+        }
+        seq.end()
+    }
+}
+
+struct EntityRef<'a> { kg: &'a KnowledgeGraph, e: &'a StoredEntity }
+impl Serialize for EntityRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Entity", 3)?;
+        st.serialize_field("name", self.kg.interner.lookup(self.e.name))?;
+        st.serialize_field("entityType", self.kg.interner.lookup(self.e.entity_type))?;
+        st.serialize_field("observations", &ObsRef { kg: self.kg, obs: &self.e.observations })?;
+        st.end()
+    }
+}
+
+struct ObsRef<'a> { kg: &'a KnowledgeGraph, obs: &'a [StrId] }
+impl Serialize for ObsRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.obs.len()))?;
+        for &o in self.obs {
+            seq.serialize_element(self.kg.interner.lookup(o))?;
+        }
+        seq.end()
+    }
+}
+
+struct RelationRef<'a> { kg: &'a KnowledgeGraph, r: &'a StoredRelation }
+impl Serialize for RelationRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Relation", 3)?;
+        st.serialize_field("from", self.kg.interner.lookup(self.r.from))?;
+        st.serialize_field("to", self.kg.interner.lookup(self.r.to))?;
+        st.serialize_field("relationType", self.kg.interner.lookup(self.r.relation_type))?;
+        st.end()
+    }
+}
+
+/// Edge-following direction for neighborhood queries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+    /// Follow `from -> to` (outgoing edges).
+    Out,
+    /// Follow `to -> from` (incoming edges).
+    In,
+    /// Follow edges regardless of orientation.
+    Both,
+}
+
+impl Direction {
+    /// Parse a direction string; anything other than `"out"`/`"in"` is `Both`.
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("out") => Direction::Out,
+            Some("in") => Direction::In,
+            _ => Direction::Both,
+        }
+    }
+}
+
+/// Escape a string for embedding inside a Mermaid/DOT quoted label.
+fn sanitize_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push('\''),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +214,6 @@ const fn h1(hash: u64, mask: usize) -> usize {
 
 struct NameTableShard {
     ctrl: Vec<u8>,      // 0xFF = empty; 0x00-0x7F = h2 stamp (bit 7 always clear)
-    hashes: Vec<u64>,   // full 64-bit hash (used only during grow/rehash)
     names: Vec<StrId>,
     slots: Vec<u32>,
     mask: usize,
@@ -82,7 +225,6 @@ impl NameTableShard {
         let cap = capacity.next_power_of_two().max(16);
         Self {
             ctrl: vec![EMPTY_SLOT; cap],
-            hashes: vec![0; cap],
             names: vec![StrId::EMPTY; cap],
             slots: vec![u32::MAX; cap],
             mask: cap - 1,
@@ -122,9 +264,9 @@ impl NameTableShard {
         None
     }
 
-    fn insert(&mut self, hash: u64, name: StrId, slot: u32) {
+    fn insert(&mut self, interner: &StringInterner, hash: u64, name: StrId, slot: u32) {
         if self.count * 4 > self.ctrl.len() * 3 {
-            self.grow();
+            self.grow(interner);
         }
         let stamp = h2(hash);
         let mask = self.mask;
@@ -134,7 +276,6 @@ impl NameTableShard {
             unsafe {
                 if *self.ctrl.get_unchecked(idx) & 0x80 != 0 {
                     *self.ctrl.get_unchecked_mut(idx) = stamp;
-                    *self.hashes.get_unchecked_mut(idx) = hash;
                     *self.names.get_unchecked_mut(idx) = name;
                     *self.slots.get_unchecked_mut(idx) = slot;
                     self.count += 1;
@@ -145,7 +286,7 @@ impl NameTableShard {
         }
     }
 
-    fn remove(&mut self, hash: u64, name: StrId) {
+    fn remove(&mut self, interner: &StringInterner, hash: u64, name: StrId) {
         let stamp = h2(hash);
         let mask = self.mask;
         let mut idx = h1(hash, mask);
@@ -157,18 +298,18 @@ impl NameTableShard {
             if self.ctrl[idx] == stamp && self.names[idx] == name {
                 // Found — remove with shift-back to preserve probe chains.
                 self.ctrl[idx] = EMPTY_SLOT;
-                self.hashes[idx] = 0;
                 self.names[idx] = StrId::EMPTY;
                 self.slots[idx] = u32::MAX;
                 self.count -= 1;
 
                 let mut next = (idx + 1) & mask;
                 while self.ctrl[next] & 0x80 == 0 {
-                    let nh = self.hashes[next];
                     let nn = self.names[next];
                     let ns = self.slots[next];
+                    // Hash is no longer stored (M4) — recompute it from the
+                    // interned name to find the entry's ideal bucket.
+                    let nh = interner.get_hash(nn);
                     self.ctrl[next] = EMPTY_SLOT;
-                    self.hashes[next] = 0;
                     self.names[next] = StrId::EMPTY;
                     self.slots[next] = u32::MAX;
                     self.count -= 1;
@@ -180,7 +321,6 @@ impl NameTableShard {
                         re_idx = (re_idx + 1) & mask;
                     }
                     self.ctrl[re_idx] = nstamp;
-                    self.hashes[re_idx] = nh;
                     self.names[re_idx] = nn;
                     self.slots[re_idx] = ns;
                     self.count += 1;
@@ -193,31 +333,30 @@ impl NameTableShard {
         }
     }
 
-    fn grow(&mut self) {
+    fn grow(&mut self, interner: &StringInterner) {
         let new_cap = self.ctrl.len() * 2;
         let new_mask = new_cap - 1;
         let mut new_ctrl = vec![EMPTY_SLOT; new_cap];
-        let mut new_hashes = vec![0u64; new_cap];
         let mut new_names = vec![StrId::EMPTY; new_cap];
         let mut new_slots = vec![u32::MAX; new_cap];
 
         for i in 0..self.ctrl.len() {
             if self.ctrl[i] & 0x80 == 0 {
-                let hash = self.hashes[i];
+                // Recompute the hash from the interned name (M4: not stored).
+                let name = self.names[i];
+                let hash = interner.get_hash(name);
                 let stamp = h2(hash);
                 let mut idx = h1(hash, new_mask);
                 while new_ctrl[idx] & 0x80 == 0 {
                     idx = (idx + 1) & new_mask;
                 }
                 new_ctrl[idx] = stamp;
-                new_hashes[idx] = hash;
-                new_names[idx] = self.names[i];
+                new_names[idx] = name;
                 new_slots[idx] = self.slots[i];
             }
         }
 
         self.ctrl = new_ctrl;
-        self.hashes = new_hashes;
         self.names = new_names;
         self.slots = new_slots;
         self.mask = new_mask;
@@ -251,13 +390,13 @@ impl ShardedNameTable {
     }
 
     #[inline(always)]
-    fn insert(&mut self, hash: u64, name: StrId, slot: u32) {
-        self.shards[Self::shard(hash)].insert(hash, name, slot);
+    fn insert(&mut self, interner: &StringInterner, hash: u64, name: StrId, slot: u32) {
+        self.shards[Self::shard(hash)].insert(interner, hash, name, slot);
     }
 
     #[inline(always)]
-    fn remove(&mut self, hash: u64, name: StrId) {
-        self.shards[Self::shard(hash)].remove(hash, name);
+    fn remove(&mut self, interner: &StringInterner, hash: u64, name: StrId) {
+        self.shards[Self::shard(hash)].remove(interner, hash, name);
     }
 }
 
@@ -267,6 +406,9 @@ impl ShardedNameTable {
 pub struct KnowledgeGraph {
     interner: StringInterner,
     entity_slots: Vec<Option<StoredEntity>>,
+    /// Tombstoned slot indices available for reuse on the next create (M2),
+    /// so create/delete churn doesn't grow `entity_slots` without bound.
+    free_slots: Vec<u32>,
     name_table: ShardedNameTable,
     relations: Vec<StoredRelation>,
     search: SearchIndex,
@@ -339,9 +481,18 @@ impl KnowledgeGraph {
             }
         })?;
 
+        // Slots tombstoned by deletes during replay are available for reuse (M2).
+        let free_slots: Vec<u32> = entity_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_none())
+            .map(|(i, _)| i as u32)
+            .collect();
+
         Ok(Self {
             interner,
             entity_slots,
+            free_slots,
             name_table,
             relations,
             search,
@@ -374,7 +525,7 @@ impl KnowledgeGraph {
             observations: obs_ids.clone(),
         }));
         let hash = interner.get_hash(name_id);
-        name_table.insert(hash, name_id, slot);
+        name_table.insert(&*interner, hash, name_id, slot);
         search.index_entity(interner, slot, name_id, type_id, &obs_ids);
     }
 
@@ -423,7 +574,7 @@ impl KnowledgeGraph {
         {
             entities[slot as usize] = None;
             search.remove_entity(slot);
-            name_table.remove(hash, name_id);
+            name_table.remove(&*interner, hash, name_id);
         }
         rels.retain(|r| r.from != name_id && r.to != name_id);
     }
@@ -563,15 +714,15 @@ impl KnowledgeGraph {
         }
 
         // Build adjacency list (P4) — O(E) once, not O(V×E).
-        let mut adj: HashMap<StrId, Vec<(StrId, StrId)>> = HashMap::new();
+        let mut adj: AHashMap<StrId, Vec<(StrId, StrId)>> = AHashMap::new();
         for rel in &self.relations {
             adj.entry(rel.from).or_default().push((rel.to, rel.relation_type));
             adj.entry(rel.to).or_default().push((rel.from, rel.relation_type));
         }
 
         // BFS over adjacency list
-        let mut visited: HashSet<StrId> = HashSet::new();
-        let mut parent: HashMap<StrId, StrId> = HashMap::new();
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        let mut parent: AHashMap<StrId, StrId> = AHashMap::new();
         let mut queue: VecDeque<StrId> = VecDeque::new();
 
         visited.insert(from_id);
@@ -657,8 +808,13 @@ impl KnowledgeGraph {
         // 3. Atomically rename over the original (atomic on POSIX)
         std::fs::rename(&tmp_path, self.store.path()).map_err(MCSError::IoError)?;
 
-        // 4. Reopen the store with the new file
-        self.store = BinaryStore::new(self.store.path()).map_err(MCSError::IoError)?;
+        // 4. Rebuild the entire in-memory graph from the compacted log (M1/M2).
+        //    Replaying into fresh structures reclaims the interner arena (stale
+        //    strings from deleted/edited entities), tombstoned entity slots, and
+        //    stale search-index entries — none of which the old reopen-only path
+        //    reclaimed.
+        let path = self.store.path().clone();
+        *self = KnowledgeGraph::new(&path).map_err(MCSError::IoError)?;
 
         Ok(())
     }
@@ -666,6 +822,14 @@ impl KnowledgeGraph {
     // ---- Public API with write-ahead log (C1) and error propagation ----
 
     pub fn create_entities(&mut self, entities: &[Entity]) -> Result<Vec<Entity>> {
+        // Validate up front so an invalid entity never produces partial writes.
+        for entity in entities {
+            if entity.name.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Entity name must not be empty".into(),
+                ));
+            }
+        }
         let mut created = Vec::new();
         for entity in entities {
             // Check dedup before writing (using non-interning lookup)
@@ -692,16 +856,23 @@ impl KnowledgeGraph {
                 .iter()
                 .map(|o| self.interner.intern(o))
                 .collect();
-            let slot = self.entity_slots.len() as u32;
+            // Reuse a tombstoned slot if one is free (M2); its old search-index
+            // entries were cleared on delete, so the slot starts clean.
+            let reused = self.free_slots.pop();
+            let slot = reused.unwrap_or(self.entity_slots.len() as u32);
             self.search
                 .index_entity(&mut self.interner, slot, name_id, type_id, &obs_ids);
-            self.entity_slots.push(Some(StoredEntity {
+            let stored = Some(StoredEntity {
                 state: ENTITY_SLOT_LIVE,
                 name: name_id,
                 entity_type: type_id,
                 observations: obs_ids,
-            }));
-            self.name_table.insert(hash, name_id, slot);
+            });
+            match reused {
+                Some(s) => self.entity_slots[s as usize] = stored,
+                None => self.entity_slots.push(stored),
+            }
+            self.name_table.insert(&self.interner, hash, name_id, slot);
             created.push(Entity {
                 name: entity.name.clone(),
                 entity_type: entity.entity_type.clone(),
@@ -712,9 +883,17 @@ impl KnowledgeGraph {
     }
 
     pub fn create_relations(&mut self, relations: &[Relation]) -> Result<Vec<Relation>> {
+        // Validate up front so an invalid relation never produces partial writes.
+        for relation in relations {
+            if relation.from.is_empty() || relation.to.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Relation endpoints must not be empty".into(),
+                ));
+            }
+        }
         let mut created = Vec::new();
         // Build a dedup set for O(1) duplicate checks (P5)
-        let mut rel_set: HashSet<(StrId, StrId, StrId)> = HashSet::new();
+        let mut rel_set: AHashSet<(StrId, StrId, StrId)> = AHashSet::new();
         for rel in &self.relations {
             rel_set.insert((rel.from, rel.to, rel.relation_type));
         }
@@ -760,8 +939,8 @@ impl KnowledgeGraph {
             .and_then(|e| e.as_mut())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
 
-        // Deduplicate new observations (P7) — use HashSet for O(1) lookups
-        let existing: HashSet<StrId> = stored.observations.iter().copied().collect();
+        // Deduplicate new observations (P7) — use AHashSet for O(1) lookups
+        let existing: AHashSet<StrId> = stored.observations.iter().copied().collect();
         let mut added = Vec::new();
         let mut interned_added = Vec::new();
         for content in contents {
@@ -781,9 +960,10 @@ impl KnowledgeGraph {
             self.store.write_record(RecordKind::AddObservations, &buf)
                 .map_err(MCSError::IoError)?;
 
-            self.search.remove_entity(slot);
+            // Incrementally index only the new observation tokens (P3) — no
+            // full remove + re-index of the whole entity.
             self.search
-                .index_entity(&mut self.interner, slot, stored.name, stored.entity_type, &stored.observations);
+                .index_additional(&mut self.interner, slot, &interned_added);
         }
         Ok(added)
     }
@@ -805,15 +985,16 @@ impl KnowledgeGraph {
                         .map_err(MCSError::IoError)?;
 
                     self.entity_slots[slot as usize] = None;
+                    self.free_slots.push(slot);
                     self.search.remove_entity(slot);
-                    self.name_table.remove(hash, name_id);
+                    self.name_table.remove(&self.interner, hash, name_id);
                     deleted_names.push(name.clone());
                 }
             }
         }
         if !deleted_names.is_empty() {
-            // Use a HashSet for O(1) retain checks (P5)
-            let deleted_ids: HashSet<StrId> = deleted_names.iter()
+            // Use a AHashSet for O(1) retain checks (P5)
+            let deleted_ids: AHashSet<StrId> = deleted_names.iter()
                 .map(|n| self.interner.intern(n))
                 .collect();
             self.relations
@@ -835,7 +1016,7 @@ impl KnowledgeGraph {
             .get_mut(slot as usize)
             .and_then(|e| e.as_mut())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
-        let remove_ids: HashSet<StrId> = observations.iter().map(|o| self.interner.intern(o)).collect();
+        let remove_ids: AHashSet<StrId> = observations.iter().map(|o| self.interner.intern(o)).collect();
         stored.observations.retain(|o| !remove_ids.contains(o));
         // Write-ahead: log before re-indexing
         let mut buf = Vec::new();
@@ -851,8 +1032,8 @@ impl KnowledgeGraph {
     }
 
     pub fn delete_relations(&mut self, relations: &[Relation]) -> Result<()> {
-        // Collect targets into a HashSet for O(1) retain checks (P5)
-        let rels: HashSet<(StrId, StrId, StrId)> = relations
+        // Collect targets into a AHashSet for O(1) retain checks (P5)
+        let rels: AHashSet<(StrId, StrId, StrId)> = relations
             .iter()
             .map(|r| {
                 (
@@ -875,83 +1056,52 @@ impl KnowledgeGraph {
     }
 
     pub fn read_graph(&self) -> KnowledgeGraphOut {
-        let entities: Vec<Entity> = self
+        self.read_graph_view().to_owned_out()
+    }
+
+    /// Borrowing, allocation-light view of the full graph (M6). Serializing it
+    /// streams interned `&str` directly instead of materializing a `String`
+    /// per name/type/observation.
+    pub fn read_graph_view(&self) -> GraphView<'_> {
+        let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
-            .map(|stored| self.entity_to_output(stored))
             .collect();
-        let rels: Vec<Relation> = self
-            .relations
-            .iter()
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
-            .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        let relations: Vec<&StoredRelation> = self.relations.iter().collect();
+        GraphView { kg: self, entities, relations }
     }
 
+    /// Relevance-ranked substring search returning all matches (no pagination).
+    /// Equivalent to `search_nodes_filtered(query, None, 0, usize::MAX)`.
     pub fn search_nodes(&self, query: &str) -> KnowledgeGraphOut {
-        let matched = self.search.search(query, &self.interner);
-        let entities: Vec<Entity> = matched
-            .iter()
-            .filter_map(|&slot| {
-                self.entity_slots
-                    .get(slot as usize)?
-                    .as_ref()
-                    .filter(|e| e.is_live())
-                    .map(|stored| self.entity_to_output(stored))
-            })
-            .collect();
-        let entity_names: HashSet<StrId> = entities.iter()
-            .filter_map(|e| self.interner.get_optional(&e.name))
-            .collect();
-        let rels: Vec<Relation> = self
-            .relations
-            .iter()
-            .filter(|r| entity_names.contains(&r.from) || entity_names.contains(&r.to))
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
-            .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        self.search_nodes_filtered(query, None, 0, usize::MAX)
     }
 
     pub fn open_nodes(&self, names: &[String]) -> KnowledgeGraphOut {
-        let name_ids: HashSet<StrId> = names.iter()
+        self.open_nodes_view(names).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`open_nodes`] (M6).
+    pub fn open_nodes_view(&self, names: &[String]) -> GraphView<'_> {
+        let name_ids: AHashSet<StrId> = names.iter()
             .filter_map(|n| self.interner.get_optional(n))
             .collect();
-        let entities: Vec<Entity> = self
+        let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
             .filter_map(|s| {
-                s.as_ref().and_then(|stored| {
-                    if stored.is_live() && name_ids.contains(&stored.name) {
-                        Some(self.entity_to_output(stored))
-                    } else {
-                        None
-                    }
-                })
+                s.as_ref()
+                    .filter(|stored| stored.is_live() && name_ids.contains(&stored.name))
             })
             .collect();
-        let matched_names: HashSet<StrId> = entities.iter()
-            .filter_map(|e| self.interner.get_optional(&e.name))
-            .collect();
-        let rels: Vec<Relation> = self
+        let matched_names: AHashSet<StrId> = entities.iter().map(|e| e.name).collect();
+        let relations: Vec<&StoredRelation> = self
             .relations
             .iter()
             .filter(|r| matched_names.contains(&r.from) || matched_names.contains(&r.to))
-            .map(|r| Relation {
-                from: self.interner.lookup(r.from).to_string(),
-                to: self.interner.lookup(r.to).to_string(),
-                relation_type: self.interner.lookup(r.relation_type).to_string(),
-            })
             .collect();
-        KnowledgeGraphOut { entities, relations: rels }
+        GraphView { kg: self, entities, relations }
     }
 
     // -----------------------------------------------------------------------
@@ -968,6 +1118,653 @@ impl KnowledgeGraph {
                 .map(|o| self.interner.lookup(*o).to_string())
                 .collect(),
         }
+    }
+
+    #[inline]
+    fn relation_to_output(&self, r: &StoredRelation) -> Relation {
+        Relation {
+            from: self.interner.lookup(r.from).to_string(),
+            to: self.interner.lookup(r.to).to_string(),
+            relation_type: self.interner.lookup(r.relation_type).to_string(),
+        }
+    }
+
+    /// Resolve a name to its live entity slot, or `None` if absent/deleted.
+    fn lookup_live_slot(&self, name: &str) -> Option<u32> {
+        let name_id = self.interner.get_optional(name)?;
+        let hash = self.interner.get_hash(name_id);
+        let slot = self.name_table.lookup(hash, name_id)?;
+        let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
+        stored.is_live().then_some(slot)
+    }
+
+    /// Materialize a live entity from its interned name id.
+    fn entity_by_name_id(&self, name_id: StrId) -> Option<Entity> {
+        let hash = self.interner.get_hash(name_id);
+        let slot = self.name_table.lookup(hash, name_id)?;
+        let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
+        stored.is_live().then(|| self.entity_to_output(stored))
+    }
+
+    /// Tally distinct entity types and their live-entity counts, ranked by
+    /// count descending (ties broken by name). One linear pass over the dense
+    /// slot vec; only the final names are allocated.
+    pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: AHashMap<StrId, usize> = AHashMap::new();
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            *counts.entry(st.entity_type).or_insert(0) += 1;
+        }
+        self.rank_counts(counts)
+    }
+
+    /// Tally distinct relation types and their counts, ranked by count desc.
+    pub fn relation_type_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: AHashMap<StrId, usize> = AHashMap::new();
+        for r in &self.relations {
+            *counts.entry(r.relation_type).or_insert(0) += 1;
+        }
+        self.rank_counts(counts)
+    }
+
+    fn rank_counts(&self, counts: AHashMap<StrId, usize>) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = counts
+            .into_iter()
+            .map(|(id, c)| (self.interner.lookup(id).to_string(), c))
+            .collect();
+        out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Relevance-ranked, optionally type-filtered, paginated node search.
+    /// Entities come back best-match-first (see [`SearchIndex::search_ranked`]).
+    /// Relations touching any returned entity (either endpoint) are included.
+    pub fn search_nodes_filtered(
+        &self,
+        query: &str,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> KnowledgeGraphOut {
+        self.search_nodes_view(query, entity_type, offset, limit).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`search_nodes_filtered`] (M6).
+    pub fn search_nodes_view(
+        &self,
+        query: &str,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GraphView<'_> {
+        let type_id = match entity_type {
+            Some(t) => match self.interner.get_optional(t) {
+                Some(id) => Some(id),
+                None => return GraphView { kg: self, entities: Vec::new(), relations: Vec::new() },
+            },
+            None => None,
+        };
+
+        let ranked = self.search.search_ranked(query, &self.interner);
+        let mut selected: AHashSet<StrId> = AHashSet::new();
+        let mut entities: Vec<&StoredEntity> = Vec::new();
+        let mut skipped = 0usize;
+        for (slot, _score) in ranked {
+            let Some(st) = self
+                .entity_slots
+                .get(slot as usize)
+                .and_then(|s| s.as_ref())
+                .filter(|e| e.is_live())
+            else {
+                continue;
+            };
+            if type_id.is_some_and(|tid| st.entity_type != tid) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if entities.len() >= limit {
+                break;
+            }
+            selected.insert(st.name);
+            entities.push(st);
+        }
+
+        let relations: Vec<&StoredRelation> = self
+            .relations
+            .iter()
+            .filter(|r| selected.contains(&r.from) || selected.contains(&r.to))
+            .collect();
+        GraphView { kg: self, entities, relations }
+    }
+
+    /// Type-filtered, paginated view of the whole graph. Unlike [`read_graph`],
+    /// relations are restricted to those whose **both** endpoints fall in the
+    /// returned entity page, so the slice is internally consistent.
+    pub fn read_graph_filtered(
+        &self,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> KnowledgeGraphOut {
+        self.read_graph_filtered_view(entity_type, offset, limit).to_owned_out()
+    }
+
+    /// Borrowing view variant of [`read_graph_filtered`] (M6).
+    pub fn read_graph_filtered_view(
+        &self,
+        entity_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GraphView<'_> {
+        let type_id = match entity_type {
+            Some(t) => match self.interner.get_optional(t) {
+                Some(id) => Some(id),
+                None => return GraphView { kg: self, entities: Vec::new(), relations: Vec::new() },
+            },
+            None => None,
+        };
+
+        let mut selected: AHashSet<StrId> = AHashSet::new();
+        let mut entities: Vec<&StoredEntity> = Vec::new();
+        let mut skipped = 0usize;
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            if type_id.is_some_and(|tid| st.entity_type != tid) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if entities.len() >= limit {
+                break;
+            }
+            selected.insert(st.name);
+            entities.push(st);
+        }
+
+        let relations: Vec<&StoredRelation> = self
+            .relations
+            .iter()
+            .filter(|r| selected.contains(&r.from) && selected.contains(&r.to))
+            .collect();
+        GraphView { kg: self, entities, relations }
+    }
+
+    /// Neighborhood expansion around `name` out to `depth` hops, following
+    /// edges in the requested [`Direction`] and (optionally) of one relation
+    /// type. Returns the origin plus reached entities, and every relation
+    /// (passing the type filter) whose endpoints are both inside that set.
+    ///
+    /// `depth == 1` (the common case) is a single linear pass over the flat
+    /// relation vec; deeper queries build an adjacency map once (O(E)) and BFS.
+    pub fn neighbors(
+        &self,
+        name: &str,
+        direction: Direction,
+        rtype: Option<&str>,
+        depth: u32,
+    ) -> Result<KnowledgeGraphOut> {
+        self.lookup_live_slot(name)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+        // Safe: lookup_live_slot succeeded, so the name is interned.
+        let start = self.interner.get_optional(name).unwrap();
+
+        // An unknown relation-type filter can match nothing: return just origin.
+        let rtype_id = match rtype {
+            Some(r) => match self.interner.get_optional(r) {
+                Some(id) => Some(id),
+                None => {
+                    let entities = self.entity_by_name_id(start).into_iter().collect();
+                    return Ok(KnowledgeGraphOut { entities, relations: Vec::new() });
+                }
+            },
+            None => None,
+        };
+
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        visited.insert(start);
+
+        let type_ok = |r: &StoredRelation| rtype_id.is_none_or(|rt| r.relation_type == rt);
+
+        if depth == 1 {
+            for r in self.relations.iter().filter(|r| type_ok(r)) {
+                match direction {
+                    Direction::Out => {
+                        if r.from == start {
+                            visited.insert(r.to);
+                        }
+                    }
+                    Direction::In => {
+                        if r.to == start {
+                            visited.insert(r.from);
+                        }
+                    }
+                    Direction::Both => {
+                        if r.from == start {
+                            visited.insert(r.to);
+                        } else if r.to == start {
+                            visited.insert(r.from);
+                        }
+                    }
+                }
+            }
+        } else if depth >= 2 {
+            // Build a direction-aware adjacency map once, then BFS.
+            let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
+            for r in self.relations.iter().filter(|r| type_ok(r)) {
+                match direction {
+                    Direction::Out => adj.entry(r.from).or_default().push(r.to),
+                    Direction::In => adj.entry(r.to).or_default().push(r.from),
+                    Direction::Both => {
+                        adj.entry(r.from).or_default().push(r.to);
+                        adj.entry(r.to).or_default().push(r.from);
+                    }
+                }
+            }
+            let mut queue: VecDeque<(StrId, u32)> = VecDeque::new();
+            queue.push_back((start, 0));
+            while let Some((node, d)) = queue.pop_front() {
+                if d >= depth {
+                    continue;
+                }
+                if let Some(nbrs) = adj.get(&node) {
+                    for &nb in nbrs {
+                        if visited.insert(nb) {
+                            queue.push_back((nb, d + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut entities = Vec::with_capacity(visited.len());
+        for &nid in &visited {
+            if let Some(e) = self.entity_by_name_id(nid) {
+                entities.push(e);
+            }
+        }
+        let relations = self
+            .relations
+            .iter()
+            .filter(|r| type_ok(r) && visited.contains(&r.from) && visited.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        Ok(KnowledgeGraphOut { entities, relations })
+    }
+
+    /// One-shot context bundle for a single entity: the entity itself, every
+    /// incident relation, its distinct neighbor names, and its degree. Saves an
+    /// agent the get_entity + two search_relations round-trips.
+    pub fn describe_entity(&self, name: &str) -> Result<serde_json::Value> {
+        let name_id = self
+            .interner
+            .get_optional(name)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+        let entity = self
+            .entity_by_name_id(name_id)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{name}' not found")))?;
+
+        let mut incident: Vec<Relation> = Vec::new();
+        let mut neighbor_seen: AHashSet<StrId> = AHashSet::new();
+        let mut neighbors: Vec<&str> = Vec::new();
+        for r in &self.relations {
+            if r.from == name_id || r.to == name_id {
+                incident.push(self.relation_to_output(r));
+                let other = if r.from == name_id { r.to } else { r.from };
+                if other != name_id && neighbor_seen.insert(other) {
+                    neighbors.push(self.interner.lookup(other));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "entity": entity,
+            "relations": incident,
+            "neighbors": neighbors,
+            "degree": incident.len(),
+        }))
+    }
+
+    /// Create-or-merge a batch of entities idempotently. Missing entities are
+    /// created; existing ones keep their type and gain any new observations
+    /// (deduplicated). Returns a per-entity outcome. The caller is responsible
+    /// for flushing — every underlying op is already write-ahead logged.
+    pub fn upsert_entities(&mut self, entities: &[Entity]) -> Result<Vec<serde_json::Value>> {
+        for e in entities {
+            if e.name.is_empty() {
+                return Err(MCSError::InvalidParams(
+                    "Entity name must not be empty".into(),
+                ));
+            }
+        }
+        let mut out = Vec::with_capacity(entities.len());
+        for e in entities {
+            if self.lookup_live_slot(&e.name).is_some() {
+                let added = self.add_observations(&e.name, &e.observations)?;
+                out.push(serde_json::json!({
+                    "name": e.name,
+                    "created": false,
+                    "addedObservations": added,
+                }));
+            } else {
+                let created = self.create_entities(std::slice::from_ref(e))?;
+                out.push(serde_json::json!({
+                    "name": e.name,
+                    "created": !created.is_empty(),
+                    "addedObservations": e.observations,
+                }));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Serialize the graph in one of: `json` (read_graph), `mermaid`, `dot`.
+    pub fn export(&self, format: &str) -> Result<String> {
+        match format {
+            "json" => serde_json::to_string(&self.read_graph()).map_err(MCSError::JsonError),
+            "mermaid" => Ok(self.export_mermaid()),
+            "dot" => Ok(self.export_dot()),
+            other => Err(MCSError::InvalidParams(format!(
+                "Unknown export format '{other}' (expected json|mermaid|dot)"
+            ))),
+        }
+    }
+
+    /// Assign each live entity a stable `n{k}` node id for diagram output.
+    fn diagram_node_ids(&self) -> (AHashMap<StrId, usize>, Vec<(usize, StrId)>) {
+        let mut ids: AHashMap<StrId, usize> = AHashMap::new();
+        let mut order: Vec<(usize, StrId)> = Vec::new();
+        for st in self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|e| e.is_live())
+        {
+            let n = ids.len();
+            ids.insert(st.name, n);
+            order.push((n, st.name));
+        }
+        (ids, order)
+    }
+
+    fn export_mermaid(&self) -> String {
+        let (ids, order) = self.diagram_node_ids();
+        let mut s = String::with_capacity(64 + order.len() * 32 + self.relations.len() * 32);
+        s.push_str("graph LR\n");
+        for (n, name_id) in &order {
+            let label = sanitize_label(self.interner.lookup(*name_id));
+            s.push_str(&format!("  n{n}[\"{label}\"]\n"));
+        }
+        for r in &self.relations {
+            if let (Some(&a), Some(&b)) = (ids.get(&r.from), ids.get(&r.to)) {
+                let rel = sanitize_label(self.interner.lookup(r.relation_type));
+                s.push_str(&format!("  n{a} -->|{rel}| n{b}\n"));
+            }
+        }
+        s
+    }
+
+    fn export_dot(&self) -> String {
+        let (ids, order) = self.diagram_node_ids();
+        let mut s = String::with_capacity(64 + order.len() * 32 + self.relations.len() * 32);
+        s.push_str("digraph G {\n");
+        for (n, name_id) in &order {
+            let label = sanitize_label(self.interner.lookup(*name_id));
+            s.push_str(&format!("  n{n} [label=\"{label}\"];\n"));
+        }
+        for r in &self.relations {
+            if let (Some(&a), Some(&b)) = (ids.get(&r.from), ids.get(&r.to)) {
+                let rel = sanitize_label(self.interner.lookup(r.relation_type));
+                s.push_str(&format!("  n{a} -> n{b} [label=\"{rel}\"];\n"));
+            }
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    // ------ High-level productivity tools ------
+
+    /// Merge `source` entity into `target` entity. All observations from
+    /// source are moved to target (deduplicated), all relations involving
+    /// source are redirected to target (deduplicated), and source is then
+    /// deleted. Every underlying mutation goes through the write-ahead log.
+    /// Caller is responsible for `flush_and_sync()`.
+    pub fn merge_entities(&mut self, source: &str, target: &str) -> Result<serde_json::Value> {
+        if source == target {
+            return Err(MCSError::InvalidParams(
+                "Source and target must be different entities".into(),
+            ));
+        }
+        self.lookup_live_slot(source).ok_or_else(|| {
+            MCSError::InvalidParams(format!("Source entity '{source}' not found"))
+        })?;
+        self.lookup_live_slot(target).ok_or_else(|| {
+            MCSError::InvalidParams(format!("Target entity '{target}' not found"))
+        })?;
+
+        let source_entity = self.get_entity(source).unwrap();
+        let moved_obs_count = source_entity.observations.len();
+
+        // Move observations to target (dedup via add_observations).
+        let added_count = if !source_entity.observations.is_empty() {
+            self.add_observations(target, &source_entity.observations)?.len()
+        } else {
+            0
+        };
+
+        // Redirect relations: create new ones with target in place of source.
+        let source_id = self.interner.get_optional(source).unwrap();
+        let source_rels: Vec<Relation> = self
+            .relations
+            .iter()
+            .filter(|r| r.from == source_id || r.to == source_id)
+            .filter_map(|r| {
+                let new_from = if r.from == source_id {
+                    target
+                } else {
+                    self.interner.lookup(r.from)
+                };
+                let new_to = if r.to == source_id {
+                    target
+                } else {
+                    self.interner.lookup(r.to)
+                };
+                // Skip self-loops — they are meaningless after redirect.
+                if new_from == new_to {
+                    None
+                } else {
+                    Some(Relation {
+                        from: new_from.to_string(),
+                        to: new_to.to_string(),
+                        relation_type: self.interner.lookup(r.relation_type).to_string(),
+                    })
+                }
+            })
+            .collect();
+
+        let redirected = self.create_relations(&source_rels)?.len() as u32;
+
+        // Delete source entity (also removes stale relations).
+        self.delete_entities(&[source.to_string()])?;
+
+        Ok(serde_json::json!({
+            "source": source,
+            "target": target,
+            "movedObservations": moved_obs_count,
+            "addedObservations": added_count,
+            "redirectedRelations": redirected,
+        }))
+    }
+
+    /// Extract a connected subgraph around one or more seed entity names,
+    /// expanding out to `depth` hops along all relations (undirected). Returns
+    /// the set of reached entities and the relations among them.
+    pub fn extract_subgraph(&self, names: &[String], depth: u32) -> Result<KnowledgeGraphOut> {
+        if names.is_empty() {
+            return Ok(KnowledgeGraphOut {
+                entities: Vec::new(),
+                relations: Vec::new(),
+            });
+        }
+        // Seed the BFS queue from any names that exist.
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        let mut queue: VecDeque<(StrId, u32)> = VecDeque::new();
+        for name in names {
+            if let Some(id) = self.interner.get_optional(name) {
+                if visited.insert(id) {
+                    queue.push_back((id, 0));
+                }
+            }
+        }
+        // Build an undirected adjacency map once.
+        let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
+        for r in &self.relations {
+            adj.entry(r.from).or_default().push(r.to);
+            adj.entry(r.to).or_default().push(r.from);
+        }
+        while let Some((node, d)) = queue.pop_front() {
+            if d >= depth {
+                continue;
+            }
+            if let Some(nbrs) = adj.get(&node) {
+                for &nb in nbrs {
+                    if visited.insert(nb) {
+                        queue.push_back((nb, d + 1));
+                    }
+                }
+            }
+        }
+        let mut entities: Vec<Entity> = Vec::with_capacity(visited.len());
+        for &nid in &visited {
+            if let Some(e) = self.entity_by_name_id(nid) {
+                entities.push(e);
+            }
+        }
+        let relations: Vec<Relation> = self
+            .relations
+            .iter()
+            .filter(|r| visited.contains(&r.from) && visited.contains(&r.to))
+            .map(|r| self.relation_to_output(r))
+            .collect();
+        Ok(KnowledgeGraphOut { entities, relations })
+    }
+
+    /// Return full entities for a list of names. Missing names yield `None`.
+    pub fn batch_get_entities(&self, names: &[String]) -> Vec<Option<Entity>> {
+        names.iter().map(|n| self.get_entity(n)).collect()
+    }
+
+    /// Recursive DFS helper — collects every simple path from `current` to
+    /// `target` up to `max_depth` hops, capped at `max_paths` results.
+    fn dfs_all_paths(
+        adj: &AHashMap<StrId, Vec<StrId>>,
+        current: StrId,
+        target: StrId,
+        max_depth: usize,
+        max_paths: usize,
+        visited: &mut AHashSet<StrId>,
+        current_path: &mut Vec<StrId>,
+        all_paths: &mut Vec<Vec<StrId>>,
+    ) {
+        if all_paths.len() >= max_paths {
+            return;
+        }
+        if current == target && current_path.len() > 1 {
+            all_paths.push(current_path.clone());
+            return;
+        }
+        if current_path.len() > max_depth {
+            return;
+        }
+        if let Some(neighbors) = adj.get(&current) {
+            for &nb in neighbors {
+                if visited.insert(nb) {
+                    current_path.push(nb);
+                    Self::dfs_all_paths(
+                        adj, nb, target, max_depth, max_paths, visited, current_path, all_paths,
+                    );
+                    current_path.pop();
+                    visited.remove(&nb);
+                }
+            }
+        }
+    }
+
+    /// Find all simple paths between `from` and `to` up to `max_depth` hops,
+    /// returning at most `max_paths` results. Paths are found via DFS with
+    /// backtracking and include both endpoints.
+    pub fn find_all_paths(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+        max_paths: usize,
+    ) -> Result<Vec<Vec<String>>> {
+        let from_id = self
+            .interner
+            .get_optional(from)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{from}' not found")))?;
+        let to_id = self
+            .interner
+            .get_optional(to)
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{to}' not found")))?;
+        // Verify both are live.
+        if self.lookup_live_slot(from).is_none() {
+            return Err(MCSError::InvalidParams(format!("Entity '{from}' not found")));
+        }
+        if self.lookup_live_slot(to).is_none() {
+            return Err(MCSError::InvalidParams(format!("Entity '{to}' not found")));
+        }
+        if from_id == to_id {
+            return Ok(vec![vec![from.to_string()]]);
+        }
+        // Build undirected adjacency.
+        let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
+        for r in &self.relations {
+            adj.entry(r.from).or_default().push(r.to);
+            adj.entry(r.to).or_default().push(r.from);
+        }
+        let mut all_paths: Vec<Vec<StrId>> = Vec::new();
+        let mut current_path = Vec::new();
+        let mut visited: AHashSet<StrId> = AHashSet::new();
+        visited.insert(from_id);
+        current_path.push(from_id);
+        Self::dfs_all_paths(
+            &adj,
+            from_id,
+            to_id,
+            max_depth,
+            max_paths,
+            &mut visited,
+            &mut current_path,
+            &mut all_paths,
+        );
+        if all_paths.is_empty() {
+            return Err(MCSError::MemoryError(format!(
+                "No path found between '{from}' and '{to}'"
+            )));
+        }
+        let result: Vec<Vec<String>> = all_paths
+            .into_iter()
+            .map(|path| {
+                path.into_iter()
+                    .map(|id| self.interner.lookup(id).to_string())
+                    .collect()
+            })
+            .collect();
+        Ok(result)
     }
 
     // --- Flush & sync ---

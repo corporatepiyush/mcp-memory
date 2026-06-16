@@ -23,8 +23,20 @@ async fn inner_main() -> Result<()> {
     let mcp_server = server::MCPServer::new((*config).clone())?;
     info!("Server initialized successfully");
 
-    info!("Running in stdio mode");
-    mcp_server.run_stdio().await?;
+    match args.transport {
+        mcp_memory::Transport::Stdio => {
+            info!("Running in stdio mode");
+            mcp_server.run_stdio().await?;
+        }
+        mcp_memory::Transport::Tcp => {
+            info!("Running in TCP mode on {}", config.bind_addr);
+            mcp_server.run_tcp(&config.bind_addr).await?;
+        }
+        mcp_memory::Transport::Http => {
+            info!("Running in HTTP mode on {}", config.bind_addr);
+            mcp_server.run_http(&config.bind_addr).await?;
+        }
+    }
 
     info!("Server shutdown complete");
     Ok(())

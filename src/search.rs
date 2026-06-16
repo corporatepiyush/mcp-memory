@@ -44,11 +44,25 @@ impl SearchIndex {
         entity_type: StrId,
         observations: &[StrId],
     ) {
-        self.tokenize_and_insert(interner, entity_idx, name);
-        self.tokenize_and_insert(interner, entity_idx, entity_type);
-        for &obs in observations {
-            self.tokenize_and_insert(interner, entity_idx, obs);
-        }
+        let mut texts = Vec::with_capacity(2 + observations.len());
+        texts.push(name);
+        texts.push(entity_type);
+        texts.extend_from_slice(observations);
+        self.insert_tokens(interner, entity_idx, &texts);
+    }
+
+    /// Incrementally index additional strings (e.g. newly added observations)
+    /// for an entity that is *already* indexed, without removing and rebuilding
+    /// its existing entries (P3). Token entries that already exist are deduped
+    /// during the merge, so calling this with text that overlaps existing
+    /// tokens is safe.
+    pub fn index_additional(
+        &mut self,
+        interner: &mut crate::intern::StringInterner,
+        entity_idx: u32,
+        texts: &[StrId],
+    ) {
+        self.insert_tokens(interner, entity_idx, texts);
     }
 
     /// Remove all entries for a given entity (before re-indexing).
@@ -98,36 +112,120 @@ impl SearchIndex {
         matched
     }
 
-    fn tokenize_and_insert(
+    /// Like [`search`], but returns `(entity_idx, score)` pairs sorted by
+    /// descending score (then ascending idx for stability). `score` is the
+    /// number of indexed-token hits the entity accumulated for the query —
+    /// a cheap relevance proxy so callers can surface the best matches first.
+    ///
+    /// The scan is a single linear pass over the flat `entries` vec (no
+    /// per-entity allocation until the final compaction), keeping it
+    /// cache-friendly. A small `Vec<(idx, score)>` is gathered then sorted.
+    pub fn search_ranked(&self, query: &str, interner: &crate::intern::StringInterner) -> Vec<(u32, u32)> {
+        if query.is_empty() || self.entries.is_empty() {
+            return Vec::new();
+        }
+
+        let lower_query: String = query.to_ascii_lowercase();
+        let qbytes = lower_query.as_bytes();
+        let qlen = qbytes.len();
+
+        // Exact-token id (if the query is itself an interned token) lets us
+        // score exact hits without a string compare.
+        let exact_id = interner.get_optional(&lower_query);
+
+        // (idx, score) gathered in one pass, idx-major so equal idxs are adjacent.
+        let mut hits: Vec<(u32, u32)> = Vec::new();
+        for &(token_id, entity_idx) in &self.entries {
+            let matches = if Some(token_id) == exact_id {
+                true
+            } else {
+                let token = interner.lookup(token_id);
+                token.len() >= qlen && token.as_bytes().starts_with(qbytes)
+            };
+            if matches {
+                match hits.last_mut() {
+                    Some(last) if last.0 == entity_idx => last.1 += 1,
+                    _ => hits.push((entity_idx, 1)),
+                }
+            }
+        }
+
+        // entries are sorted by (token, idx), so a single entity_idx may appear
+        // in non-adjacent groups (once per matching token). Merge by idx, then
+        // rank by score desc.
+        hits.sort_unstable_by_key(|&(idx, _)| idx);
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(hits.len());
+        for (idx, score) in hits {
+            match merged.last_mut() {
+                Some(last) if last.0 == idx => last.1 += score,
+                _ => merged.push((idx, score)),
+            }
+        }
+        merged.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        merged
+    }
+
+    /// Tokenize every string in `texts`, collect the resulting
+    /// `(token, entity_idx)` entries, and merge them into the sorted `entries`
+    /// vec in a single O(N + K) pass (P2). This replaces the previous
+    /// per-token `Vec::insert`, which shifted the tail on every token and made
+    /// indexing O(K × N).
+    fn insert_tokens(
         &mut self,
         interner: &mut crate::intern::StringInterner,
         entity_idx: u32,
-        text: StrId,
+        texts: &[StrId],
     ) {
-        let s = interner.lookup(text);
-        if s.is_empty() {
+        let mut additions: Vec<(StrId, u32)> = Vec::new();
+        for &text in texts {
+            let s = interner.lookup(text);
+            if s.is_empty() {
+                continue;
+            }
+            self.lower_buf.clear();
+            self.lower_buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+            let lowered = unsafe { std::str::from_utf8_unchecked(&self.lower_buf) };
+            let tokens: Vec<&str> =
+                lowered.split_whitespace().filter(|t| !t.is_empty()).collect();
+            for token in tokens {
+                additions.push((interner.intern(token), entity_idx));
+            }
+        }
+        if additions.is_empty() {
             return;
         }
-
-        self.lower_buf.clear();
-        self.lower_buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
-        let lowered = unsafe { std::str::from_utf8_unchecked(&self.lower_buf) };
-
-        let tokens: Vec<&str> = lowered.split_whitespace().filter(|t| !t.is_empty()).collect();
-        let interned: Vec<StrId> = tokens.iter().map(|t| interner.intern(t)).collect();
-
-        for token_id in &interned {
-            self.insert_entry(*token_id, entity_idx);
-        }
+        additions.sort_unstable();
+        additions.dedup();
+        self.merge_entries(&additions);
     }
 
-    fn insert_entry(&mut self, token: StrId, entity_idx: u32) {
-        let entry = (token, entity_idx);
-        let pos = match self.entries.binary_search(&entry) {
-            Ok(_) => return,
-            Err(pos) => pos,
-        };
-        self.entries.insert(pos, entry);
+    /// Merge a pre-sorted, deduped slice of new entries into `entries`
+    /// (also sorted and deduped) in one linear pass. Entries already present
+    /// are skipped, preserving the no-duplicate invariant.
+    fn merge_entries(&mut self, additions: &[(StrId, u32)]) {
+        let old = std::mem::take(&mut self.entries);
+        let mut merged = Vec::with_capacity(old.len() + additions.len());
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() && j < additions.len() {
+            match old[i].cmp(&additions[j]) {
+                std::cmp::Ordering::Less => {
+                    merged.push(old[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(additions[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(old[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend_from_slice(&old[i..]);
+        merged.extend_from_slice(&additions[j..]);
+        self.entries = merged;
     }
 }
 
@@ -270,6 +368,36 @@ mod tests {
         let interner = StringInterner::new();
         let index = SearchIndex::new();
         assert!(index.search("anything", &interner).is_empty());
+    }
+
+    #[test]
+    fn test_search_ranked_orders_by_score() {
+        let mut interner = StringInterner::new();
+        let mut index = SearchIndex::new();
+        // Entity 0: "coffee" appears in both name and observation → score 2.
+        let n0 = interner.intern("coffee");
+        let t0 = interner.intern("drink");
+        let o0 = interner.intern("coffee beans");
+        index.index_entity(&mut interner, 0, n0, t0, &[o0]);
+        // Entity 1: "coffee" appears once (observation only) → score 1.
+        let n1 = interner.intern("Bob");
+        let t1 = interner.intern("person");
+        let o1 = interner.intern("likes coffee");
+        index.index_entity(&mut interner, 1, n1, t1, &[o1]);
+
+        let ranked = index.search_ranked("coffee", &interner);
+        assert_eq!(ranked.len(), 2);
+        // Higher score first.
+        assert_eq!(ranked[0].0, 0);
+        assert!(ranked[0].1 >= ranked[1].1);
+        assert_eq!(ranked[1].0, 1);
+    }
+
+    #[test]
+    fn test_search_ranked_empty_query() {
+        let interner = StringInterner::new();
+        let index = SearchIndex::new();
+        assert!(index.search_ranked("", &interner).is_empty());
     }
 
     #[test]

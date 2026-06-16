@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use mcp_memory::kg::KnowledgeGraph;
 use mcp_memory::types::{Entity, Relation};
@@ -15,9 +16,9 @@ fn setup() -> (KnowledgeGraph, String) {
     (kg, path)
 }
 
-fn setup_mutex() -> (Arc<Mutex<KnowledgeGraph>>, String) {
+fn setup_mutex() -> (Arc<RwLock<KnowledgeGraph>>, String) {
     let (kg, path) = setup();
-    (Arc::new(Mutex::new(kg)), path)
+    (Arc::new(RwLock::new(kg)), path)
 }
 
 fn cleanup(path: &str) {
@@ -1010,7 +1011,7 @@ fn test_concurrent_create_entities() {
                 entity_type: "concurrent".into(),
                 observations: vec![format!("obs_{i}")],
             };
-            let mut guard = kg.lock().unwrap();
+            let mut guard = kg.write();
             guard.create_entities(&[entity]).unwrap();
         }));
     }
@@ -1019,7 +1020,7 @@ fn test_concurrent_create_entities() {
         h.join().unwrap();
     }
 
-    let guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read();
     let stats = guard.graph_stats();
     assert_eq!(stats["entities"], 10);
     drop(guard);
@@ -1031,7 +1032,7 @@ fn test_concurrent_read_write() {
     let (kg_mutex, path) = setup_mutex();
     // Pre-populate an entity.
     {
-        let mut guard = kg_mutex.lock().unwrap();
+        let mut guard = kg_mutex.write();
         guard.create_entities(&[alice()]).unwrap();
     }
 
@@ -1043,7 +1044,7 @@ fn test_concurrent_read_write() {
         let kg = Arc::clone(&kg);
         handles.push(std::thread::spawn(move || {
             for _ in 0..20 {
-                let mut guard = kg.lock().unwrap();
+                let guard = kg.read();
                 let _ = guard.get_entity("Alice");
                 let _ = guard.graph_stats();
             }
@@ -1060,7 +1061,7 @@ fn test_concurrent_read_write() {
                     entity_type: "writer".into(),
                     observations: vec![],
                 };
-                let mut guard = kg.lock().unwrap();
+                let mut guard = kg.write();
                 guard.create_entities(&[entity]).unwrap();
             }
         }));
@@ -1070,7 +1071,7 @@ fn test_concurrent_read_write() {
         h.join().unwrap();
     }
 
-    let guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read();
     let stats = guard.graph_stats();
     // Alice + 5 writers × 10 entities = 51
     assert_eq!(stats["entities"], 51);
@@ -1083,7 +1084,7 @@ fn test_concurrent_relations() {
     let (kg_mutex, path) = setup_mutex();
     // Pre-populate entities.
     {
-        let mut guard = kg_mutex.lock().unwrap();
+        let mut guard = kg_mutex.write();
         guard.create_entities(&[alice(), bob(), charlie()]).unwrap();
     }
 
@@ -1098,7 +1099,7 @@ fn test_concurrent_relations() {
             } else {
                 knows_bob()
             };
-            let mut guard = kg.lock().unwrap();
+            let mut guard = kg.write();
             let _ = guard.create_relations(&[relation]);
         }));
     }
@@ -1107,7 +1108,7 @@ fn test_concurrent_relations() {
         h.join().unwrap();
     }
 
-    let mut guard = kg_mutex.lock().unwrap();
+    let guard = kg_mutex.read();
     // Only 2 unique relations (duplicates are skipped)
     let rels = guard.search_relations(None, None, None);
     assert!(!rels.is_empty());
@@ -1239,5 +1240,631 @@ fn test_find_path_undirected_traversal() {
     // BFS from Bob to Charlie should fail (no path).
     let result = kg.find_path("Bob", "Charlie");
     assert!(result.is_err());
+    cleanup(&path);
+}
+
+// =========================================================================
+// Tier-1 productivity tools
+// =========================================================================
+
+use mcp_memory::kg::Direction;
+
+fn names(out: &mcp_memory::types::KnowledgeGraphOut) -> Vec<String> {
+    let mut v: Vec<String> = out.entities.iter().map(|e| e.name.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn test_get_neighbors_depth1_both() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap(); // Alice→Bob, Alice→Charlie
+
+    let out = kg.neighbors("Alice", Direction::Both, None, 1).unwrap();
+    assert_eq!(names(&out), vec!["Alice", "Bob", "Charlie"]);
+    // Both incident edges are among the returned set.
+    assert_eq!(out.relations.len(), 2);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_direction_filters() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap(); // Alice→Bob
+
+    // Outgoing from Alice reaches Bob.
+    let out = kg.neighbors("Alice", Direction::Out, None, 1).unwrap();
+    assert_eq!(names(&out), vec!["Alice", "Bob"]);
+    // Incoming to Alice reaches nobody.
+    let inn = kg.neighbors("Alice", Direction::In, None, 1).unwrap();
+    assert_eq!(names(&inn), vec!["Alice"]);
+    // Incoming to Bob reaches Alice.
+    let bob_in = kg.neighbors("Bob", Direction::In, None, 1).unwrap();
+    assert_eq!(names(&bob_in), vec!["Alice", "Bob"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_depth2_and_rtype() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap(); // Alice→Bob→Charlie
+
+    // Depth 1 from Alice: only Bob.
+    let d1 = kg.neighbors("Alice", Direction::Out, None, 1).unwrap();
+    assert_eq!(names(&d1), vec!["Alice", "Bob"]);
+    // Depth 2 from Alice: Bob and Charlie.
+    let d2 = kg.neighbors("Alice", Direction::Out, None, 2).unwrap();
+    assert_eq!(names(&d2), vec!["Alice", "Bob", "Charlie"]);
+    // Filter on a relation type that exists.
+    let knows = kg.neighbors("Alice", Direction::Out, Some("knows"), 2).unwrap();
+    assert_eq!(names(&knows), vec!["Alice", "Bob", "Charlie"]);
+    // Filter on a type that does not exist → just the origin.
+    let none = kg.neighbors("Alice", Direction::Out, Some("nope"), 2).unwrap();
+    assert_eq!(names(&none), vec!["Alice"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_get_neighbors_missing_entity() {
+    let (kg, path) = setup();
+    assert!(kg.neighbors("Ghost", Direction::Both, None, 1).is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_describe_entity() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap();
+
+    let v = kg.describe_entity("Alice").unwrap();
+    assert_eq!(v["entity"]["name"], "Alice");
+    assert_eq!(v["degree"], 2);
+    let neighbors = v["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 2);
+    assert_eq!(v["relations"].as_array().unwrap().len(), 2);
+
+    assert!(kg.describe_entity("Ghost").is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_list_entity_and_relation_types() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap(); // 2 person, 1 ai
+    kg.create_relations(&[knows_alice(), knows_bob(), works_with()]).unwrap(); // 2 knows, 1 works_with
+
+    let etypes = kg.entity_type_counts();
+    assert_eq!(etypes[0], ("person".to_string(), 2)); // ranked by count desc
+    assert!(etypes.contains(&("ai".to_string(), 1)));
+
+    let rtypes = kg.relation_type_counts();
+    assert_eq!(rtypes[0], ("knows".to_string(), 2));
+    assert!(rtypes.contains(&("works_with".to_string(), 1)));
+    cleanup(&path);
+}
+
+#[test]
+fn test_upsert_entities_create_then_merge() {
+    let (mut kg, path) = setup();
+
+    // First upsert creates.
+    let e = Entity { name: "Dave".into(), entity_type: "person".into(), observations: vec!["a".into()] };
+    let out = kg.upsert_entities(&[e]).unwrap();
+    assert_eq!(out[0]["created"], true);
+    assert_eq!(kg.get_entity("Dave").unwrap().observations, vec!["a".to_string()]);
+
+    // Second upsert merges new observations, keeps type, dedupes existing.
+    let e2 = Entity { name: "Dave".into(), entity_type: "robot".into(), observations: vec!["a".into(), "b".into()] };
+    let out2 = kg.upsert_entities(&[e2]).unwrap();
+    assert_eq!(out2[0]["created"], false);
+    assert_eq!(out2[0]["addedObservations"].as_array().unwrap(), &vec![serde_json::json!("b")]);
+    let dave = kg.get_entity("Dave").unwrap();
+    assert_eq!(dave.entity_type, "person"); // type unchanged on merge
+    assert_eq!(dave.observations, vec!["a".to_string(), "b".to_string()]);
+
+    // Empty name rejected.
+    let bad = Entity { name: "".into(), entity_type: "x".into(), observations: vec![] };
+    assert!(kg.upsert_entities(&[bad]).is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_search_nodes_filtered_pagination_and_type() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+
+    // "coffee" matches Alice + Charlie; restrict to type person → Alice only.
+    let only_person = kg.search_nodes_filtered("coffee", Some("person"), 0, usize::MAX);
+    assert_eq!(names(&only_person), vec!["Alice"]);
+
+    // Pagination: limit 1 returns a single entity.
+    let page = kg.search_nodes_filtered("person", None, 0, 1);
+    assert_eq!(page.entities.len(), 1);
+
+    // Unknown type → empty.
+    let empty = kg.search_nodes_filtered("coffee", Some("nope"), 0, usize::MAX);
+    assert!(empty.entities.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_read_graph_filtered() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap();
+
+    // Type filter: only the two persons; only relations between persons.
+    let persons = kg.read_graph_filtered(Some("person"), 0, usize::MAX);
+    assert_eq!(names(&persons), vec!["Alice", "Bob"]);
+    // knows_alice (Alice→Bob) is between persons; works_with (Alice→Charlie) is not.
+    assert_eq!(persons.relations.len(), 1);
+
+    // Pagination caps entity count.
+    let page = kg.read_graph_filtered(None, 0, 2);
+    assert_eq!(page.entities.len(), 2);
+    let rest = kg.read_graph_filtered(None, 2, usize::MAX);
+    assert_eq!(rest.entities.len(), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn test_export_graph_formats() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let json = kg.export("json").unwrap();
+    assert!(json.contains("Alice") && json.contains("Bob"));
+
+    let mermaid = kg.export("mermaid").unwrap();
+    assert!(mermaid.starts_with("graph LR"));
+    assert!(mermaid.contains("knows"));
+
+    let dot = kg.export("dot").unwrap();
+    assert!(dot.starts_with("digraph G {"));
+    assert!(dot.trim_end().ends_with("}"));
+
+    assert!(kg.export("yaml").is_err());
+    cleanup(&path);
+}
+
+// =========================================================================
+// Optimization regression tests (M1/M2/M6)
+// =========================================================================
+
+/// M6: the borrowing serialize views must produce byte-identical JSON to
+/// serializing the owned `KnowledgeGraphOut`.
+#[test]
+fn test_view_json_matches_owned() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let owned = serde_json::to_string(&kg.read_graph()).unwrap();
+    let view = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    assert_eq!(owned, view);
+
+    let owned_s = serde_json::to_string(&kg.search_nodes("coffee")).unwrap();
+    let view_s = serde_json::to_string(&kg.search_nodes_view("coffee", None, 0, usize::MAX)).unwrap();
+    assert_eq!(owned_s, view_s);
+
+    let owned_o = serde_json::to_string(&kg.open_nodes(&["Alice".into()])).unwrap();
+    let view_o = serde_json::to_string(&kg.open_nodes_view(&["Alice".into()])).unwrap();
+    assert_eq!(owned_o, view_o);
+    cleanup(&path);
+}
+
+/// M2: a deleted entity's slot is reused by the next create. After many
+/// create/delete cycles the graph must remain correct (and slots bounded).
+#[test]
+fn test_slot_reuse_after_delete() {
+    let (mut kg, path) = setup();
+    for i in 0..50 {
+        let e = Entity {
+            name: format!("E{i}"),
+            entity_type: "t".into(),
+            observations: vec![format!("obs {i}")],
+        };
+        kg.create_entities(&[e]).unwrap();
+        kg.delete_entities(&[format!("E{i}")]).unwrap();
+    }
+    // Only the never-deleted survivor remains live.
+    kg.create_entities(&[alice()]).unwrap();
+    let g = kg.read_graph();
+    assert_eq!(g.entities.len(), 1);
+    assert_eq!(g.entities[0].name, "Alice");
+    assert_eq!(kg.get_entity("Alice").unwrap().observations.len(), 2);
+    cleanup(&path);
+}
+
+/// M1: compact rebuilds in-memory state from the compacted log. After deletes
+/// + churn, compacting must preserve live data and keep lookups/search working.
+#[test]
+fn test_compact_rebuild_preserves_state() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+    kg.add_observations("Alice", &["extra fact".into()]).unwrap();
+    kg.delete_entities(&["Bob".into()]).unwrap();
+
+    let before = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    kg.compact().unwrap();
+    let after = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    assert_eq!(before, after, "compact must not change observable state");
+
+    // Lookups, search, and relations still work post-rebuild.
+    assert!(kg.get_entity("Alice").unwrap().observations.contains(&"extra fact".to_string()));
+    assert!(kg.get_entity("Bob").is_none());
+    assert!(!kg.search_nodes("coffee").entities.is_empty());
+
+    // Survives reopen too (the compacted log on disk is authoritative).
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let reopened = serde_json::to_string(&kg2.read_graph_view()).unwrap();
+    assert_eq!(after, reopened);
+    cleanup(&path);
+}
+
+// =========================================================================
+// Proof: RwLock readers do not block each other (unlike Mutex)
+// =========================================================================
+
+use std::time::Instant;
+
+/// Prove that concurrent readers finish in parallel rather than serially.
+/// With RwLock, N readers should complete in ~1x the time of a single reader
+/// (they execute concurrently). With the old Mutex, they'd take N×.
+#[test]
+fn test_rwlock_concurrent_reads_are_not_serialized() {
+    let path = {
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("/tmp/mcp_mem_proof_{pid}_{seq}.bin")
+    };
+    let kg = Arc::new(RwLock::new(KnowledgeGraph::new(Path::new(&path)).unwrap()));
+    // Populate graph with enough data to make reads non-trivial.
+    {
+        let mut guard = kg.write();
+        for i in 0..100 {
+            guard
+                .create_entities(&[Entity {
+                    name: format!("E{i}"),
+                    entity_type: "proof".into(),
+                    observations: (0..10).map(|j| format!("obs_{i}_{j}")).collect(),
+                }])
+                .unwrap();
+        }
+    }
+
+    // Time a single read as baseline.
+    let single_start = Instant::now();
+    {
+        let guard = kg.read();
+        let _stats = guard.graph_stats();
+        let _graph = guard.read_graph();
+    }
+    let single_elapsed = single_start.elapsed();
+
+    // Time 8 concurrent readers.
+    let concurrent_start = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let kg = Arc::clone(&kg);
+        handles.push(std::thread::spawn(move || {
+            let guard = kg.read();
+            let _stats = guard.graph_stats();
+            let _graph = guard.read_graph();
+            // Hold the read lock for a brief period to prove parallelism.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let concurrent_elapsed = concurrent_start.elapsed();
+
+    // With RwLock, 8 concurrent readers should take roughly the same time
+    // as 1 reader + 5ms sleep (they run in parallel, not serialized).
+    // If they were serialized (Mutex), they'd take ~8× longer.
+    // Allow generous headroom for OS scheduling jitter.
+    let expected_max = (single_elapsed + std::time::Duration::from_millis(10))
+        .max(std::time::Duration::from_millis(50));
+
+    assert!(
+        concurrent_elapsed < expected_max,
+        "8 concurrent readers were serialized! took {concurrent_elapsed:?}, expected < {expected_max:?}\n\
+         Hint: this suggests RwLock is not allowing parallel reads — \
+         single read took {single_elapsed:?}"
+    );
+
+    drop(kg);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Prove that readers do not block other readers (only writers do).
+/// Starts a long-running read, then spawns more reads — they should
+/// all acquire the lock immediately without waiting.
+#[test]
+fn test_rwlock_readers_do_not_block_readers() {
+    let path = {
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("/tmp/mcp_mem_proof_{pid}_{seq}.bin")
+    };
+    let kg = Arc::new(RwLock::new(KnowledgeGraph::new(Path::new(&path)).unwrap()));
+    {
+        let mut guard = kg.write();
+        guard.create_entities(&[Entity {
+            name: "Proof".into(),
+            entity_type: "test".into(),
+            observations: vec!["data".into()],
+        }])
+        .unwrap();
+    }
+
+    // Thread A: hold the read lock for 100ms.
+    let kg_a = Arc::clone(&kg);
+    let handle_a = std::thread::spawn(move || {
+        let _guard = kg_a.read();
+        let stats = _guard.graph_stats();
+        assert_eq!(stats["entities"], 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+
+    // Give thread A time to acquire the read lock.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Thread B: try to acquire the read lock while A holds it.
+    // With RwLock, B should succeed immediately (readers don't block readers).
+    let kg_b = Arc::clone(&kg);
+    let handle_b = std::thread::spawn(move || {
+        let start = Instant::now();
+        let guard = kg_b.read();
+        let elapsed = start.elapsed();
+        let _stats = guard.graph_stats();
+        // B should acquire the read lock in well under 100ms (A's hold time),
+        // proving readers aren't blocked by readers.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "Reader B was blocked by Reader A for {elapsed:?} — RwLock serialized reads!"
+        );
+    });
+
+    handle_a.join().unwrap();
+    handle_b.join().unwrap();
+
+    drop(kg);
+    let _ = std::fs::remove_file(&path);
+}
+
+// =========================================================================
+// merge_entities
+// =========================================================================
+
+#[test]
+fn test_merge_entities_basic() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let result = kg.merge_entities("Alice", "Bob").unwrap();
+    assert_eq!(result["source"], "Alice");
+    assert_eq!(result["target"], "Bob");
+    assert_eq!(result["movedObservations"], 2);
+    // Alice->Bob becomes Bob->Bob self-loop which is filtered out.
+    assert_eq!(result["redirectedRelations"], 0);
+
+    assert!(kg.get_entity("Alice").is_none());
+
+    let bob = kg.get_entity("Bob").unwrap();
+    assert_eq!(bob.observations.len(), 3);
+    assert!(bob.observations.contains(&"likes coffee".to_string()));
+    assert!(bob.observations.contains(&"works at acme".to_string()));
+    assert!(bob.observations.contains(&"drinks tea".to_string()));
+
+    let rels = kg.search_relations(None, None, None);
+    assert!(rels.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_no_relations() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    let result = kg.merge_entities("Alice", "Bob").unwrap();
+    assert_eq!(result["redirectedRelations"], 0);
+    assert_eq!(result["movedObservations"], 2);
+    assert!(kg.get_entity("Alice").is_none());
+    assert_eq!(kg.get_entity("Bob").unwrap().observations.len(), 3);
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_same_source_and_target() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    assert!(kg.merge_entities("Alice", "Alice").is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_missing_entities() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    assert!(kg.merge_entities("Ghost", "Alice").is_err());
+    assert!(kg.merge_entities("Alice", "Ghost").is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_redirect_with_third_party() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap();
+
+    let result = kg.merge_entities("Alice", "Charlie").unwrap();
+    assert_eq!(result["redirectedRelations"], 1);
+
+    let rels = kg.search_relations(None, None, None);
+    assert_eq!(rels.len(), 2);
+
+    assert!(kg.get_entity("Alice").is_none());
+    cleanup(&path);
+}
+
+// =========================================================================
+// extract_subgraph
+// =========================================================================
+
+#[test]
+fn test_extract_subgraph_depth1() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap();
+
+    let out = kg.extract_subgraph(&["Bob".into()], 1).unwrap();
+    let mut names: Vec<&str> = out.entities.iter().map(|e| e.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+    assert_eq!(out.relations.len(), 2);
+    cleanup(&path);
+}
+
+#[test]
+fn test_extract_subgraph_depth0() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+
+    let out = kg.extract_subgraph(&["Alice".into()], 0).unwrap();
+    assert_eq!(out.entities.len(), 1);
+    assert_eq!(out.entities[0].name, "Alice");
+    assert!(out.relations.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_extract_subgraph_empty_names() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    let out = kg.extract_subgraph(&[], 1).unwrap();
+    assert!(out.entities.is_empty());
+    assert!(out.relations.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_extract_subgraph_nonexistent_seed() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    let out = kg.extract_subgraph(&["Ghost".into()], 1).unwrap();
+    assert!(out.entities.is_empty());
+    cleanup(&path);
+}
+
+#[test]
+fn test_extract_subgraph_multiple_seeds() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), works_with()]).unwrap();
+
+    let out = kg.extract_subgraph(&["Bob".into(), "Charlie".into()], 0).unwrap();
+    assert_eq!(out.entities.len(), 2);
+    cleanup(&path);
+}
+
+// =========================================================================
+// batch_get_entities
+// =========================================================================
+
+#[test]
+fn test_batch_get_entities_all_exist() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    let results = kg.batch_get_entities(&["Alice".into(), "Bob".into()]);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_some());
+    assert!(results[1].is_some());
+    assert_eq!(results[0].as_ref().unwrap().name, "Alice");
+    assert_eq!(results[1].as_ref().unwrap().name, "Bob");
+    cleanup(&path);
+}
+
+#[test]
+fn test_batch_get_entities_mixed() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    let results = kg.batch_get_entities(&["Alice".into(), "Ghost".into()]);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_some());
+    assert!(results[1].is_none());
+    cleanup(&path);
+}
+
+#[test]
+fn test_batch_get_entities_empty_list() {
+    let (mut kg, path) = setup();
+    let results = kg.batch_get_entities(&[]);
+    assert!(results.is_empty());
+    cleanup(&path);
+}
+
+// =========================================================================
+// find_all_paths
+// =========================================================================
+
+#[test]
+fn test_find_all_paths_direct() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+    let paths = kg.find_all_paths("Alice", "Bob", 6, 50).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0], vec!["Alice", "Bob"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_find_all_paths_multiple() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob(), works_with()]).unwrap();
+    let paths = kg.find_all_paths("Alice", "Charlie", 6, 50).unwrap();
+    assert_eq!(paths.len(), 2);
+    cleanup(&path);
+}
+
+#[test]
+fn test_find_all_paths_no_path() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    let result = kg.find_all_paths("Alice", "Bob", 6, 50);
+    assert!(result.is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_find_all_paths_same_entity() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    let paths = kg.find_all_paths("Alice", "Alice", 6, 50).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0], vec!["Alice"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_find_all_paths_bounded_by_depth() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap();
+
+    let result = kg.find_all_paths("Alice", "Charlie", 1, 50);
+    assert!(result.is_err());
+    let paths = kg.find_all_paths("Alice", "Charlie", 2, 50).unwrap();
+    assert_eq!(paths.len(), 1);
     cleanup(&path);
 }

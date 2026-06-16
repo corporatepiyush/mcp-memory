@@ -1,8 +1,11 @@
 use crate::errors::Result;
+use crate::Transport;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub memory_file_path: String,
+    pub transport: Transport,
+    pub bind_addr: String,
 }
 
 impl Config {
@@ -13,7 +16,11 @@ impl Config {
             .or_else(|| std::env::var("MEMORY_FILE_PATH").ok())
             .unwrap_or_else(|| "memory.mcpmem".to_string());
 
-        Ok(Config { memory_file_path })
+        Ok(Config {
+            memory_file_path,
+            transport: args.transport,
+            bind_addr: args.bind.clone(),
+        })
     }
 }
 
@@ -21,6 +28,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             memory_file_path: "memory.mcpmem".to_string(),
+            transport: Transport::Stdio,
+            bind_addr: "127.0.0.1:8080".to_string(),
         }
     }
 }

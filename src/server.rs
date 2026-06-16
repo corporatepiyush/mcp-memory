@@ -1,8 +1,11 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::error;
+use tokio::net::TcpListener;
+use tracing::{error, info};
 
 use crate::actions::memory;
 use crate::config::Config;
@@ -13,6 +16,8 @@ use crate::tools;
 
 const BUFFER_CAPACITY: usize = 65536;
 const NEWLINE: &[u8] = b"\n";
+/// Maximum size of a single inbound JSON-RPC message (shared by all transports).
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 enum LineRead {
     Line,
@@ -68,17 +73,73 @@ fn parse_error(msg: String) -> JsonRpcResponse {
     JsonRpcResponse::error(None, mcp_error.error_code(), mcp_error.to_string())
 }
 
-fn parse_request(line: &str) -> std::result::Result<JsonRpcRequest, String> {
+// ---------------------------------------------------------------------------
+// Transport-agnostic dispatch core.
+//
+// All three transports (stdio, tcp, http) share the exact same JSON-RPC/MCP
+// semantics; they differ only in framing. `process_value` is the single source
+// of truth: it takes one parsed JSON-RPC message and returns the response
+// value, or `None` for a notification (which gets no reply anywhere).
+// ---------------------------------------------------------------------------
+
+/// Process one parsed JSON-RPC message. `None` means "no reply" — the message
+/// was a notification (no `id`), per JSON-RPC.
+pub fn process_value(value: Value, kg: &RwLock<KnowledgeGraph>) -> Option<Value> {
+    let req: JsonRpcRequest = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => return Some(to_value(parse_error(e.to_string()))),
+    };
+    // Notifications never get a reply, even on error.
+    if req.id.is_none() {
+        return None;
+    }
+    let response = match process_request(&req, kg) {
+        Ok(result) => JsonRpcResponse::success(req.id, result),
+        Err(e) => JsonRpcResponse::error(req.id, e.error_code(), e.to_string()),
+    };
+    Some(to_value(response))
+}
+
+/// Dispatch one framed line (stdio / tcp). Returns the serialized response, or
+/// `None` for a notification.
+pub fn dispatch_line(line: &str, kg: &RwLock<KnowledgeGraph>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Err("Empty request".to_string());
+        return Some(serde_json::to_string(&parse_error("Empty request".into())).unwrap());
     }
-    serde_json::from_str::<JsonRpcRequest>(trimmed).map_err(|e| e.to_string())
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => return Some(serde_json::to_string(&parse_error(e.to_string())).unwrap()),
+    };
+    process_value(value, kg).map(|v| serde_json::to_string(&v).unwrap())
+}
+
+/// Dispatch a Streamable-HTTP POST body, which may be a single JSON-RPC message
+/// or a batch array. `Ok(None)` means the body held only notifications (HTTP
+/// 202, empty body); `Err` means the body was not valid JSON.
+pub fn dispatch_http_body(
+    body: &str,
+    kg: &RwLock<KnowledgeGraph>,
+) -> std::result::Result<Option<Value>, String> {
+    let value: Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
+    match value {
+        Value::Array(items) => {
+            let responses: Vec<Value> =
+                items.into_iter().filter_map(|v| process_value(v, kg)).collect();
+            Ok((!responses.is_empty()).then_some(Value::Array(responses)))
+        }
+        other => Ok(process_value(other, kg)),
+    }
+}
+
+#[inline]
+fn to_value(resp: JsonRpcResponse) -> Value {
+    serde_json::to_value(resp).expect("JsonRpcResponse always serializes")
 }
 
 pub struct MCPServer {
     _config: Arc<Config>,
-    kg: Arc<Mutex<KnowledgeGraph>>,
+    kg: Arc<RwLock<KnowledgeGraph>>,
 }
 
 impl MCPServer {
@@ -89,75 +150,91 @@ impl MCPServer {
 
         Ok(Self {
             _config: Arc::new(config),
-            kg: Arc::new(Mutex::new(kg)),
+            kg: Arc::new(RwLock::new(kg)),
         })
     }
 
+    /// Expose the shared graph handle (used to drive the HTTP transport).
+    pub fn graph(&self) -> Arc<RwLock<KnowledgeGraph>> {
+        Arc::clone(&self.kg)
+    }
+
+    /// stdio transport: newline-delimited JSON-RPC over stdin/stdout.
     pub async fn run_stdio(&self) -> Result<()> {
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
-        let mut line = String::with_capacity(1024);
-        let mut response_buf = Vec::with_capacity(65536);
-        let max = 16 * 1024 * 1024;
+        serve_line_conn(&mut reader, &mut stdout, &self.kg).await
+    }
 
+    /// TCP transport: each accepted connection speaks newline-delimited
+    /// JSON-RPC, exactly like stdio. Connections are served concurrently and
+    /// share the one graph behind its mutex.
+    pub async fn run_tcp(&self, addr: &str) -> Result<()> {
+        let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
+        info!("Listening for TCP MCP connections on {addr}");
         loop {
-            match read_line_capped(&mut reader, &mut line, max).await {
-                Ok(LineRead::Eof) => break,
-                Ok(LineRead::Line) => {
-                    process_one_line(&line, &self.kg, &mut response_buf, &mut stdout).await?;
+            let (socket, peer) = listener.accept().await.map_err(MCSError::IoError)?;
+            let kg = Arc::clone(&self.kg);
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = socket.into_split();
+                let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, read_half);
+                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, &kg).await {
+                    error!("TCP connection {peer} error: {e}");
                 }
-                Ok(LineRead::TooLong) => {
-                    let err = MCSError::InvalidParams("Request exceeds maximum size of 16MB".into());
-                    let response = JsonRpcResponse::error(None, err.error_code(), err.to_string());
-                    response_buf.clear();
-                    serde_json::to_writer(&mut response_buf, &response).map_err(MCSError::JsonError)?;
-                    response_buf.extend_from_slice(NEWLINE);
-                    stdout.write_all(&response_buf).await.map_err(MCSError::IoError)?;
-                    stdout.flush().await.map_err(MCSError::IoError)?;
-                    break;
-                }
-                Err(e) => {
-                    error!("IO error: {}", e);
-                    break;
-                }
-            }
+            });
         }
-        Ok(())
+    }
+
+    /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
+    pub async fn run_http(&self, addr: &str) -> Result<()> {
+        crate::http::run(addr, self.graph()).await
     }
 }
 
-async fn process_one_line<W: AsyncWriteExt + Unpin>(
-    line: &str,
-    kg: &Mutex<KnowledgeGraph>,
-    response_buf: &mut Vec<u8>,
-    writer: &mut W,
-) -> Result<()> {
-    let (response, is_notification) = match parse_request(line) {
-        Ok(req) => {
-            let is_notif = req.id.is_none();
-            match process_request(&req, kg) {
-                Ok(result) => (JsonRpcResponse::success(req.id, result), is_notif),
-                Err(e) => (JsonRpcResponse::error(req.id, e.error_code(), e.to_string()), is_notif),
+/// Drive one line-framed connection (stdio or a single TCP socket): read
+/// newline-delimited JSON-RPC requests, write newline-delimited responses.
+/// Notifications produce no output. Returns when the peer closes the stream.
+async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: &RwLock<KnowledgeGraph>) -> Result<()>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut line = String::with_capacity(1024);
+    let mut out = Vec::with_capacity(BUFFER_CAPACITY);
+
+    loop {
+        match read_line_capped(reader, &mut line, MAX_REQUEST_BYTES).await {
+            Ok(LineRead::Eof) => break,
+            Ok(LineRead::Line) => {
+                if let Some(resp) = dispatch_line(&line, kg) {
+                    out.clear();
+                    out.extend_from_slice(resp.as_bytes());
+                    out.extend_from_slice(NEWLINE);
+                    writer.write_all(&out).await.map_err(MCSError::IoError)?;
+                    writer.flush().await.map_err(MCSError::IoError)?;
+                }
+            }
+            Ok(LineRead::TooLong) => {
+                let err = MCSError::InvalidParams("Request exceeds maximum size of 16MB".into());
+                let response = JsonRpcResponse::error(None, err.error_code(), err.to_string());
+                out.clear();
+                serde_json::to_writer(&mut out, &response).map_err(MCSError::JsonError)?;
+                out.extend_from_slice(NEWLINE);
+                writer.write_all(&out).await.map_err(MCSError::IoError)?;
+                writer.flush().await.map_err(MCSError::IoError)?;
+                break;
+            }
+            Err(e) => {
+                error!("IO error: {}", e);
+                break;
             }
         }
-        Err(e) => (parse_error(e), false),
-    };
-
-    if is_notification {
-        return Ok(());
     }
-
-    response_buf.clear();
-    serde_json::to_writer(&mut *response_buf, &response).map_err(MCSError::JsonError)?;
-    response_buf.extend_from_slice(NEWLINE);
-
-    writer.write_all(response_buf).await.map_err(MCSError::IoError)?;
-    writer.flush().await.map_err(MCSError::IoError)?;
     Ok(())
 }
 
-fn process_request(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+fn process_request(req: &JsonRpcRequest, kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
     match req.method.as_str() {
         "initialize" => handle_initialize(),
         "tools/list" => handle_tools_list(),
@@ -203,7 +280,7 @@ fn handle_tools_list() -> Result<Value> {
     Ok(result)
 }
 
-fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result<Value> {
+fn handle_tools_call(req: &JsonRpcRequest, kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
     let tool_name = req
         .params
         .as_ref()
@@ -223,7 +300,7 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result
         "delete_entities" => memory::handle_delete_entities(kg, tool_args),
         "delete_observations" => memory::handle_delete_observations(kg, tool_args),
         "delete_relations" => memory::handle_delete_relations(kg, tool_args),
-        "read_graph" => memory::handle_read_graph(kg),
+        "read_graph" => memory::handle_read_graph(kg, tool_args),
         "search_nodes" => memory::handle_search_nodes(kg, tool_args),
         "open_nodes" => memory::handle_open_nodes(kg, tool_args),
         "get_entity" => memory::handle_get_entity(kg, tool_args),
@@ -231,6 +308,16 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &Mutex<KnowledgeGraph>) -> Result
         "search_relations" => memory::handle_search_relations(kg, tool_args),
         "find_path" => memory::handle_find_path(kg, tool_args),
         "compact" => memory::handle_compact(kg),
+        "get_neighbors" => memory::handle_get_neighbors(kg, tool_args),
+        "describe_entity" => memory::handle_describe_entity(kg, tool_args),
+        "list_entity_types" => memory::handle_list_entity_types(kg),
+        "list_relation_types" => memory::handle_list_relation_types(kg),
+        "upsert_entities" => memory::handle_upsert_entities(kg, tool_args),
+        "export_graph" => memory::handle_export_graph(kg, tool_args),
+        "merge_entities" => memory::handle_merge_entities(kg, tool_args),
+        "extract_subgraph" => memory::handle_extract_subgraph(kg, tool_args),
+        "batch_get_entities" => memory::handle_batch_get_entities(kg, tool_args),
+        "find_all_paths" => memory::handle_find_all_paths(kg, tool_args),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
     }
 }
@@ -242,12 +329,12 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn setup_kg() -> (Arc<Mutex<KnowledgeGraph>>, String) {
+    fn setup_kg() -> (Arc<RwLock<KnowledgeGraph>>, String) {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = format!("/tmp/mcp_mem_test_{pid}_{seq}.bin");
         let kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-        (Arc::new(Mutex::new(kg)), path)
+        (Arc::new(RwLock::new(kg)), path)
     }
 
     fn cleanup(path: &str) {
@@ -255,16 +342,88 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_valid_request() {
+    fn test_dispatch_line_valid_request() {
+        let (kg, path) = setup_kg();
         let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
-        let req = parse_request(line).unwrap();
-        assert_eq!(req.method, "initialize");
+        let resp = dispatch_line(line, &kg).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["serverInfo"]["name"], "mcp-memory");
+        cleanup(&path);
     }
 
     #[test]
-    fn test_parse_invalid_json() {
-        let err = parse_request("{invalid}").unwrap_err();
-        assert!(!err.is_empty());
+    fn test_dispatch_line_invalid_json() {
+        let (kg, path) = setup_kg();
+        let resp = dispatch_line("{invalid}", &kg).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        // Parse error per JSON-RPC: code -32700, null id.
+        assert_eq!(v["error"]["code"], -32700);
+        assert!(v["id"].is_null());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_dispatch_line_empty() {
+        let (kg, path) = setup_kg();
+        let resp = dispatch_line("   \n", &kg).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32700);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_notification_has_no_response() {
+        let (kg, path) = setup_kg();
+        // A message with no `id` is a notification → no reply.
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(dispatch_line(line, &kg).is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_unknown_method_error() {
+        let (kg, path) = setup_kg();
+        let line = r#"{"jsonrpc":"2.0","method":"does/not/exist","id":7}"#;
+        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["error"]["code"], -32601); // method not found
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tools_call_roundtrip_via_dispatch() {
+        let (kg, path) = setup_kg();
+        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_entities","arguments":{"entities":[{"name":"Ada","entityType":"person","observations":["math"]}]}}}"#;
+        assert!(dispatch_line(create, &kg).is_some());
+
+        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_graph","arguments":{}}}"#;
+        let v: Value = serde_json::from_str(&dispatch_line(read, &kg).unwrap()).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Ada"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_http_body_batch_and_notifications() {
+        let (kg, path) = setup_kg();
+        // Batch: one request + one notification → array with a single response.
+        let batch = r#"[
+            {"jsonrpc":"2.0","method":"initialize","id":1},
+            {"jsonrpc":"2.0","method":"notifications/initialized"}
+        ]"#;
+        let out = dispatch_http_body(batch, &kg).unwrap().unwrap();
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], 1);
+
+        // Notification-only body → no response (HTTP 202).
+        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(dispatch_http_body(notif, &kg).unwrap().is_none());
+
+        // Invalid JSON → Err.
+        assert!(dispatch_http_body("{bad", &kg).is_err());
+        cleanup(&path);
     }
 
     #[test]
