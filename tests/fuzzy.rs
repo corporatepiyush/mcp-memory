@@ -26,18 +26,18 @@ fn cleanup(path: &str) {
 
 fn random_name(rng: &mut impl Rng, len: usize) -> String {
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789_".chars().collect();
-    (0..len).map(|_| chars[rng.gen_range(0..chars.len())]).collect()
+    (0..len).map(|_| chars[rng.random_range(0..chars.len())]).collect()
 }
 
 fn random_entity(rng: &mut impl Rng) -> Entity {
-    let name_len = rng.gen_range(3..12);
+    let name_len = rng.random_range(3..12);
     let name = random_name(rng, name_len);
-    let etype_len = rng.gen_range(3..8);
+    let etype_len = rng.random_range(3..8);
     let etype = random_name(rng, etype_len);
-    let num_obs = rng.gen_range(0..5);
+    let num_obs = rng.random_range(0..5);
     let observations: Vec<String> = (0..num_obs)
         .map(|_| {
-            let obs_len = rng.gen_range(2..15);
+            let obs_len = rng.random_range(2..15);
             random_name(rng, obs_len)
         })
         .collect();
@@ -45,7 +45,7 @@ fn random_entity(rng: &mut impl Rng) -> Entity {
 }
 
 fn known_entity(rng: &mut impl Rng, names: &[String]) -> String {
-    names[rng.gen_range(0..names.len())].clone()
+    names[rng.random_range(0..names.len())].clone()
 }
 
 // =========================================================================
@@ -70,7 +70,7 @@ fn check_invariants(kg: &KnowledgeGraph, live_names: &HashSet<String>) {
     }
 
     // get_entity for a ghost must return None
-    let ghost = format!("__ghost_{}", random_name(&mut thread_rng(), 6));
+    let ghost = format!("__ghost_{}", random_name(&mut rand::rng(), 6));
     if !live_names.contains(&ghost) {
         assert!(kg.get_entity(&ghost).is_none());
     }
@@ -108,7 +108,7 @@ fn test_random_crud_sequence_small() {
     let mut all_relations: Vec<Relation> = Vec::new();
 
     for _ in 0..200 {
-        let op: u32 = rng.gen_range(0..100);
+        let op: u32 = rng.random_range(0..100);
         match op {
             0..=35 => {
                 let entity = random_entity(&mut rng);
@@ -121,7 +121,7 @@ fn test_random_crud_sequence_small() {
             }
             36..=50 => {
                 if !live_names.is_empty() {
-                    let delete_count = rng.gen_range(1..=3.min(live_names.len()));
+                    let delete_count = rng.random_range(1..=3.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
                         .choose_multiple(&mut rng, delete_count)
                         .into_iter()
@@ -150,7 +150,7 @@ fn test_random_crud_sequence_small() {
             }
             66..=75 => {
                 if !all_relations.is_empty() {
-                    let del_count = rng.gen_range(1..=2.min(all_relations.len()));
+                    let del_count = rng.random_range(1..=2.min(all_relations.len()));
                     let to_del: Vec<Relation> = all_relations.iter()
                         .choose_multiple(&mut rng, del_count)
                         .into_iter()
@@ -163,7 +163,7 @@ fn test_random_crud_sequence_small() {
             76..=85 => {
                 if !live_names.is_empty() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
-                    let num_obs = rng.gen_range(1..=3);
+                    let num_obs = rng.random_range(1..=3);
                     let new_obs: Vec<String> = (0..num_obs)
                         .map(|_| random_name(&mut rng, 5))
                         .collect();
@@ -180,7 +180,7 @@ fn test_random_crud_sequence_small() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
                     let entity = kg.get_entity(&name).unwrap();
                     if !entity.observations.is_empty() {
-                        let del_count = rng.gen_range(1..=entity.observations.len().min(2));
+                        let del_count = rng.random_range(1..=entity.observations.len().min(2));
                         let to_del: Vec<String> = entity.observations.iter()
                             .choose_multiple(&mut rng, del_count)
                             .into_iter()
@@ -192,7 +192,7 @@ fn test_random_crud_sequence_small() {
             }
             _ => {
                 // Read-only ops: search, stats, path, open_nodes
-                if !live_names.is_empty() && rng.gen_bool(0.5) {
+                if !live_names.is_empty() && rng.random_bool(0.5) {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
                     let _ = kg.search_nodes(&name[..2.min(name.len())]);
                     let _ = kg.open_nodes(&[name]);
@@ -220,7 +220,7 @@ fn test_random_persistence_roundtrip() {
 
     // Phase 1: random mutations
     for _ in 0..100 {
-        let op: u32 = rng.gen_range(0..100);
+        let op: u32 = rng.random_range(0..100);
         match op {
             0..=50 => {
                 let entity = random_entity(&mut rng);
@@ -232,7 +232,7 @@ fn test_random_persistence_roundtrip() {
             }
             51..=70 => {
                 if !live_names.is_empty() {
-                    let pick = rng.gen_range(1..=2.min(live_names.len()));
+                    let pick = rng.random_range(1..=2.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
                         .choose_multiple(&mut rng, pick)
                         .into_iter()
@@ -247,7 +247,7 @@ fn test_random_persistence_roundtrip() {
             _ => {
                 if !live_names.is_empty() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
-                    let num_obs = rng.gen_range(1..=3);
+                    let num_obs = rng.random_range(1..=3);
                     let obs: Vec<String> = (0..num_obs).map(|_| random_name(&mut rng, 5)).collect();
                     kg.add_observations(&name, &obs).unwrap();
                 }
@@ -308,8 +308,8 @@ fn test_stress_bulk_create() {
     let name_vec: Vec<String> = live_names.iter().cloned().collect();
     let mut rel_count = 0;
     for _ in 0..200 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let rtype = random_name(&mut rng, 4);
             let rel = Relation { from, to, relation_type: rtype };
@@ -350,20 +350,20 @@ fn test_stress_observations_churn() {
     // Churn observations
     for _ in 0..300 {
         let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
-        let num_new = rng.gen_range(1..=5);
+        let num_new = rng.random_range(1..=5);
         let new_obs: Vec<String> = (0..num_new)
             .map(|_| {
-                let len = rng.gen_range(3..10);
+                let len = rng.random_range(3..10);
                 random_name(&mut rng, len)
             })
             .collect();
         kg.add_observations(&name, &new_obs).unwrap();
 
         // Delete some observations occasionally
-        if rng.gen_bool(0.3) {
+        if rng.random_bool(0.3) {
             let entity = kg.get_entity(&name).unwrap();
             if !entity.observations.is_empty() {
-                let del_n = rng.gen_range(1..=entity.observations.len().min(3));
+                let del_n = rng.random_range(1..=entity.observations.len().min(3));
                 let to_del: Vec<String> = entity.observations
                     .choose_multiple(&mut rng, del_n)
                     .cloned()
@@ -407,8 +407,8 @@ fn test_fuzzy_compact_preserves_invariants() {
     // Create some relations
     let name_vec: Vec<String> = live_names.iter().cloned().collect();
     for _ in 0..30 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let rel = Relation { from, to, relation_type: "edge".into() };
             let _ = kg.create_relations(&[rel]);
@@ -482,7 +482,7 @@ fn test_concurrent_fuzzy_stress() {
         handles.push(std::thread::spawn(move || {
             let mut rng = SmallRng::from_seed(seed.to_le_bytes().repeat(4).try_into().unwrap());
             for _ in 0..ops_per_thread {
-                let op: u32 = rng.gen_range(0..100);
+                let op: u32 = rng.random_range(0..100);
                 let mut guard = kg.write();
                 match op {
                     0..=40 => {
@@ -496,7 +496,7 @@ fn test_concurrent_fuzzy_stress() {
                             // Try deleting a random entity — pick from existing
                             let graph = guard.read_graph();
                             if !graph.entities.is_empty() {
-                                let idx = rng.gen_range(0..graph.entities.len());
+                                let idx = rng.random_range(0..graph.entities.len());
                                 let name = graph.entities[idx].name.clone();
                                 let _ = guard.delete_entities(&[name]);
                             }
@@ -505,8 +505,8 @@ fn test_concurrent_fuzzy_stress() {
                     56..=75 => {
                         let graph = guard.read_graph();
                         if graph.entities.len() >= 2 {
-                            let a = &graph.entities[rng.gen_range(0..graph.entities.len())].name;
-                            let b = &graph.entities[rng.gen_range(0..graph.entities.len())].name;
+                            let a = &graph.entities[rng.random_range(0..graph.entities.len())].name;
+                            let b = &graph.entities[rng.random_range(0..graph.entities.len())].name;
                             if a != b {
                                 let rel = Relation {
                                     from: a.clone(),
@@ -520,7 +520,7 @@ fn test_concurrent_fuzzy_stress() {
                     _ => {
                         // Read
                         let _ = guard.graph_stats();
-                        if rng.gen_bool(0.5) {
+                        if rng.random_bool(0.5) {
                             let _ = guard.search_nodes(&random_name(&mut rng, 4));
                         }
                     }
@@ -705,13 +705,13 @@ fn test_fuzzy_unicode_stress() {
     let mut live_names: HashSet<String> = HashSet::new();
 
     for _ in 0..50 {
-        let name_len = rng.gen_range(2..8);
-        let name: String = (0..name_len).map(|_| unicode_chars[rng.gen_range(0..unicode_chars.len())]).collect();
-        let etype: String = (0..3).map(|_| unicode_chars[rng.gen_range(0..unicode_chars.len())]).collect();
-        let obs: Vec<String> = (0..rng.gen_range(0..4))
+        let name_len = rng.random_range(2..8);
+        let name: String = (0..name_len).map(|_| unicode_chars[rng.random_range(0..unicode_chars.len())]).collect();
+        let etype: String = (0..3).map(|_| unicode_chars[rng.random_range(0..unicode_chars.len())]).collect();
+        let obs: Vec<String> = (0..rng.random_range(0..4))
             .map(|_| {
-                let olen = rng.gen_range(2..6);
-                (0..olen).map(|_| unicode_chars[rng.gen_range(0..unicode_chars.len())]).collect()
+                let olen = rng.random_range(2..6);
+                (0..olen).map(|_| unicode_chars[rng.random_range(0..unicode_chars.len())]).collect()
             })
             .collect();
 
@@ -743,10 +743,10 @@ fn test_fuzzy_unicode_stress() {
     let name_vec: Vec<String> = live_names.iter().cloned().collect();
     for _ in 0..10 {
         if name_vec.len() >= 2 {
-            let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-            let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+            let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+            let to = name_vec[rng.random_range(0..name_vec.len())].clone();
             if from != to {
-                let rtype: String = (0..3).map(|_| unicode_chars[rng.gen_range(0..unicode_chars.len())]).collect();
+                let rtype: String = (0..3).map(|_| unicode_chars[rng.random_range(0..unicode_chars.len())]).collect();
                 let rel = Relation { from, to, relation_type: rtype };
                 let _ = kg.create_relations(&[rel]);
             }
@@ -783,8 +783,8 @@ fn test_fuzzy_find_path_invariants() {
     // Create a random graph of relations
     let name_vec: Vec<String> = live_names.iter().cloned().collect();
     for _ in 0..60 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let rel = Relation { from, to, relation_type: "knows".into() };
             let _ = kg.create_relations(&[rel]);
@@ -793,8 +793,8 @@ fn test_fuzzy_find_path_invariants() {
 
     // Test find_path invariants
     for _ in 0..50 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
 
         match kg.find_path(&from, &to) {
             Ok(path) => {
@@ -911,7 +911,7 @@ fn test_fuzzy_stats_invariants() {
     let mut live_names: HashSet<String> = HashSet::new();
 
     for _ in 0..200 {
-        let op: u32 = rng.gen_range(0..100);
+        let op: u32 = rng.random_range(0..100);
         match op {
             0..=45 => {
                 let entity = random_entity(&mut rng);
@@ -923,7 +923,7 @@ fn test_fuzzy_stats_invariants() {
             }
             46..=65 => {
                 if !live_names.is_empty() {
-                    let pick = rng.gen_range(1..=3.min(live_names.len()));
+                    let pick = rng.random_range(1..=3.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
                         .choose_multiple(&mut rng, pick)
                         .into_iter()
@@ -938,7 +938,7 @@ fn test_fuzzy_stats_invariants() {
             66..=80 => {
                 if !live_names.is_empty() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
-                    let num_obs = rng.gen_range(1..=3);
+                    let num_obs = rng.random_range(1..=3);
                     let obs: Vec<String> = (0..num_obs).map(|_| random_name(&mut rng, 5)).collect();
                     kg.add_observations(&name, &obs).unwrap();
                 }
@@ -949,7 +949,7 @@ fn test_fuzzy_stats_invariants() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
                     if let Some(entity) = kg.get_entity(&name) {
                         if !entity.observations.is_empty() {
-                            let del_n = rng.gen_range(1..=entity.observations.len().min(2));
+                            let del_n = rng.random_range(1..=entity.observations.len().min(2));
                             let to_del: Vec<String> = entity.observations
                                 .choose_multiple(&mut rng, del_n)
                                 .cloned()
@@ -1054,13 +1054,13 @@ fn test_fuzzy_open_nodes_invariants() {
 
     for _ in 0..200 {
         // Build a request mixing real names and never-created ghosts.
-        let pick = rng.gen_range(0..=5.min(name_vec.len()));
+        let pick = rng.random_range(0..=5.min(name_vec.len()));
         let mut request: Vec<String> = name_vec
             .choose_multiple(&mut rng, pick)
             .cloned()
             .collect();
         // Number of ghosts to append.
-        let ghosts = rng.gen_range(0..3);
+        let ghosts = rng.random_range(0..3);
         for _ in 0..ghosts {
             let g = format!("__ghost_{}", random_name(&mut rng, 8));
             if !live_names.contains(&g) {
@@ -1112,12 +1112,12 @@ fn test_fuzzy_delete_relations_precision() {
     let rtypes = ["knows", "likes", "owns", "manages"];
 
     for _ in 0..400 {
-        let op = rng.gen_range(0..100);
+        let op = rng.random_range(0..100);
         if op < 60 {
             // Create a random relation.
-            let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-            let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
-            let rtype = rtypes[rng.gen_range(0..rtypes.len())].to_string();
+            let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+            let to = name_vec[rng.random_range(0..name_vec.len())].clone();
+            let rtype = rtypes[rng.random_range(0..rtypes.len())].to_string();
             let rel = Relation { from: from.clone(), to: to.clone(), relation_type: rtype.clone() };
             let created = kg.create_relations(&[rel]).unwrap();
             if !created.is_empty() {
@@ -1129,14 +1129,14 @@ fn test_fuzzy_delete_relations_precision() {
         } else if !model.is_empty() {
             // Delete an existing relation; sometimes also attempt a bogus one.
             let existing: Vec<(String, String, String)> = model.iter().cloned().collect();
-            let target = existing[rng.gen_range(0..existing.len())].clone();
+            let target = existing[rng.random_range(0..existing.len())].clone();
             let mut to_del = vec![Relation {
                 from: target.0.clone(),
                 to: target.1.clone(),
                 relation_type: target.2.clone(),
             }];
             // A non-existent relation must be a silent no-op.
-            if rng.gen_bool(0.3) {
+            if rng.random_bool(0.3) {
                 to_del.push(Relation {
                     from: target.0.clone(),
                     to: target.1.clone(),
@@ -1184,7 +1184,7 @@ fn test_fuzzy_reopen_after_each_mutation() {
             .collect();
         assert_eq!(disk_rels, relations, "relations not durable across reopen");
 
-        let op = rng.gen_range(0..100);
+        let op = rng.random_range(0..100);
         match op {
             0..=45 => {
                 let entity = random_entity(&mut rng);
@@ -1197,7 +1197,7 @@ fn test_fuzzy_reopen_after_each_mutation() {
             46..=60 => {
                 if !live_names.is_empty() {
                     let names: Vec<String> = live_names.iter().cloned().collect();
-                    let victim = names[rng.gen_range(0..names.len())].clone();
+                    let victim = names[rng.random_range(0..names.len())].clone();
                     kg.delete_entities(&[victim.clone()]).unwrap();
                     live_names.remove(&victim);
                     // Cascade: relations touching the victim are gone.
@@ -1207,8 +1207,8 @@ fn test_fuzzy_reopen_after_each_mutation() {
             61..=85 => {
                 if live_names.len() >= 2 {
                     let names: Vec<String> = live_names.iter().cloned().collect();
-                    let from = names[rng.gen_range(0..names.len())].clone();
-                    let to = names[rng.gen_range(0..names.len())].clone();
+                    let from = names[rng.random_range(0..names.len())].clone();
+                    let to = names[rng.random_range(0..names.len())].clone();
                     if from != to {
                         let rel = Relation { from: from.clone(), to: to.clone(), relation_type: "rel".into() };
                         if !kg.create_relations(&[rel]).unwrap().is_empty() {
@@ -1220,7 +1220,7 @@ fn test_fuzzy_reopen_after_each_mutation() {
             _ => {
                 if !relations.is_empty() {
                     let all: Vec<(String, String, String)> = relations.iter().cloned().collect();
-                    let target = all[rng.gen_range(0..all.len())].clone();
+                    let target = all[rng.random_range(0..all.len())].clone();
                     kg.delete_relations(&[Relation {
                         from: target.0.clone(),
                         to: target.1.clone(),
@@ -1254,8 +1254,8 @@ fn test_fuzzy_neighbors_invariants() {
     let name_vec: Vec<String> = live_names.iter().cloned().collect();
 
     for _ in 0..80 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let _ = kg.create_relations(&[Relation {
                 from,
@@ -1267,9 +1267,9 @@ fn test_fuzzy_neighbors_invariants() {
 
     let dirs = [Direction::Out, Direction::In, Direction::Both];
     for _ in 0..200 {
-        let origin = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let dir = dirs[rng.gen_range(0..dirs.len())];
-        let depth = rng.gen_range(0..4);
+        let origin = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let dir = dirs[rng.random_range(0..dirs.len())];
+        let depth = rng.random_range(0..4);
         let out = kg.neighbors(&origin, dir, None, depth).unwrap();
 
         // Origin is always present; every entity is live and unique.
@@ -1314,8 +1314,8 @@ fn test_fuzzy_describe_entity_consistency() {
     kg.create_entities(&entities).unwrap();
 
     for _ in 0..100 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let _ = kg.create_relations(&[Relation {
                 from,
@@ -1406,12 +1406,12 @@ fn test_fuzzy_filtered_search_subset() {
         .collect();
 
     for _ in 0..150 {
-        let q = tokens[rng.gen_range(0..tokens.len())].clone();
+        let q = tokens[rng.random_range(0..tokens.len())].clone();
         let full = kg.search_nodes(&q);
         let full_names: HashSet<&str> = full.entities.iter().map(|e| e.name.as_str()).collect();
 
         // Pagination subset: limit caps the count and never invents entities.
-        let limit = rng.gen_range(0..=full.entities.len().max(1));
+        let limit = rng.random_range(0..=full.entities.len().max(1));
         let page = kg.search_nodes_filtered(&q, None, 0, limit);
         assert!(page.entities.len() <= limit);
         for e in &page.entities {
@@ -1419,7 +1419,7 @@ fn test_fuzzy_filtered_search_subset() {
         }
 
         // Skipping `offset` matches yields exactly the remaining count.
-        let offset = rng.gen_range(0..=full.entities.len() + 1);
+        let offset = rng.random_range(0..=full.entities.len() + 1);
         let rest = kg.search_nodes_filtered(&q, None, offset, usize::MAX);
         assert_eq!(rest.entities.len(), full.entities.len().saturating_sub(offset));
         for e in &rest.entities {
@@ -1457,8 +1457,8 @@ fn test_fuzzy_export_consistency() {
     };
     kg.create_entities(&entities).unwrap();
     for _ in 0..60 {
-        let from = name_vec[rng.gen_range(0..name_vec.len())].clone();
-        let to = name_vec[rng.gen_range(0..name_vec.len())].clone();
+        let from = name_vec[rng.random_range(0..name_vec.len())].clone();
+        let to = name_vec[rng.random_range(0..name_vec.len())].clone();
         if from != to {
             let _ = kg.create_relations(&[Relation { from, to, relation_type: "knows".into() }]);
         }

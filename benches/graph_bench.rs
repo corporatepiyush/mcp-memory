@@ -41,14 +41,14 @@ fn build_graph() -> (KnowledgeGraph, String, Vec<String>) {
     let path = bench_path();
     let _ = std::fs::remove_file(&path);
     let mut kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
-    let mut rng = SmallRng::from_seed([7u8; 32]);
+    let mut rng = SmallRng::seed_from_u64(7);
 
     let names: Vec<String> = (0..N_ENTITIES).map(|i| format!("entity_{i}")).collect();
     let entities: Vec<Entity> = names
         .iter()
         .map(|name| {
-            let etype = format!("type_{}", rng.gen_range(0..32));
-            let obs = vec![format!("obs_{}", rng.gen_range(0..1_000_000))];
+            let etype = format!("type_{}", rng.random_range(0..32));
+            let obs = vec![format!("obs_{}", rng.random_range(0..1_000_000))];
             Entity { name: name.clone(), entity_type: etype, observations: obs }
         })
         .collect();
@@ -59,8 +59,8 @@ fn build_graph() -> (KnowledgeGraph, String, Vec<String>) {
 
     let relations: Vec<Relation> = (0..N_RELATIONS)
         .map(|_| {
-            let from = names[rng.gen_range(0..names.len())].clone();
-            let to = names[rng.gen_range(0..names.len())].clone();
+            let from = names[rng.random_range(0..names.len())].clone();
+            let to = names[rng.random_range(0..names.len())].clone();
             Relation { from, to, relation_type: "knows".into() }
         })
         .collect();
@@ -73,12 +73,12 @@ fn build_graph() -> (KnowledgeGraph, String, Vec<String>) {
 
 fn benches(c: &mut Criterion) {
     let (kg, path, names) = build_graph();
-    let mut rng = SmallRng::from_seed([13u8; 32]);
+    let mut rng = SmallRng::seed_from_u64(13);
 
     // Point read: random slot lookups — the cache-line-straddle case.
     c.bench_function("get_entity_random", |b| {
         b.iter(|| {
-            let name = &names[rng.gen_range(0..names.len())];
+            let name = &names[rng.random_range(0..names.len())];
             black_box(kg.get_entity(black_box(name)));
         })
     });
@@ -86,7 +86,7 @@ fn benches(c: &mut Criterion) {
     // Scan: filter the flat relation vec by source.
     c.bench_function("search_relations_from", |b| {
         b.iter(|| {
-            let name = &names[rng.gen_range(0..names.len())];
+            let name = &names[rng.random_range(0..names.len())];
             black_box(kg.search_relations(Some(name), None, None));
         })
     });
@@ -94,8 +94,8 @@ fn benches(c: &mut Criterion) {
     // Scan + BFS over the relation adjacency.
     c.bench_function("find_path_random", |b| {
         b.iter(|| {
-            let a = &names[rng.gen_range(0..names.len())];
-            let z = &names[rng.gen_range(0..names.len())];
+            let a = &names[rng.random_range(0..names.len())];
+            let z = &names[rng.random_range(0..names.len())];
             let _ = black_box(kg.find_path(black_box(a), black_box(z)));
         })
     });
@@ -103,7 +103,7 @@ fn benches(c: &mut Criterion) {
     // 1-hop neighborhood: single relation-vec pass.
     c.bench_function("neighbors_depth1", |b| {
         b.iter(|| {
-            let name = &names[rng.gen_range(0..names.len())];
+            let name = &names[rng.random_range(0..names.len())];
             black_box(kg.neighbors(black_box(name), Direction::Both, None, 1).unwrap());
         })
     });
