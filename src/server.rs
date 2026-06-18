@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::actions::memory;
@@ -25,6 +26,8 @@ const BUFFER_CAPACITY: usize = 65536;
 const NEWLINE: &[u8] = b"\n";
 /// Maximum size of a single inbound JSON-RPC message (shared by all transports).
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of concurrent TCP connections (C4).
+const MAX_TCP_CONNECTIONS: usize = 128;
 
 enum LineRead {
     Line,
@@ -214,22 +217,25 @@ impl MCPServer {
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
-        serve_line_conn(&mut reader, &mut stdout, &self.kg).await
+        serve_line_conn(&mut reader, &mut stdout, Arc::clone(&self.kg)).await
     }
 
     /// TCP transport: each accepted connection speaks newline-delimited
-    /// JSON-RPC, exactly like stdio. Connections are served concurrently and
-    /// share the one graph behind its mutex.
+    /// JSON-RPC, exactly like stdio. Connections are served concurrently (up to
+    /// [`MAX_TCP_CONNECTIONS`]) and share the one graph behind its mutex.
     pub async fn run_tcp(&self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
-        info!("Listening for TCP MCP connections on {addr}");
+        let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+        info!("Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS})");
         loop {
+            let permit = Arc::clone(&semaphore).acquire_owned().await;
             let (socket, peer) = listener.accept().await.map_err(MCSError::IoError)?;
             let kg = Arc::clone(&self.kg);
             tokio::spawn(async move {
+                let _permit = permit; // held for the connection lifetime
                 let (read_half, mut write_half) = socket.into_split();
                 let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, read_half);
-                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, &kg).await {
+                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, kg).await {
                     error!("TCP connection {peer} error: {e}");
                 }
             });
@@ -245,7 +251,9 @@ impl MCPServer {
 /// Drive one line-framed connection (stdio or a single TCP socket): read
 /// newline-delimited JSON-RPC requests, write newline-delimited responses.
 /// Notifications produce no output. Returns when the peer closes the stream.
-async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: &GraphHandle) -> Result<()>
+/// The dispatch path (graph lock + optional fsync) is offloaded to
+/// [`tokio::task::spawn_blocking`] to keep the async reactor responsive (C3).
+async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: Arc<GraphHandle>) -> Result<()>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -257,7 +265,15 @@ where
         match read_line_capped(reader, &mut line, MAX_REQUEST_BYTES).await {
             Ok(LineRead::Eof) => break,
             Ok(LineRead::Line) => {
-                if let Some(resp) = dispatch_line(&line, kg) {
+                let line_copy = line.clone();
+                let kg_clone = Arc::clone(&kg);
+                let resp = tokio::task::spawn_blocking(move || dispatch_line(&line_copy, &kg_clone))
+                    .await
+                    .map_err(|join_err| {
+                        error!("dispatch task panicked: {join_err}");
+                        MCSError::IoError(std::io::Error::other("dispatch task panicked"))
+                    })?;
+                if let Some(resp) = resp {
                     out.clear();
                     out.extend_from_slice(resp.as_bytes());
                     out.extend_from_slice(NEWLINE);
