@@ -704,6 +704,143 @@ mod tests {
     }
 
     #[test]
+    fn test_v1_format_backward_compat() {
+        // Open an existing V1 file (MCPMEMV1 magic, no CRC), append a new record,
+        // and verify all records survive replay — the CRC footer must NOT be
+        // written for V1 files, and the payload_len calculation must not absorb
+        // non-existent CRC bytes into the payload (D2 regression guard).
+        let path = tmp_path();
+
+        // Manually craft a V1 file: MAGIC + V1-format records (no CRC).
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"MCPMEMV1");
+
+        let mut p1 = Vec::new();
+        encode_create_entity(&mut p1, "Alice", "person", &[]).unwrap();
+        let len1: u32 = 4 + 1 + p1.len() as u32;
+        raw.extend_from_slice(&len1.to_le_bytes());
+        raw.extend_from_slice(&[RecordKind::CreateEntity as u8]);
+        raw.extend_from_slice(&p1);
+
+        let mut p2 = Vec::new();
+        encode_create_entity(&mut p2, "Bob", "person", &[]).unwrap();
+        let len2: u32 = 4 + 1 + p2.len() as u32;
+        raw.extend_from_slice(&len2.to_le_bytes());
+        raw.extend_from_slice(&[RecordKind::CreateEntity as u8]);
+        raw.extend_from_slice(&p2);
+
+        std::fs::write(&path, &raw).unwrap();
+
+        // Open with BinaryStore — must detect V1 magic, set has_crc=false.
+        let mut store = BinaryStore::new(&path).unwrap();
+
+        // Append a third record — must NOT add CRC footer.
+        let mut p3 = Vec::new();
+        encode_create_entity(&mut p3, "Charlie", "person", &[]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &p3).unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        // File size: V1 records have no CRC, so each takes 5 + payload bytes.
+        let expected_size = raw.len() as u64 + (5 + p3.len()) as u64;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            expected_size,
+            "V1 file must not grow by CRC bytes after write"
+        );
+
+        // Replay must decode all three records correctly.
+        let replay_store = BinaryStore::new(&path).unwrap();
+        let mut names = Vec::new();
+        replay_store
+            .replay(|_, data| {
+                if let Some((name, _, _)) = decode_create_entity(data) {
+                    names.push(name.to_string());
+                }
+            })
+            .unwrap();
+        assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_crc_detects_corrupted_payload() {
+        // Corrupt a byte in a V2 file's payload and verify replay detects the
+        // CRC mismatch and stops — the corrupted record must NOT be returned
+        // to the callback (D2).
+        let path = tmp_path();
+        let mut store = BinaryStore::new(&path).unwrap();
+
+        let mut buf = Vec::new();
+        encode_create_entity(&mut buf, "Alice", "person", &["likes coffee".into()]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf).unwrap();
+        store.flush_and_sync().unwrap();
+        drop(store);
+
+        // Read the raw file, corrupt one byte inside the payload.
+        let mut data = std::fs::read(&path).unwrap();
+        // Layout: MAGIC(8) + Len(4) + Kind(1) + payload(N) + CRC(4)
+        // Flip a bit at the payload midpoint.
+        let payload_start = 8 + 4 + 1;
+        let corrupt_pos = payload_start + (data.len() - payload_start - 4) / 2;
+        data[corrupt_pos] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        // Replay must detect the CRC mismatch and stop before the callback.
+        let replay_store = BinaryStore::new(&path).unwrap();
+        let mut count = 0;
+        replay_store
+            .replay(|_, _| count += 1)
+            .expect("CRC mismatch must return Ok (torn-tail semantics)");
+        assert_eq!(count, 0, "corrupted record must not reach callback");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_crc_detects_corrupted_middle_record() {
+        // With two valid records, corrupting the second record's payload must
+        // preserve the first record and stop cleanly before the second (D2).
+        let path = tmp_path();
+        let mut store = BinaryStore::new(&path).unwrap();
+
+        let mut buf1 = Vec::new();
+        encode_create_entity(&mut buf1, "Alice", "person", &[]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf1).unwrap();
+
+        let mut buf2 = Vec::new();
+        encode_create_entity(&mut buf2, "Bob", "person", &[]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf2).unwrap();
+
+        store.flush_and_sync().unwrap();
+        drop(store);
+
+        // Corrupt a byte in the second record's payload.
+        let mut data = std::fs::read(&path).unwrap();
+        // First record ends at: 8 + 4 + 1 + payload1.len() + 4
+        let rec1_end = 8 + 4 + 1 + buf1.len() + 4;
+        // Second record payload starts at: rec1_end + 4 (len) + 1 (kind)
+        let rec2_payload_start = rec1_end + 4 + 1;
+        data[rec2_payload_start + 2] ^= 0xFF; // corrupt 3rd byte of payload
+        std::fs::write(&path, &data).unwrap();
+
+        let replay_store = BinaryStore::new(&path).unwrap();
+        let mut names = Vec::new();
+        replay_store
+            .replay(|_, data| {
+                if let Some((name, _, _)) = decode_create_entity(data) {
+                    names.push(name.to_string());
+                }
+            })
+            .expect("CRC mismatch of middle record must not hard-error");
+        // Alice survives; Bob is discarded.
+        assert_eq!(names, vec!["Alice"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_torn_record_mid_stream_recovers_prefix() {
         // A crash that writes a record's length prefix but only part of its
         // body must not brick the log: replay should return the records written

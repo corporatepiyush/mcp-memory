@@ -2111,6 +2111,56 @@ fn test_uncommitted_transaction_discarded() {
     cleanup(&path);
 }
 
+/// `compact_if_needed` must NOT trigger below the 30% tombstone threshold,
+/// and MUST trigger above it. Verified via inode change (compact renames a
+/// temp file over the original).
+#[test]
+fn test_compact_if_needed_threshold() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (mut kg, path) = setup();
+
+    // Create 100 entities — 100 slots, 0 tombstones.
+    let entities: Vec<Entity> = (0..100)
+        .map(|i| Entity {
+            name: format!("E{i}"),
+            entity_type: "test".into(),
+            observations: vec![],
+        })
+        .collect();
+    kg.create_entities(&entities).unwrap();
+    kg.flush_and_sync().unwrap();
+
+    let ino_initial = std::fs::metadata(&path).unwrap().ino();
+
+    // Delete 20 entities → 20% tombstones → below 30% threshold.
+    let batch1: Vec<String> = (0..20).map(|i| format!("E{i}")).collect();
+    kg.delete_entities(&batch1).unwrap();
+
+    let ino_after_20 = std::fs::metadata(&path).unwrap().ino();
+    assert_eq!(
+        ino_initial, ino_after_20,
+        "compact must NOT trigger at 20% tombstones"
+    );
+
+    // Delete 20 more → 40% tombstones → above 30% → compact triggers.
+    let batch2: Vec<String> = (20..40).map(|i| format!("E{i}")).collect();
+    kg.delete_entities(&batch2).unwrap();
+
+    let ino_after_40 = std::fs::metadata(&path).unwrap().ino();
+    assert_ne!(
+        ino_after_20, ino_after_40,
+        "compact MUST trigger at 40% tombstones (new inode after rename)"
+    );
+
+    // Graph must remain consistent.
+    assert!(kg.get_entity("E40").is_some(), "live entity must exist after compact");
+    assert!(kg.get_entity("E0").is_none(), "deleted entity must be gone after compact");
+    assert!(kg.get_entity("E99").is_some(), "undeleted entity must survive compact");
+
+    cleanup(&path);
+}
+
 /// A properly committed transaction in the log applies all of its records.
 #[test]
 fn test_committed_transaction_applied() {
