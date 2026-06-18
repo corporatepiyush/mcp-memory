@@ -6,5 +6,6 @@
 *.bin
 
 # Local design notes, plans, and reviews (not for the published crate)
-*plan*
-*review*
+PERF_OPTIMIZATION_PLAN.md
+OPTIMIZATION_PLAN.md
+REVIEW_MEMORY_IO_CONCURRENCY.md

@@ -9,7 +9,7 @@ repository = "https://github.com/corporatepiyush/mcp-memory"
 readme = "README.md"
 keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent"]
 categories = ["database-implementations", "command-line-utilities"]
-exclude = ["/target", "*plan*", "*review*", "*.bin"]
+exclude = ["/target", "PERF_OPTIMIZATION_PLAN.md", "OPTIMIZATION_PLAN.md", "REVIEW_MEMORY_IO_CONCURRENCY.md", "*.bin"]
 
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "net"] }
