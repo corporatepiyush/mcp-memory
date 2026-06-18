@@ -452,14 +452,12 @@ pub struct KnowledgeGraph {
 // ---------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct ReadSnapshot {
-    pub(crate) interner: StringInterner,
+    pub(crate) interner: Arc<StringInterner>,
     pub(crate) entity_slots: Arc<[Option<StoredEntity>]>,
-    #[allow(dead_code)]
-    free_slots: Vec<u32>,
-    name_table: ShardedNameTable,
+    name_table: Arc<ShardedNameTable>,
     pub(crate) relations: Arc<[StoredRelation]>,
-    adjacency: AHashMap<StrId, Vec<(StrId, StrId)>>,
-    search: SearchIndex,
+    adjacency: Arc<AHashMap<StrId, Vec<(StrId, StrId)>>>,
+    search: Arc<SearchIndex>,
 }
 
 // Fast JSON string escaper — writes escaped string into the buffer without
@@ -760,7 +758,7 @@ impl ReadSnapshot {
             let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
             match direction {
                 Direction::Both => {
-                    for (&node, edges) in &self.adjacency {
+                    for (&node, edges) in &*self.adjacency {
                         for &(nb, rt) in edges {
                             if rtype_id.is_none_or(|rt_id| rt == rt_id) {
                                 adj.entry(node).or_default().push(nb);
@@ -907,7 +905,7 @@ impl ReadSnapshot {
             }
         }
         let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::new();
-        for (&node, edges) in &self.adjacency {
+        for (&node, edges) in &*self.adjacency {
             let nbrs: Vec<StrId> = edges.iter().map(|(to, _)| *to).collect();
             adj.insert(node, nbrs);
         }
@@ -1076,7 +1074,7 @@ impl ReadSnapshot {
             return Ok(vec![vec![from.to_string()]]);
         }
         let mut adj: AHashMap<StrId, Vec<StrId>> = AHashMap::with_capacity(self.adjacency.len());
-        for (&node, edges) in &self.adjacency {
+        for (&node, edges) in &*self.adjacency {
             let nbrs: Vec<StrId> = edges.iter().map(|(to, _)| *to).collect();
             adj.insert(node, nbrs);
         }
@@ -2713,13 +2711,12 @@ impl KnowledgeGraph {
     /// Freezes entity_slots and relations into `Arc<[_]>` and clones the rest.
     pub fn snapshot(&self) -> ReadSnapshot {
         ReadSnapshot {
-            interner: self.interner.clone(),
+            interner: Arc::new(self.interner.clone()),
             entity_slots: Arc::from_iter(self.entity_slots.iter().cloned()),
-            free_slots: self.free_slots.clone(),
-            name_table: self.name_table.clone(),
+            name_table: Arc::new(self.name_table.clone()),
             relations: Arc::from_iter(self.relations.iter().cloned()),
-            adjacency: self.adjacency.clone(),
-            search: self.search.clone(),
+            adjacency: Arc::new(self.adjacency.clone()),
+            search: Arc::new(self.search.clone()),
         }
     }
 
