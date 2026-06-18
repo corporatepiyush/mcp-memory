@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::prelude::*;
 
-use mcp_memory::kg::{Direction, KnowledgeGraph};
+use mcp_memory::kg::{Direction, GraphHandle, KnowledgeGraph};
 use mcp_memory::types::{Entity, Relation};
 
 const N_ENTITIES: usize = 40_000;
@@ -417,9 +417,105 @@ fn benches(c: &mut Criterion) {
         );
     });
 
+    // ── Dispatch (server) benchmarks ──────────────────────────────────────
+    //
+    // These measure the full `dispatch_line` path, including JSON-RPC parsing,
+    // handler logic, and response serialization. They use a pre-built
+    // GraphHandle so the read_graph cache is warm on the 2nd+ iteration.
+
+    let gh_path = format!("{}/mcp_gh_{}_{}", std::env::temp_dir().display(), std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst));
+    {
+        // Populate a graph via GraphHandle
+        let gh = GraphHandle::new(Path::new(&gh_path)).unwrap();
+        let entities: Vec<Entity> = (0..10_000)
+            .map(|i| Entity {
+                name: format!("entity_{i}"),
+                entity_type: "bench_type".into(),
+                observations: vec!["obs".into()],
+            })
+            .collect();
+        for chunk in entities.chunks(10_000) {
+            let mut wg = gh.write();
+            wg.create_entities(chunk).unwrap();
+            wg.flush_and_sync().unwrap();
+        }
+        drop(gh); // sync snapshot
+    }
+    let gh = GraphHandle::new(Path::new(&gh_path)).unwrap();
+
+    c.bench_function("dispatch_read_graph", |b| {
+        let line = r#"{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"read_graph","arguments":{}}}"#;
+        b.iter(|| {
+            let resp = mcp_memory::server::dispatch_line(black_box(line), &gh);
+            black_box(resp)
+        });
+    });
+
+    c.bench_function("dispatch_search_nodes", |b| {
+        let line = r#"{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"search_nodes","arguments":{"query":"entity"}}}"#;
+        b.iter(|| {
+            let resp = mcp_memory::server::dispatch_line(black_box(line), &gh);
+            black_box(resp)
+        });
+    });
+
+    // Compare dispatch_read_graph for a small graph (100 entities) to show
+    // the effect of cache + fast serialization vs. the old path.
+    let small_path = format!("{}/mcp_gh_small_{}_{}", std::env::temp_dir().display(), std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst));
+    {
+        let gh = GraphHandle::new(Path::new(&small_path)).unwrap();
+        let entities: Vec<Entity> = (0..100)
+            .map(|i| Entity {
+                name: format!("entity_{i}"),
+                entity_type: "bench_type".into(),
+                observations: vec!["obs".into()],
+            })
+            .collect();
+        let mut wg = gh.write();
+        wg.create_entities(&entities).unwrap();
+        wg.flush_and_sync().unwrap();
+    }
+    let gh_small = GraphHandle::new(Path::new(&small_path)).unwrap();
+
+    c.bench_function("dispatch_read_graph_small_100", |b| {
+        let line = r#"{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"read_graph","arguments":{}}}"#;
+        b.iter(|| {
+            let resp = mcp_memory::server::dispatch_line(black_box(line), &gh_small);
+            black_box(resp)
+        });
+    });
+
+    // Compare: reading a Value-based tool through the standard dispatch path
+    c.bench_function("dispatch_initialize", |b| {
+        let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
+        b.iter(|| {
+            let resp = mcp_memory::server::dispatch_line(black_box(line), &gh);
+            black_box(resp)
+        });
+    });
+
+    // ── Raw serialization comparison ───────────────────────────────────────
+    let snap = gh.read();
+    c.bench_function("read_graph_owned", |b| {
+        // Old path: build owned structs, then serde_json::to_string
+        b.iter(|| {
+            let out = black_box(&snap).read_graph();
+            black_box(serde_json::to_string(&out).unwrap())
+        });
+    });
+
+    c.bench_function("read_graph_json_direct", |b| {
+        // New path: write JSON directly without owned structs
+        b.iter(|| {
+            black_box(black_box(&snap).read_graph_json())
+        });
+    });
+
     // Cleanup
     let _ = std::fs::remove_file(&r_path);
     let _ = std::fs::remove_file(&w_path);
+    let _ = std::fs::remove_file(&gh_path);
+    let _ = std::fs::remove_file(&small_path);
 }
 
 criterion_group!(graph, benches);

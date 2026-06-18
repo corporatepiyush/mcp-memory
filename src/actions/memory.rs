@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::errors::{MCSError, Result};
-use crate::kg::{GraphHandle, ReadSnapshot};
+use crate::kg::{push_json_str, GraphHandle, ReadSnapshot};
 
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_OBSERVATION_BYTES: usize = 65536;
@@ -50,17 +50,27 @@ fn lock_graph_write(kg: &GraphHandle) -> crate::kg::WriteGuard<'_> {
     kg.write()
 }
 
-pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
-    let graph = lock_graph_read(kg);
+fn build_content_response(inner_json: &str) -> String {
+    let mut out = String::with_capacity(64 + inner_json.len() + (inner_json.len() / 8));
+    out.push_str(r#"{"content":[{"type":"text","text":"#);
+    push_json_str(&mut out, inner_json);
+    out.push_str(r#"}]}"#);
+    out
+}
+
+pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<String> {
     let params = args.unwrap_or(&Value::Null);
     let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let offset = opt_usize(params, "offset", 0)?;
     let limit = opt_usize(params, "limit", usize::MAX)?;
 
-    let out = if entity_type.is_none() && offset == 0 && limit == usize::MAX {
-        graph.read_graph()
+    if entity_type.is_none() && offset == 0 && limit == usize::MAX {
+        // Fast path: use cached or raw-JSON serialization, bypassing Value tree.
+        Ok(build_content_response(&kg.read_graph_cached()))
     } else {
-        let mut entities: Vec<crate::types::Entity> = graph
+        // Filtered/paginated read: use the borrowing view and serialize once.
+        let graph = lock_graph_read(kg);
+        let entities: Vec<crate::types::Entity> = graph
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
@@ -69,18 +79,26 @@ pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
             .take(limit)
             .map(|e| graph.entity_to_output(e))
             .collect();
-        entities.sort_by(|a, b| a.name.cmp(&b.name));
-        let matched: std::collections::HashSet<_> = entities.iter().map(|e| graph.interner.get_optional(&e.name)).flatten().collect();
+        // No entity type filter on relations — just filter by matched names.
+        let mut matched: std::collections::HashSet<_> = entities.iter()
+            .filter_map(|e| graph.interner.get_optional(&e.name))
+            .collect();
+        if matched.is_empty() && entity_type.is_none() {
+            // Full read without type filter but with pagination — need all names.
+            matched = graph.entity_slots.iter()
+                .filter_map(|s| s.as_ref().filter(|e| e.is_live()).map(|e| e.name))
+                .collect();
+        }
         let relations: Vec<crate::types::Relation> = graph
             .relations
             .iter()
             .filter(|r| matched.contains(&r.from) && matched.contains(&r.to))
             .map(|r| graph.relation_to_output(r))
             .collect();
-        crate::types::KnowledgeGraphOut { entities, relations }
-    };
-    let text = serde_json::to_string(&out).map_err(MCSError::JsonError)?;
-    Ok(text_content!(text))
+        let text = serde_json::to_string(&crate::types::KnowledgeGraphOut { entities, relations })
+            .map_err(MCSError::JsonError)?;
+        Ok(build_content_response(&text))
+    }
 }
 
 pub fn handle_create_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
@@ -114,7 +132,6 @@ pub fn handle_create_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<
     {
         let mut graph = lock_graph_write(kg);
         result = graph.create_entities(&input_entities)?;
-        graph.flush_and_sync()?;
     }
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
@@ -142,7 +159,6 @@ pub fn handle_create_relations(kg: &GraphHandle, args: Option<&Value>) -> Result
 
     let mut graph = lock_graph_write(kg);
     let result = graph.create_relations(&input_relations)?;
-    graph.flush_and_sync()?;
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
@@ -189,7 +205,6 @@ pub fn handle_add_observations(kg: &GraphHandle, args: Option<&Value>) -> Result
             "addedObservations": added
         }));
     }
-    graph.flush_and_sync()?;
     let text = serde_json::to_string(&json!({"results": results})).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
@@ -204,7 +219,6 @@ pub fn handle_delete_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<
 
     let mut graph = lock_graph_write(kg);
     graph.delete_entities(&entity_names)?;
-    graph.flush_and_sync()?;
 
     Ok(text_content!("Entities deleted successfully"))
 }
@@ -231,7 +245,6 @@ pub fn handle_delete_observations(kg: &GraphHandle, args: Option<&Value>) -> Res
 
         graph.delete_observations(entity_name, &observations)?;
     }
-    graph.flush_and_sync()?;
 
     Ok(text_content!("Observations deleted successfully"))
 }
@@ -247,12 +260,11 @@ pub fn handle_delete_relations(kg: &GraphHandle, args: Option<&Value>) -> Result
 
     let mut graph = lock_graph_write(kg);
     graph.delete_relations(&input_relations)?;
-    graph.flush_and_sync()?;
 
     Ok(text_content!("Relations deleted successfully"))
 }
 
-pub fn handle_search_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+pub fn handle_search_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<String> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let query = params
         .get("query")
@@ -272,7 +284,7 @@ pub fn handle_search_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<Val
         .take(limit)
         .collect();
     let text = serde_json::to_string(&filtered).map_err(MCSError::JsonError)?;
-    Ok(text_content!(text))
+    Ok(build_content_response(&text))
 }
 
 pub fn handle_open_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
@@ -346,7 +358,6 @@ pub fn handle_find_path(kg: &GraphHandle, args: Option<&Value>) -> Result<Value>
 pub fn handle_compact(kg: &GraphHandle) -> Result<Value> {
     let mut graph = lock_graph_write(kg);
     graph.compact()?;
-    graph.flush_and_sync()?;
     Ok(text_content!("Log compacted successfully"))
 }
 
@@ -448,7 +459,6 @@ pub fn handle_upsert_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<
 
     let mut graph = lock_graph_write(kg);
     let results = graph.upsert_entities(&input_entities)?;
-    graph.flush_and_sync()?;
     let text = serde_json::to_string(&json!({ "results": results })).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
@@ -468,7 +478,6 @@ pub fn handle_merge_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<V
 
     let mut graph = lock_graph_write(kg);
     let result = graph.merge_entities(source, target)?;
-    graph.flush_and_sync()?;
     let text = serde_json::to_string(&result).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }

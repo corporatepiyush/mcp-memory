@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"MCPMEMV1";
 const MAX_RECORD_BYTES: u32 = 1 << 20;
@@ -43,6 +44,10 @@ impl RecordKind {
 pub struct BinaryStore {
     writer: BufWriter<File>,
     path: PathBuf,
+    /// A separate file handle on the same underlying file, used by the
+    /// background sync thread to call `fsync` without holding any lock.
+    /// Cloned via `File::try_clone()` during construction.
+    pub(crate) sync_file: Arc<File>,
 }
 
 impl BinaryStore {
@@ -58,6 +63,7 @@ impl BinaryStore {
             .read(false)
             .open(path)?;
 
+        let sync_file = Arc::new(file.try_clone()?);
         let mut writer = BufWriter::with_capacity(65536, file);
 
         if !exists {
@@ -68,6 +74,7 @@ impl BinaryStore {
         Ok(Self {
             writer,
             path: path.to_path_buf(),
+            sync_file,
         })
     }
 
@@ -85,9 +92,19 @@ impl BinaryStore {
         Ok(())
     }
 
-    pub fn flush_and_sync(&mut self) -> std::io::Result<()> {
-        self.writer.flush()?;
+    /// Flush the `BufWriter` to the kernel buffer (no `fsync`).
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+
+    /// `fsync` the underlying file (kernel buffer → disk).
+    pub fn sync(&mut self) -> std::io::Result<()> {
         self.writer.get_ref().sync_data()
+    }
+
+    pub fn flush_and_sync(&mut self) -> std::io::Result<()> {
+        self.flush()?;
+        self.sync()
     }
 
     pub fn replay<F>(&self, mut callback: F) -> std::io::Result<()>
@@ -167,6 +184,7 @@ impl BinaryStore {
             .write(true)
             .truncate(true)
             .open(&self.path)?;
+        self.sync_file = Arc::new(file.try_clone()?);
         let mut writer = BufWriter::with_capacity(65536, file);
         writer.write_all(MAGIC)?;
         writer.flush()?;

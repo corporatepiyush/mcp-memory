@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
-use std::path::Path;
 
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
 
@@ -462,8 +462,166 @@ pub struct ReadSnapshot {
     search: SearchIndex,
 }
 
+// Fast JSON string escaper — writes escaped string into the buffer without
+// allocating an intermediate string for the escape pass.
+pub(crate) fn push_json_str(buf: &mut String, s: &str) {
+    buf.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                write!(buf, "\\u{:04x}", c as u32).unwrap();
+            }
+            c => buf.push(c),
+        }
+    }
+    buf.push('"');
+}
+
+/// A borrowing view over a selection of entities/relations from a ReadSnapshot.
+/// Serializes without intermediate owned String allocations.
+pub struct ReadGraphView<'a> {
+    snap: &'a ReadSnapshot,
+    entities: Vec<&'a StoredEntity>,
+    relations: Vec<&'a StoredRelation>,
+}
+
+impl Serialize for ReadGraphView<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("KnowledgeGraphOut", 2)?;
+        st.serialize_field("entities", &ReadEntityListRef { snap: self.snap, items: &self.entities })?;
+        st.serialize_field("relations", &ReadRelationListRef { snap: self.snap, items: &self.relations })?;
+        st.end()
+    }
+}
+
+struct ReadEntityListRef<'a> { snap: &'a ReadSnapshot, items: &'a [&'a StoredEntity] }
+impl Serialize for ReadEntityListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &e in self.items {
+            seq.serialize_element(&ReadEntityRef { snap: self.snap, e })?;
+        }
+        seq.end()
+    }
+}
+
+struct ReadRelationListRef<'a> { snap: &'a ReadSnapshot, items: &'a [&'a StoredRelation] }
+impl Serialize for ReadRelationListRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.items.len()))?;
+        for &r in self.items {
+            seq.serialize_element(&ReadRelationRef { snap: self.snap, r })?;
+        }
+        seq.end()
+    }
+}
+
+struct ReadEntityRef<'a> { snap: &'a ReadSnapshot, e: &'a StoredEntity }
+impl Serialize for ReadEntityRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Entity", 3)?;
+        st.serialize_field("name", self.snap.interner.lookup(self.e.name))?;
+        st.serialize_field("entityType", self.snap.interner.lookup(self.e.entity_type))?;
+        st.serialize_field("observations", &ReadObsRef { snap: self.snap, obs: &self.e.observations })?;
+        st.end()
+    }
+}
+
+struct ReadObsRef<'a> { snap: &'a ReadSnapshot, obs: &'a [StrId] }
+impl Serialize for ReadObsRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.obs.len()))?;
+        for &o in self.obs {
+            seq.serialize_element(self.snap.interner.lookup(o))?;
+        }
+        seq.end()
+    }
+}
+
+struct ReadRelationRef<'a> { snap: &'a ReadSnapshot, r: &'a StoredRelation }
+impl Serialize for ReadRelationRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("Relation", 3)?;
+        st.serialize_field("from", self.snap.interner.lookup(self.r.from))?;
+        st.serialize_field("to", self.snap.interner.lookup(self.r.to))?;
+        st.serialize_field("relationType", self.snap.interner.lookup(self.r.relation_type))?;
+        st.end()
+    }
+}
+
 // --- ReadSnapshot helpers (mirrors KnowledgeGraph helpers) ---
 impl ReadSnapshot {
+
+    /// Serialize the full graph directly to a JSON string, avoiding intermediate
+    /// owned `Entity`/`Relation` allocations. This is the fast path for handlers.
+    pub fn read_graph_json(&self) -> String {
+        // Rough capacity: 40K entities × ~60 B + 120K relations × ~55 B = ~9 MB
+        let cap = self.entity_slots.len() * 64 + self.relations.len() * 60 + 128;
+        let mut buf = String::with_capacity(cap);
+
+        // entities array
+        buf.push_str(r#"{"entities":["#);
+        let mut first = true;
+        for slot in self.entity_slots.iter() {
+            let Some(e) = slot.as_ref().filter(|e| e.is_live()) else { continue };
+            if first { first = false } else { buf.push(',') }
+            buf.push('{');
+            // name
+            buf.push_str(r#""name":"#);
+            push_json_str(&mut buf, self.interner.lookup(e.name));
+            buf.push(',');
+            // entityType
+            buf.push_str(r#""entityType":"#);
+            push_json_str(&mut buf, self.interner.lookup(e.entity_type));
+            buf.push(',');
+            // observations
+            buf.push_str(r#""observations":["#);
+            for (oi, o) in e.observations.iter().enumerate() {
+                if oi > 0 { buf.push(',') }
+                push_json_str(&mut buf, self.interner.lookup(*o));
+            }
+            buf.push_str("]}");
+        }
+
+        // relations array
+        buf.push_str(r#"],"relations":["#);
+        first = true;
+        for r in self.relations.iter() {
+            if first { first = false } else { buf.push(',') }
+            buf.push('{');
+            buf.push_str(r#""from":"#);
+            push_json_str(&mut buf, self.interner.lookup(r.from));
+            buf.push(',');
+            buf.push_str(r#""to":"#);
+            push_json_str(&mut buf, self.interner.lookup(r.to));
+            buf.push(',');
+            buf.push_str(r#""relationType":"#);
+            push_json_str(&mut buf, self.interner.lookup(r.relation_type));
+            buf.push('}');
+        }
+        buf.push_str("]}");
+
+        buf
+    }
+
+    /// Borrowing view of the full graph, suitable for serde-serialization without
+    /// intermediate owned String allocations.
+    pub fn read_graph_view(&self) -> ReadGraphView<'_> {
+        let entities: Vec<&StoredEntity> = self
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .collect();
+        let relations: Vec<&StoredRelation> = self.relations.iter().collect();
+        ReadGraphView { snap: self, entities, relations }
+    }
+
     fn lookup_live_slot(&self, name: &str) -> Option<u32> {
         let name_id = self.interner.get_optional(name)?;
         let hash = self.interner.get_hash(name_id);
@@ -546,22 +704,6 @@ impl ReadSnapshot {
             .map(|r| self.relation_to_output(r))
             .collect();
         KnowledgeGraphOut { entities, relations }
-    }
-
-    /// Search entities by keyword.
-    pub fn search_entities(&self, query: &str) -> Result<Vec<Entity>> {
-        let token = query.to_lowercase();
-        let matching = self.search.search(&token, &self.interner);
-        Ok(matching
-            .iter()
-            .filter_map(|idx| {
-                self.entity_slots
-                    .get(*idx as usize)?
-                    .as_ref()
-                    .filter(|e| e.is_live())
-                    .map(|e| self.entity_to_output(e))
-            })
-            .collect())
     }
 
     /// Get a single entity by name.
@@ -996,6 +1138,22 @@ impl ReadSnapshot {
                 }
             }
         }
+    }
+
+    /// Search for entities whose name/type/observations contain `query`.
+    pub fn search_entities(&self, query: &str) -> Result<Vec<Entity>> {
+        let token = query.to_lowercase();
+        let matching = self.search.search(&token, &self.interner);
+        Ok(matching
+            .iter()
+            .filter_map(|idx| {
+                self.entity_slots
+                    .get(*idx as usize)?
+                    .as_ref()
+                    .filter(|e| e.is_live())
+                    .map(|e| self.entity_to_output(e))
+            })
+            .collect())
     }
 }
 
@@ -2535,7 +2693,18 @@ impl KnowledgeGraph {
 
     // --- Flush & sync ---
 
-    /// Flush and fsync the log to stable storage.
+    /// Flush the `BufWriter` to the kernel buffer (process-crash safe).
+    pub fn flush(&mut self) -> Result<()> {
+        self.store.flush().map_err(MCSError::IoError)
+    }
+
+    /// `fsync` the log to disk (OS-crash safe). Called by the background sync
+    /// thread in [`GraphHandle`]; most callers should use `flush()` instead.
+    pub fn sync(&mut self) -> Result<()> {
+        self.store.sync().map_err(MCSError::IoError)
+    }
+
+    /// Flush + fsync (legacy; prefer [`flush`](Self::flush) for production use).
     pub fn flush_and_sync(&mut self) -> Result<()> {
         self.store.flush_and_sync().map_err(MCSError::IoError)
     }
@@ -2553,24 +2722,53 @@ impl KnowledgeGraph {
 /// (lock-free via `ArcSwap`). Writers take a [`Mutex`] lock, mutate the
 /// underlying [`KnowledgeGraph`], and publish a fresh snapshot on unlock
 /// via the [`WriteGuard`] drop glue.
+///
+/// A background thread calls `fsync` on the WAL file every 1 second so that
+/// write handlers never block on disk I/O. The thread is stopped on `Drop`.
+///
+/// The sync thread uses its own `Arc<File>` handle (cloned from the WAL file)
+/// so that `fsync` never contends with the graph mutex. A [`Condvar`] notifies
+/// the thread immediately after every write, ensuring low-latency sync without
+/// polling.
 pub struct GraphHandle {
-    inner: Arc<Mutex<KnowledgeGraph>>,
+    inner: Arc<parking_lot::Mutex<KnowledgeGraph>>,
     snapshot: ArcSwap<ReadSnapshot>,
+    /// Cached JSON of the full `read_graph` output. Invalidated on every write.
+    read_cache: ArcSwap<Option<Arc<str>>>,
+    /// Notifies the background sync thread when a write has flushed data to the
+    /// kernel buffer. The thread also wakes on a 1-second timeout as a fallback.
+    /// The `bool` is `true` when there is pending data to sync.
+    sync_notify: Arc<(StdMutex<bool>, Condvar)>,
+    /// Signal the background sync thread to stop. Set on `Drop`.
+    stop_sync: Arc<AtomicBool>,
 }
 
 /// RAII guard that publishes a fresh [`ReadSnapshot`] on drop.
 pub struct WriteGuard<'a> {
     guard: parking_lot::MutexGuard<'a, KnowledgeGraph>,
     snapshot: &'a ArcSwap<ReadSnapshot>,
+    read_cache: &'a ArcSwap<Option<Arc<str>>>,
+    sync_notify: &'a (StdMutex<bool>, Condvar),
     did_publish: bool,
 }
 
 impl WriteGuard<'_> {
     /// Publish a snapshot now (eager, before drop). Also called by Drop.
+    /// Invalidates the serialized read cache. Flushes the WAL to kernel buffer
+    /// (the background sync thread in [`GraphHandle`] handles the actual `fsync`).
     pub fn publish(&mut self) {
+        if let Err(e) = self.guard.flush() {
+            tracing::error!("WAL flush failed: {e}");
+        }
         let snap = Arc::new(self.guard.snapshot());
         self.snapshot.store(snap);
+        self.read_cache.store(Arc::new(None));
         self.did_publish = true;
+        // Wake the sync thread — data is in the kernel buffer waiting for fsync.
+        let (lock, cvar) = self.sync_notify;
+        let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = true;
+        cvar.notify_one();
     }
 
     /// Access the underlying `KnowledgeGraph` for mutation.
@@ -2600,15 +2798,96 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
+impl Drop for GraphHandle {
+    fn drop(&mut self) {
+        self.stop_sync.store(true, Ordering::Relaxed);
+        // Wake the sync thread by setting pending=true so the
+        // wait_timeout_while(|p| !*p) condition breaks immediately.
+        let (lock, cvar) = &*self.sync_notify;
+        let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *pending = true;
+        cvar.notify_one();
+    }
+}
+
 impl GraphHandle {
     /// Open or create the graph at `path`, seeding the initial snapshot.
+    /// Spawns a background thread that `fsync`s the WAL so that write handlers
+    /// never block on disk I/O.
     pub fn new(path: &Path) -> std::io::Result<Self> {
         let kg = KnowledgeGraph::new(path)?;
         let snapshot = Arc::new(kg.snapshot());
+        // Clone the sync file handle before moving `kg` into the Mutex.
+        let sync_file = Arc::clone(&kg.store.sync_file);
+        let inner = Arc::new(parking_lot::Mutex::new(kg));
+
+        let sync_notify: Arc<(StdMutex<bool>, Condvar)> =
+            Arc::new((StdMutex::new(false), Condvar::new()));
+        let notify = Arc::clone(&sync_notify);
+        let stop_sync = Arc::new(AtomicBool::new(false));
+
+        // Background sync thread — calls fsync on a dedicated `Arc<File>`
+        // handle, never touching the graph mutex. Woken by Condvar after every
+        // write; falls back to a 1-second timeout.
+        let sync_stop = Arc::clone(&stop_sync);
+        std::thread::Builder::new()
+            .name("mcp-memory-sync".into())
+            .spawn(move || {
+                let (lock, cvar) = &*notify;
+                loop {
+                    // Wait while there is nothing to sync. Woken by publish()
+                    // or by the 1-second timeout.
+                    let mut guard = cvar
+                        .wait_timeout_while(
+                            lock.lock().unwrap_or_else(|e| e.into_inner()),
+                            std::time::Duration::from_secs(1),
+                            |p| !*p,
+                        )
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+
+                    let should_sync = *guard;
+                    *guard = false;
+                    // Release the StdMutex before fsync so publish() is not
+                    // blocked on setting the next pending flag.
+                    drop(guard);
+
+                    if should_sync {
+                        if let Err(e) = sync_file.sync_data() {
+                            tracing::error!("WAL fsync failed: {e}");
+                        }
+                    }
+
+                    if sync_stop.load(Ordering::Relaxed) {
+                        // One final fsync before exiting.
+                        if let Err(e) = sync_file.sync_data() {
+                            tracing::error!("WAL final fsync failed: {e}");
+                        }
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
         Ok(Self {
-            inner: Arc::new(Mutex::new(kg)),
+            inner,
             snapshot: ArcSwap::new(snapshot),
+            read_cache: ArcSwap::new(Arc::new(None)),
+            sync_notify,
+            stop_sync,
         })
+    }
+
+    /// Return the cached full-graph JSON, or build and cache it on first call.
+    /// Invalidated by any write (see [`WriteGuard::publish`]).
+    pub fn read_graph_cached(&self) -> Arc<str> {
+        if let Some(cached) = self.read_cache.load().as_ref() {
+            return cached.clone();
+        }
+        let graph = self.read();
+        let json: Arc<str> = Arc::from(graph.read_graph_json().into_boxed_str());
+        self.read_cache.store(Arc::new(Some(json.clone())));
+        json
     }
 
     /// Lock-free read snapshot. Holds an `Arc` reference to the frozen graph data.
@@ -2622,6 +2901,8 @@ impl GraphHandle {
         WriteGuard {
             guard: self.inner.lock(),
             snapshot: &self.snapshot,
+            read_cache: &self.read_cache,
+            sync_notify: &self.sync_notify,
             did_publish: false,
         }
     }

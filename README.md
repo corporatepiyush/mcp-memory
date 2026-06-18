@@ -7,22 +7,25 @@ observations stored in a compact custom binary log with write-ahead durability.
 Speaks MCP over stdio, TCP, and HTTP transports.
 
 ```
-                 ┌──────────────────────────────────────┐
-                 │           mcp-memory server           │
-                 │                                      │
-  ┌───────┐      │  ┌──────────┐    ┌────────────────┐  │
-  │Claude │──────│─>│  stdio / │───>│ KnowledgeGraph  │  │
-  │Desktop│      │  │  TCP /   │    │  • entities     │  │
-  └───────┘      │  │  HTTP    │    │  • relations    │  │
-                 │  └──────────┘    │  • observations │  │
-                 │         │        └───────┬────────┘  │
-                 │         │                │           │
-                 │         v                v           │
-                 │  ┌──────────────────────────────┐    │
-                 │  │  Binary write-ahead log      │    │
-                 │  │  (append-only, fsynced)      │    │
-                 │  └──────────────────────────────┘    │
-                 └──────────────────────────────────────┘
+                  ┌──────────────────────────────────────────┐
+                  │           mcp-memory server              │
+                  │                                          │
+   ┌───────┐      │  ┌──────────┐    ┌────────────────────┐  │
+   │Claude │──────│─>│  stdio /  │───>│ GraphHandle        │  │
+   │Desktop│      │  │  TCP /   │    │  ├ read → snapshot  │  │
+   └───────┘      │  │  HTTP    │    │  └ write → mutex    │  │
+                  │  └──────────┘    └────────┬───────────┘  │
+                  │         │                  │              │
+                  │         v                  v              │
+                  │  ┌──────────────────────────────┐        │
+                  │  │  Binary write-ahead log      │        │
+                  │  │  (append-only, async fsync)  │        │
+                  │  │  ┌─────────────────────────┐ │        │
+                  │  │  │ Background sync thread  │ │        │
+                  │  │  │ fsync every 1 second    │ │        │
+                  │  │  └─────────────────────────┘ │        │
+                  │  └──────────────────────────────┘        │
+                  └──────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -111,42 +114,49 @@ Results are from a MacBook Pro (Apple M4 Pro, 24 GB). Run `cargo bench` on your 
 
 | Operation | Latency | Ops/sec | vs JS |
 |-----------|---------|---------|-------|
-| `get_entity` (Swiss-table lookup) | 200 ns | 5,000,000 | **~250,000×** |
-| `batch_get_entities` (10 names) | 2.1 µs | 476,000 | — |
-| `graph_stats` (linear scan) | 37 µs | 27,000 | — |
+| `get_entity` (Swiss-table lookup) | 153 ns | 6,500,000 | **~325,000×** |
+| `batch_get_entities` (10 names) | 1.6 µs | 610,000 | — |
+| `graph_stats` (linear scan) | 38 µs | 26,000 | — |
 | `describe_entity` (entity + incident relations) | 60 µs | 16,700 | — |
-| `entity_type_counts` (linear scan + hash tally) | 89 µs | 11,200 | — |
-| `search_relations` (from/to filter, linear scan) | 40 µs | 25,000 | — |
-| `relation_type_counts` (linear scan + hash tally) | 257 µs | 3,900 | — |
-| `neighbors` depth=1 | 392 µs | 2,600 | — |
+| `entity_type_counts` (linear scan + hash tally) | 91 µs | 11,000 | — |
+| `search_relations` (from/to filter, linear scan) | 39 µs | 25,600 | — |
+| `relation_type_counts` (linear scan + hash tally) | 262 µs | 3,800 | — |
+| `neighbors` depth=1 | 391 µs | 2,600 | — |
 | `read_graph_filtered` (type + pagination) | 479 µs | 2,100 | — |
-| `open_nodes` (10 names + incident relations) | 676 µs | 1,500 | — |
-| `search_nodes_filtered` (prefix index + filter) | 1.25 ms | 800 | — |
+| `open_nodes` (10 names + incident relations) | 677 µs | 1,500 | — |
+| `read_graph_json_direct` (hand-rolled JSON) | 613 µs | 1,630 | — |
+| `search_nodes_filtered` (prefix index + filter) | 1.23 ms | 810 | — |
 | `find_all_paths` (DFS, maxDepth=4, maxPaths=10) | 1.68 ms | 595 | — |
 | `find_path` (BFS shortest path) | 2.5 ms | 400 | — |
 | `extract_subgraph` depth=1 (3 seeds) | 2.7 ms | 375 | — |
 | `extract_subgraph` depth=2 (3 seeds) | 2.8 ms | 350 | — |
-| `neighbors` depth=2 | 4.8 ms | 208 | — |
-| `read_graph` (full dump) | 10.6 ms | 94 | **~5×** |
+| `neighbors` depth=2 | 4.7 ms | 210 | — |
+| `dispatch_read_graph` (10K ents, warm cache) | 1.46 ms | 685 | **~7×** |
+| `dispatch_search_nodes` (10K ents, broad query) | 2.87 ms | 349 | **~4×** |
+| `read_graph` (full dump via serde) | 10.6 ms | 94 | **~5×** |
 | `search_nodes` (prefix index, broad query) | 12.2 ms | 82 | **~4×** |
-| `export_json` | 20.3 ms | 49 | — |
-| `export_dot` | 20.0 ms | 50 | — |
-| `export_mermaid` | 22.3 ms | 45 | — |
+| `export_json` | 21.3 ms | 47 | — |
+| `export_dot` | 18.6 ms | 54 | — |
+| `export_mermaid` | 23.1 ms | 43 | — |
 
-### Write operations (100 entities, 300 relations)
+`dispatch_*` benchmarks measure the **full server pipeline** (JSON-RPC parsing, handler dispatch, response serialization). `read_graph_json_direct` is the hand-rolled serialization used by the dispatch path, 2.1× faster than `serde_json`.
+
+### Write operations (100 entities, 300 relations) — async fsync
 
 | Operation | Latency | Ops/sec | vs JS |
 |-----------|---------|---------|-------|
-| `add_observations` (10 new, single entity) | 24 µs | 41,000 | — |
-| `merge_entities` (source→target full merge) | 49 µs | 20,400 | — |
-| `create_relations` (100 new) | 65 µs | 15,400 | — |
-| `delete_observations` (per entity) | 17 µs | 58,000 | — |
-| `delete_relations` (100 tuples) | 161 µs | 6,200 | — |
-| `delete_entities` (100 names + cascade) | 177 µs | 5,600 | — |
-| `create_entities` (100 new) | 227 µs | 4,400 | — |
-| `upsert_existing` (100 merges) | 570 µs | 1,800 | — |
-| `upsert_new` (100 creates) | 740 µs | 1,400 | — |
-| `compact` (after 50 deletes) | 12.7 ms | 79 | — |
+| `add_observations` (10 new, single entity) | 15 µs | 67,000 | — |
+| `merge_entities` (source→target full merge) | 25 µs | 40,000 | — |
+| `delete_observations` (per entity) | 11 µs | 90,000 | — |
+| `delete_relations` (100 tuples) | 70 µs | 14,000 | — |
+| `delete_entities` (100 names + cascade) | 130 µs | 7,700 | — |
+| `create_relations` (100 new) | 135 µs | 7,400 | — |
+| `create_entities` (100 new) | 450 µs | 2,200 | — |
+| `upsert_existing` (100 merges) | 360 µs | 2,800 | — |
+| `upsert_new` (100 creates) | 480 µs | 2,100 | — |
+| `compact` (after 50 deletes) | 12.5 ms | 80 | — |
+
+Writes flush to the kernel buffer immediately (~µs) and defer `fsync` to a background thread that syncs once per second. This eliminates write latency spikes from disk I/O.
 
 ### Why is Rust faster than the JS reference?
 
@@ -663,23 +673,33 @@ for graph access since the reads are synchronous.
 
 ### Locking
 
-The `KnowledgeGraph` is guarded by `parking_lot::RwLock`:
+**Reads are lock-free** via `ArcSwap<ReadSnapshot>` — snapshots are wait-free frozen copies of the graph state.
 
-- Concurrent readers never block each other (proven by test).
-- Writers wait for all readers to drain, then proceed exclusively.
-- No poisoning — lock acquisition returns the guard directly, not a `Result`.
+**Writes are serialised** by a `parking_lot::Mutex<KnowledgeGraph>`. Writers:
+
+1. Lock the mutex
+2. Mutate in-memory structures
+3. Write records to the binary WAL (appended to a `BufWriter`)
+4. Flush the `BufWriter` to the kernel buffer (process-crash safe, ~µs)
+5. Store a fresh `Arc<ReadSnapshot>` for readers (lock-free via `ArcSwap`)
+6. Unlock the mutex
+
+**`fsync` is deferred** to a background thread that syncs the WAL file every 1 second (OS-crash safe). This keeps write latency under 100 µs in the common case — the handler never blocks on disk I/O. On shutdown, one final `fsync` is issued.
 
 ### Write-ahead log (WAL)
 
-Every mutation goes through this sequence **before** touching in-memory state:
+Every mutation goes through this sequence:
 
 1. Encode the mutation as a binary record
 2. Append to `BufWriter<File>`
 3. Update in-memory structures
-4. On flush: `BufWriter::flush` + `File::sync_all`
+4. Flush to kernel buffer (process-crash safe, ~µs)
+5. Publish a fresh `ReadSnapshot` for concurrent readers
 
-This means a crash between steps 2 and 3 results in the record being replayed
-on next startup — the mutation is applied during replay.
+The in-memory data is always consistent with the WAL — a process crash recovers
+the last flushed state on replay. A background thread calls `fsync` every
+1 second to make the state OS-crash safe. This design trades up to 1 second of
+data loss on OS crash for sub-100 µs write latency.
 
 The file begins with an 8-byte magic header (`MCPMEMV1`). Each record that
 follows is:

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted via custom binary log"

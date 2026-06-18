@@ -13,6 +13,14 @@ use crate::kg::GraphHandle;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::tools;
 
+/// Outcome of processing a request: either a pre-escaped JSON Value (small
+/// payloads) or a pre-serialized JSON *string* of the `result` field (avoids
+/// a second serialization pass for large payloads such as `read_graph`).
+enum HandlerResult {
+    Value(Value),
+    RawResult(String),
+}
+
 const BUFFER_CAPACITY: usize = 65536;
 const NEWLINE: &[u8] = b"\n";
 /// Maximum size of a single inbound JSON-RPC message (shared by all transports).
@@ -81,10 +89,15 @@ pub fn process_value(value: Value, kg: &GraphHandle) -> Option<Value> {
     };
     req.id.as_ref()?;
     let response = match process_request(&req, kg) {
-        Ok(result) => JsonRpcResponse::success(req.id, result),
-        Err(e) => JsonRpcResponse::error(req.id, e.error_code(), e.to_string()),
+        Ok(HandlerResult::Value(result)) => Some(to_value(JsonRpcResponse::success(req.id, result))),
+        Ok(HandlerResult::RawResult(_)) => {
+            // RawResult cannot pass through Value — dispatch_line and
+            // dispatch_http_body handle it via separate code paths.
+            unreachable!("RawResult must be handled at the dispatch level, not via process_value");
+        }
+        Err(e) => Some(to_value(JsonRpcResponse::error(req.id, e.error_code(), e.to_string()))),
     };
-    Some(to_value(response))
+    response
 }
 
 /// Dispatch one framed line (stdio / tcp). Returns the serialized response, or
@@ -94,11 +107,35 @@ pub fn dispatch_line(line: &str, kg: &GraphHandle) -> Option<String> {
     if trimmed.is_empty() {
         return Some(serde_json::to_string(&parse_error("Empty request".into())).unwrap());
     }
-    let value: Value = match serde_json::from_str(trimmed) {
+    let raw: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(e) => return Some(serde_json::to_string(&parse_error(e.to_string())).unwrap()),
     };
-    process_value(value, kg).map(|v| serde_json::to_string(&v).unwrap())
+    let req: JsonRpcRequest = match serde_json::from_value(raw) {
+        Ok(r) => r,
+        Err(e) => return Some(serde_json::to_string(&parse_error(e.to_string())).unwrap()),
+    };
+    req.id.as_ref()?;
+    match process_request(&req, kg) {
+        Ok(HandlerResult::Value(result)) => {
+            let resp = JsonRpcResponse::success(req.id, result);
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        Ok(HandlerResult::RawResult(result_json)) => {
+            let id_json = serde_json::to_string(&req.id).unwrap();
+            let mut out = String::with_capacity(64 + id_json.len() + result_json.len());
+            out.push_str(r#"{"jsonrpc":"2.0","id":"#);
+            out.push_str(&id_json);
+            out.push_str(r#","result":"#);
+            out.push_str(&result_json);
+            out.push('}');
+            Some(out)
+        }
+        Err(e) => {
+            let resp = JsonRpcResponse::error(req.id, e.error_code(), e.to_string());
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+    }
 }
 
 /// Dispatch a Streamable-HTTP POST body, which may be a single JSON-RPC message
@@ -111,11 +148,38 @@ pub fn dispatch_http_body(
     let value: Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
     match value {
         Value::Array(items) => {
+            // Batches are rare and never huge — keep Value path for simplicity.
             let responses: Vec<Value> =
-                items.into_iter().filter_map(|v| process_value(v, kg)).collect();
+                items.into_iter().filter_map(|v| process_value_http(v, kg)).collect();
             Ok((!responses.is_empty()).then_some(Value::Array(responses)))
         }
-        other => Ok(process_value(other, kg)),
+        other => Ok(process_value_http(other, kg)),
+    }
+}
+
+/// HTTP variant of process_value that handles RawResult by converting to Value
+/// (acceptable since HTTP payloads are typically much smaller in this context).
+fn process_value_http(value: Value, kg: &GraphHandle) -> Option<Value> {
+    let req: JsonRpcRequest = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => return Some(to_value(parse_error(e.to_string()))),
+    };
+    req.id.as_ref()?;
+    match process_request(&req, kg) {
+        Ok(HandlerResult::Value(result)) => {
+            Some(to_value(JsonRpcResponse::success(req.id, result)))
+        }
+        Ok(HandlerResult::RawResult(result_json)) => {
+            // Parse the pre-serialized result back into a Value for HTTP delivery.
+            // This is a small extra cost for the HTTP transport; the stdio/TCP
+            // path (dispatch_line) avoids it entirely.
+            let result_val: Value = serde_json::from_str(&result_json)
+                .unwrap_or(Value::Null);
+            Some(to_value(JsonRpcResponse::success(req.id, result_val)))
+        }
+        Err(e) => {
+            Some(to_value(JsonRpcResponse::error(req.id, e.error_code(), e.to_string())))
+        }
     }
 }
 
@@ -220,28 +284,22 @@ where
     Ok(())
 }
 
-fn process_request(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<Value> {
+fn process_request(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResult> {
     match req.method.as_str() {
-        "initialize" => handle_initialize(),
-        "tools/list" => handle_tools_list(),
+        "initialize" => Ok(HandlerResult::Value(handle_initialize())),
+        "tools/list" => Ok(HandlerResult::Value(handle_tools_list())),
         "tools/call" => handle_tools_call(req, kg),
-        "ping" => handle_ping(),
-        method if method.starts_with("notifications/") => handle_notification(method),
+        "ping" => Ok(HandlerResult::Value(Value::Null)),
+        method if method.starts_with("notifications/") => {
+            tracing::trace!("Received notification: {method}");
+            Ok(HandlerResult::Value(Value::Null))
+        }
         _ => Err(MCSError::MethodNotFound(req.method.clone())),
     }
 }
 
-const fn handle_ping() -> Result<Value> {
-    Ok(Value::Null)
-}
-
-fn handle_notification(method: &str) -> Result<Value> {
-    tracing::trace!("Received notification: {method}");
-    Ok(Value::Null)
-}
-
-fn handle_initialize() -> Result<Value> {
-    Ok(json!({
+fn handle_initialize() -> Value {
+    json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
             "tools": { "listChanged": false }
@@ -250,23 +308,23 @@ fn handle_initialize() -> Result<Value> {
             "name": "mcp-memory",
             "version": env!("CARGO_PKG_VERSION")
         }
-    }))
+    })
 }
 
-fn handle_tools_list() -> Result<Value> {
+fn handle_tools_list() -> Value {
     static CACHED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
     if let Some(cached) = CACHED.get() {
-        return Ok(cached.clone());
+        return cached.clone();
     }
     let tools_json = include_str!("../tools.json");
     let tools: Vec<Value> =
-        serde_json::from_str(tools_json).map_err(MCSError::JsonError)?;
+        serde_json::from_str(tools_json).map_err(MCSError::JsonError).unwrap();
     let result = json!({ "tools": tools });
     let _ = CACHED.set(result.clone());
-    Ok(result)
+    result
 }
 
-fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<Value> {
+fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResult> {
     let tool_name = req
         .params
         .as_ref()
@@ -280,30 +338,32 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<Value> {
     }
 
     match tool_name {
-        "create_entities" => memory::handle_create_entities(kg, tool_args),
-        "create_relations" => memory::handle_create_relations(kg, tool_args),
-        "add_observations" => memory::handle_add_observations(kg, tool_args),
-        "delete_entities" => memory::handle_delete_entities(kg, tool_args),
-        "delete_observations" => memory::handle_delete_observations(kg, tool_args),
-        "delete_relations" => memory::handle_delete_relations(kg, tool_args),
-        "read_graph" => memory::handle_read_graph(kg, tool_args),
-        "search_nodes" => memory::handle_search_nodes(kg, tool_args),
-        "open_nodes" => memory::handle_open_nodes(kg, tool_args),
-        "get_entity" => memory::handle_get_entity(kg, tool_args),
-        "graph_stats" => memory::handle_graph_stats(kg),
-        "search_relations" => memory::handle_search_relations(kg, tool_args),
-        "find_path" => memory::handle_find_path(kg, tool_args),
-        "compact" => memory::handle_compact(kg),
-        "get_neighbors" => memory::handle_get_neighbors(kg, tool_args),
-        "describe_entity" => memory::handle_describe_entity(kg, tool_args),
-        "list_entity_types" => memory::handle_list_entity_types(kg),
-        "list_relation_types" => memory::handle_list_relation_types(kg),
-        "upsert_entities" => memory::handle_upsert_entities(kg, tool_args),
-        "export_graph" => memory::handle_export_graph(kg, tool_args),
-        "merge_entities" => memory::handle_merge_entities(kg, tool_args),
-        "extract_subgraph" => memory::handle_extract_subgraph(kg, tool_args),
-        "batch_get_entities" => memory::handle_batch_get_entities(kg, tool_args),
-        "find_all_paths" => memory::handle_find_all_paths(kg, tool_args),
+        // Raw-result handlers (large payloads, avoid second serialization pass).
+        "read_graph" => Ok(HandlerResult::RawResult(memory::handle_read_graph(kg, tool_args)?)),
+        "search_nodes" => Ok(HandlerResult::RawResult(memory::handle_search_nodes(kg, tool_args)?)),
+        // Standard Value handlers.
+        "create_entities" => Ok(HandlerResult::Value(memory::handle_create_entities(kg, tool_args)?)),
+        "create_relations" => Ok(HandlerResult::Value(memory::handle_create_relations(kg, tool_args)?)),
+        "add_observations" => Ok(HandlerResult::Value(memory::handle_add_observations(kg, tool_args)?)),
+        "delete_entities" => Ok(HandlerResult::Value(memory::handle_delete_entities(kg, tool_args)?)),
+        "delete_observations" => Ok(HandlerResult::Value(memory::handle_delete_observations(kg, tool_args)?)),
+        "delete_relations" => Ok(HandlerResult::Value(memory::handle_delete_relations(kg, tool_args)?)),
+        "open_nodes" => Ok(HandlerResult::Value(memory::handle_open_nodes(kg, tool_args)?)),
+        "get_entity" => Ok(HandlerResult::Value(memory::handle_get_entity(kg, tool_args)?)),
+        "graph_stats" => Ok(HandlerResult::Value(memory::handle_graph_stats(kg)?)),
+        "search_relations" => Ok(HandlerResult::Value(memory::handle_search_relations(kg, tool_args)?)),
+        "find_path" => Ok(HandlerResult::Value(memory::handle_find_path(kg, tool_args)?)),
+        "compact" => Ok(HandlerResult::Value(memory::handle_compact(kg)?)),
+        "get_neighbors" => Ok(HandlerResult::Value(memory::handle_get_neighbors(kg, tool_args)?)),
+        "describe_entity" => Ok(HandlerResult::Value(memory::handle_describe_entity(kg, tool_args)?)),
+        "list_entity_types" => Ok(HandlerResult::Value(memory::handle_list_entity_types(kg)?)),
+        "list_relation_types" => Ok(HandlerResult::Value(memory::handle_list_relation_types(kg)?)),
+        "upsert_entities" => Ok(HandlerResult::Value(memory::handle_upsert_entities(kg, tool_args)?)),
+        "export_graph" => Ok(HandlerResult::Value(memory::handle_export_graph(kg, tool_args)?)),
+        "merge_entities" => Ok(HandlerResult::Value(memory::handle_merge_entities(kg, tool_args)?)),
+        "extract_subgraph" => Ok(HandlerResult::Value(memory::handle_extract_subgraph(kg, tool_args)?)),
+        "batch_get_entities" => Ok(HandlerResult::Value(memory::handle_batch_get_entities(kg, tool_args)?)),
+        "find_all_paths" => Ok(HandlerResult::Value(memory::handle_find_all_paths(kg, tool_args)?)),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
     }
 }
@@ -416,7 +476,10 @@ mod tests {
             params: None,
             id: Some(Value::Number(1.into())),
         };
-        let result = process_request(&req, &kg).unwrap();
+        let result = match process_request(&req, &kg).unwrap() {
+            HandlerResult::Value(v) => v,
+            HandlerResult::RawResult(_) => panic!("expected Value"),
+        };
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "mcp-memory");
         cleanup(&path);
