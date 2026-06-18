@@ -5,6 +5,6 @@
 *~
 *.bin
 
-# Local performance/optimization design notes (not for the published crate)
-PERF_OPTIMIZATION_PLAN.md
-OPTIMIZATION_PLAN.md
+# Local design notes, plans, and reviews (not for the published crate)
+*plan*
+*review*
