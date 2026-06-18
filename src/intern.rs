@@ -46,6 +46,7 @@ const fn h1(hash: u64, mask: usize) -> usize {
     ((hash >> 7) as usize) & mask
 }
 
+#[derive(Clone)]
 pub struct StringInterner {
     arena: String,
     offsets: Vec<u32>,

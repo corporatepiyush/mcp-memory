@@ -101,7 +101,68 @@ TF saturation, length normalization, or IDF weighting.
 | Concurrency | `parking_lot::RwLock` (no poisoning, fair queuing) | ~30% faster uncontended; readers never block readers |
 | Persistence | Append-only binary WAL + compact (atomic rename) | `compact` rewrites state as minimal create-records |
 
-## Tools
+## Benchmarks
+
+All microbenchmarks measure a single-threaded `KnowledgeGraph` with **40,000 entities** and **120,000 relations** (≈10 MB as JSONL). Write-tool benchmarks use a fresh 100-entity, 300-relation graph so the setup cost does not dominate the measurement.
+
+Results are from a MacBook Pro (Apple M4 Pro, 24 GB). Run `cargo bench` on your target hardware.
+
+### Read operations (40K entities, 120K relations)
+
+| Operation | Latency | Ops/sec | vs JS |
+|-----------|---------|---------|-------|
+| `get_entity` (Swiss-table lookup) | 200 ns | 5,000,000 | **~250,000×** |
+| `batch_get_entities` (10 names) | 2.1 µs | 476,000 | — |
+| `graph_stats` (linear scan) | 37 µs | 27,000 | — |
+| `describe_entity` (entity + incident relations) | 60 µs | 16,700 | — |
+| `entity_type_counts` (linear scan + hash tally) | 89 µs | 11,200 | — |
+| `search_relations` (from/to filter, linear scan) | 40 µs | 25,000 | — |
+| `relation_type_counts` (linear scan + hash tally) | 257 µs | 3,900 | — |
+| `neighbors` depth=1 | 392 µs | 2,600 | — |
+| `read_graph_filtered` (type + pagination) | 479 µs | 2,100 | — |
+| `open_nodes` (10 names + incident relations) | 676 µs | 1,500 | — |
+| `search_nodes_filtered` (prefix index + filter) | 1.25 ms | 800 | — |
+| `find_all_paths` (DFS, maxDepth=4, maxPaths=10) | 1.68 ms | 595 | — |
+| `find_path` (BFS shortest path) | 2.5 ms | 400 | — |
+| `extract_subgraph` depth=1 (3 seeds) | 2.7 ms | 375 | — |
+| `extract_subgraph` depth=2 (3 seeds) | 2.8 ms | 350 | — |
+| `neighbors` depth=2 | 4.8 ms | 208 | — |
+| `read_graph` (full dump) | 10.6 ms | 94 | **~5×** |
+| `search_nodes` (prefix index, broad query) | 12.2 ms | 82 | **~4×** |
+| `export_json` | 20.3 ms | 49 | — |
+| `export_dot` | 20.0 ms | 50 | — |
+| `export_mermaid` | 22.3 ms | 45 | — |
+
+### Write operations (100 entities, 300 relations)
+
+| Operation | Latency | Ops/sec | vs JS |
+|-----------|---------|---------|-------|
+| `add_observations` (10 new, single entity) | 24 µs | 41,000 | — |
+| `merge_entities` (source→target full merge) | 49 µs | 20,400 | — |
+| `create_relations` (100 new) | 65 µs | 15,400 | — |
+| `delete_observations` (per entity) | 17 µs | 58,000 | — |
+| `delete_relations` (100 tuples) | 161 µs | 6,200 | — |
+| `delete_entities` (100 names + cascade) | 177 µs | 5,600 | — |
+| `create_entities` (100 new) | 227 µs | 4,400 | — |
+| `upsert_existing` (100 merges) | 570 µs | 1,800 | — |
+| `upsert_new` (100 creates) | 740 µs | 1,400 | — |
+| `compact` (after 50 deletes) | 12.7 ms | 79 | — |
+
+### Why is Rust faster than the JS reference?
+
+The [official JS server-memory](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) stores the graph as a **JSONL file** and **loads/saves the entire file on every operation**:
+
+| Factor | `mcp-memory` (Rust) | `@modelcontextprotocol/server-memory` (JS) |
+|--------|---------------------|--------------------------------------------|
+| Data model | In-memory Swiss-table + flat vecs | JSONL file, full read/write per op |
+| Entity lookup | O(1) hash table (~200 ns) | O(N) `Array.find` over full file |
+| Search | Inverted token index, prefix match | O(N) `Array.filter` + `String.includes` |
+| Writes | Append-only binary WAL (~µs) | Full JSONL rewrite (~10 MB, ~ms) |
+| Concurrency | `parking_lot::RwLock` (parallel reads) | Single-threaded, no parallelism |
+| String interning | Arena-backed dedup (no alloc per str) | Full strings heap-allocated per lookup |
+| Persistence | Custom binary format, 12 B/relation | JSONL, ~60 B/relation + whitespace |
+
+For a graph of 40K/120K, every JS mutation reads ~10 MB from disk, parses 160K JSON lines, modifies an array, serialises back, and writes the file — **each operation takes 50–180 ms**. The Rust server keeps everything in cache-friendly flat arrays with an append-only WAL; read operations touch zero disk and writes log a few dozen bytes.
 
 ### Write tools
 

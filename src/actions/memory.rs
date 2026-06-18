@@ -1,9 +1,7 @@
-use parking_lot::RwLock;
-
 use serde_json::{Value, json};
 
 use crate::errors::{MCSError, Result};
-use crate::kg::KnowledgeGraph;
+use crate::kg::{GraphHandle, ReadSnapshot};
 
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_OBSERVATION_BYTES: usize = 65536;
@@ -44,33 +42,48 @@ macro_rules! text_content {
     };
 }
 
-fn lock_graph_read(kg: &RwLock<KnowledgeGraph>) -> parking_lot::RwLockReadGuard<'_, KnowledgeGraph> {
+fn lock_graph_read(kg: &GraphHandle) -> ReadSnapshot {
     kg.read()
 }
 
-fn lock_graph_write(kg: &RwLock<KnowledgeGraph>) -> parking_lot::RwLockWriteGuard<'_, KnowledgeGraph> {
+fn lock_graph_write(kg: &GraphHandle) -> crate::kg::WriteGuard<'_> {
     kg.write()
 }
 
-pub fn handle_read_graph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let graph = lock_graph_read(kg);
-    // Fast path: no filters/pagination → the full graph (legacy behavior).
     let params = args.unwrap_or(&Value::Null);
     let entity_type = params.get("entityType").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-    let has_paging = params.get("limit").is_some() || params.get("offset").is_some();
-    // Serialize a borrowing view directly (M6) — no owned intermediate graph.
-    let view = if entity_type.is_none() && !has_paging {
-        graph.read_graph_view()
+    let offset = opt_usize(params, "offset", 0)?;
+    let limit = opt_usize(params, "limit", usize::MAX)?;
+
+    let out = if entity_type.is_none() && offset == 0 && limit == usize::MAX {
+        graph.read_graph()
     } else {
-        let offset = opt_usize(params, "offset", 0)?;
-        let limit = opt_usize(params, "limit", usize::MAX)?;
-        graph.read_graph_filtered_view(entity_type, offset, limit)
+        let mut entities: Vec<crate::types::Entity> = graph
+            .entity_slots
+            .iter()
+            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .filter(|e| entity_type.is_none_or(|t| graph.interner.lookup(e.entity_type) == t))
+            .skip(offset)
+            .take(limit)
+            .map(|e| graph.entity_to_output(e))
+            .collect();
+        entities.sort_by(|a, b| a.name.cmp(&b.name));
+        let matched: std::collections::HashSet<_> = entities.iter().map(|e| graph.interner.get_optional(&e.name)).flatten().collect();
+        let relations: Vec<crate::types::Relation> = graph
+            .relations
+            .iter()
+            .filter(|r| matched.contains(&r.from) && matched.contains(&r.to))
+            .map(|r| graph.relation_to_output(r))
+            .collect();
+        crate::types::KnowledgeGraphOut { entities, relations }
     };
-    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
+    let text = serde_json::to_string(&out).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_create_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_create_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entities_val = params
         .get("entities")
@@ -107,7 +120,7 @@ pub fn handle_create_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>)
     Ok(text_content!(text))
 }
 
-pub fn handle_create_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_create_relations(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let relations_val = params
         .get("relations")
@@ -134,7 +147,7 @@ pub fn handle_create_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>
     Ok(text_content!(text))
 }
 
-pub fn handle_add_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_add_observations(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let observations_val = params
         .get("observations")
@@ -181,7 +194,7 @@ pub fn handle_add_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>
     Ok(text_content!(text))
 }
 
-pub fn handle_delete_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entity_names: Vec<String> = params
         .get("entityNames")
@@ -196,7 +209,7 @@ pub fn handle_delete_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>)
     Ok(text_content!("Entities deleted successfully"))
 }
 
-pub fn handle_delete_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_observations(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let deletions = params
         .get("deletions")
@@ -223,7 +236,7 @@ pub fn handle_delete_observations(kg: &RwLock<KnowledgeGraph>, args: Option<&Val
     Ok(text_content!("Observations deleted successfully"))
 }
 
-pub fn handle_delete_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_delete_relations(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let relations_val = params
         .get("relations")
@@ -239,7 +252,7 @@ pub fn handle_delete_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>
     Ok(text_content!("Relations deleted successfully"))
 }
 
-pub fn handle_search_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_search_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let query = params
         .get("query")
@@ -251,12 +264,18 @@ pub fn handle_search_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) ->
     let limit = opt_usize(params, "limit", usize::MAX)?;
 
     let graph = lock_graph_read(kg);
-    let view = graph.search_nodes_view(query, entity_type, offset, limit);
-    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
+    let matching = graph.search_entities(query)?;
+    let filtered: Vec<crate::types::Entity> = matching
+        .into_iter()
+        .filter(|e| entity_type.is_none_or(|t| e.entity_type == t))
+        .skip(offset)
+        .take(limit)
+        .collect();
+    let text = serde_json::to_string(&filtered).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_open_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_open_nodes(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let names: Vec<String> = params
         .get("names")
@@ -265,14 +284,12 @@ pub fn handle_open_nodes(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> R
         .ok_or_else(|| MCSError::InvalidParams("Missing or invalid 'names' parameter".into()))?;
 
     let graph = lock_graph_read(kg);
-    let view = graph.open_nodes_view(&names);
-    let text = serde_json::to_string(&view).map_err(MCSError::JsonError)?;
+    let out = graph.open_nodes(&names);
+    let text = serde_json::to_string(&out).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-// ---------- New extended tools ----------
-
-pub fn handle_get_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_get_entity(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
@@ -289,14 +306,14 @@ pub fn handle_get_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> R
     }
 }
 
-pub fn handle_graph_stats(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+pub fn handle_graph_stats(kg: &GraphHandle) -> Result<Value> {
     let graph = lock_graph_read(kg);
     let stats = graph.graph_stats();
     let text = serde_json::to_string(&stats).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
 }
 
-pub fn handle_search_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_search_relations(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.unwrap_or(&serde_json::Value::Null);
 
     let from = params.get("from").and_then(|v| v.as_str());
@@ -309,7 +326,7 @@ pub fn handle_search_relations(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>
     Ok(text_content!(text))
 }
 
-pub fn handle_find_path(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_find_path(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let from = params
         .get("from")
@@ -326,16 +343,13 @@ pub fn handle_find_path(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Re
     Ok(text_content!(text))
 }
 
-pub fn handle_compact(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+pub fn handle_compact(kg: &GraphHandle) -> Result<Value> {
     let mut graph = lock_graph_write(kg);
     graph.compact()?;
     graph.flush_and_sync()?;
     Ok(text_content!("Log compacted successfully"))
 }
 
-// ---------- Tier-1 productivity tools ----------
-
-/// Read an optional non-negative integer parameter, defaulting when absent.
 fn opt_usize(params: &Value, key: &str, default: usize) -> Result<usize> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(default),
@@ -346,7 +360,7 @@ fn opt_usize(params: &Value, key: &str, default: usize) -> Result<usize> {
     }
 }
 
-pub fn handle_get_neighbors(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_get_neighbors(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
@@ -369,7 +383,7 @@ pub fn handle_get_neighbors(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -
     Ok(text_content!(text))
 }
 
-pub fn handle_describe_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_describe_entity(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
@@ -383,7 +397,7 @@ pub fn handle_describe_entity(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>)
     Ok(text_content!(text))
 }
 
-pub fn handle_list_entity_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+pub fn handle_list_entity_types(kg: &GraphHandle) -> Result<Value> {
     let graph = lock_graph_read(kg);
     let counts = graph.entity_type_counts();
     let arr: Vec<Value> = counts
@@ -394,7 +408,7 @@ pub fn handle_list_entity_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
     Ok(text_content!(text))
 }
 
-pub fn handle_list_relation_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> {
+pub fn handle_list_relation_types(kg: &GraphHandle) -> Result<Value> {
     let graph = lock_graph_read(kg);
     let counts = graph.relation_type_counts();
     let arr: Vec<Value> = counts
@@ -405,7 +419,7 @@ pub fn handle_list_relation_types(kg: &RwLock<KnowledgeGraph>) -> Result<Value> 
     Ok(text_content!(text))
 }
 
-pub fn handle_upsert_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_upsert_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let entities_val = params
         .get("entities")
@@ -439,7 +453,7 @@ pub fn handle_upsert_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>)
     Ok(text_content!(text))
 }
 
-pub fn handle_merge_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_merge_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let source = params
         .get("source")
@@ -459,7 +473,7 @@ pub fn handle_merge_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) 
     Ok(text_content!(text))
 }
 
-pub fn handle_extract_subgraph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_extract_subgraph(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let names: Vec<String> = params
         .get("names")
@@ -479,7 +493,7 @@ pub fn handle_extract_subgraph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>
     Ok(text_content!(text))
 }
 
-pub fn handle_batch_get_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_batch_get_entities(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let names: Vec<String> = params
         .get("names")
@@ -500,7 +514,7 @@ pub fn handle_batch_get_entities(kg: &RwLock<KnowledgeGraph>, args: Option<&Valu
     Ok(text_content!(text))
 }
 
-pub fn handle_find_all_paths(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_find_all_paths(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let from = params
         .get("from")
@@ -519,7 +533,7 @@ pub fn handle_find_all_paths(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) 
     Ok(text_content!(text))
 }
 
-pub fn handle_export_graph(kg: &RwLock<KnowledgeGraph>, args: Option<&Value>) -> Result<Value> {
+pub fn handle_export_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
     let format = args
         .and_then(|p| p.get("format"))
         .and_then(|v| v.as_str())

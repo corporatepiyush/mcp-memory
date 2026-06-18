@@ -14,7 +14,6 @@
 //! differs (see [`crate::server::dispatch_http_body`]).
 
 use std::convert::Infallible;
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -29,10 +28,10 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use crate::errors::{MCSError, Result};
-use crate::kg::KnowledgeGraph;
+use crate::kg::GraphHandle;
 use crate::server;
 
-type AppState = Arc<RwLock<KnowledgeGraph>>;
+type AppState = Arc<GraphHandle>;
 
 /// Build the axum router for the HTTP transport. Exposed so tests can drive it
 /// with `tower::ServiceExt::oneshot` without binding a socket.

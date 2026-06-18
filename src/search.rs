@@ -7,6 +7,7 @@ use crate::intern::StrId;
 ///
 /// Uses a flat `Vec<(StrId, u32)>` sorted by (token, entity_idx)
 /// for cache-friendly lookups via binary search.
+#[derive(Clone)]
 pub struct SearchIndex {
     // Sorted by (token, entity_idx), no duplicates.
     entries: Vec<(StrId, u32)>,
