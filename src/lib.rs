@@ -49,4 +49,15 @@ pub struct Args {
     /// Log level
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
+
+    /// Bearer token required on the `tcp` (first line) and `http`
+    /// (`Authorization` header) transports. Overrides `--auth-token-file` and
+    /// the `MCP_MEMORY_AUTH_TOKEN` env var. stdio is never authenticated.
+    #[arg(long = "auth-token")]
+    pub auth_token: Option<String>,
+
+    /// Path to a file whose trimmed contents are the bearer token. An empty
+    /// file is rejected (fail closed). Ignored if `--auth-token` is set.
+    #[arg(long = "auth-token-file")]
+    pub auth_token_file: Option<String>,
 }

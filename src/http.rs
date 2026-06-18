@@ -22,7 +22,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use futures::Stream;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -31,23 +30,33 @@ use crate::errors::{MCSError, Result};
 use crate::kg::GraphHandle;
 use crate::server;
 
-type AppState = Arc<GraphHandle>;
+/// Shared state for the HTTP handlers: the graph plus an optional bearer token
+/// required on every request when present.
+#[derive(Clone)]
+pub struct HttpState {
+    kg: Arc<GraphHandle>,
+    auth_token: Option<Arc<str>>,
+}
 
 /// Build the axum router for the HTTP transport. Exposed so tests can drive it
 /// with `tower::ServiceExt::oneshot` without binding a socket.
-pub fn router(kg: AppState) -> Router {
+pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/mcp", post(post_handler).get(get_handler))
         .route("/", post(post_handler).get(get_handler))
         .layer(DefaultBodyLimit::max(server::MAX_REQUEST_BYTES))
-        .with_state(kg)
+        .with_state(state)
 }
 
 /// Bind `addr` and serve the HTTP transport until the process is killed.
-pub async fn run(addr: &str, kg: AppState) -> Result<()> {
+pub async fn run(addr: &str, kg: Arc<GraphHandle>, auth_token: Option<Arc<str>>) -> Result<()> {
     let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
-    info!("Listening for HTTP (Streamable) MCP on http://{addr}/mcp");
-    axum::serve(listener, router(kg)).await.map_err(MCSError::IoError)?;
+    info!(
+        "Listening for HTTP (Streamable) MCP on http://{addr}/mcp (auth {})",
+        if auth_token.is_some() { "on" } else { "off" }
+    );
+    let state = HttpState { kg, auth_token };
+    axum::serve(listener, router(state)).await.map_err(MCSError::IoError)?;
     Ok(())
 }
 
@@ -58,7 +67,23 @@ fn wants_sse(headers: &HeaderMap) -> bool {
         .is_some_and(|a| a.contains("text/event-stream"))
 }
 
-async fn post_handler(State(kg): State<AppState>, headers: HeaderMap, body: String) -> Response {
+/// `true` when the request is allowed: either no token is configured, or the
+/// `Authorization` header carries the expected bearer token.
+fn authorized(state: &HttpState, headers: &HeaderMap) -> bool {
+    match state.auth_token {
+        None => true,
+        Some(ref expected) => headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|presented| server::token_matches(presented, expected)),
+    }
+}
+
+async fn post_handler(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    let kg = state.kg;
     // The dispatch path locks the graph and may perform a blocking fsync, so
     // run it off the async worker pool (keeps the HTTP reactor responsive).
     let result = tokio::task::spawn_blocking(move || server::dispatch_http_body(&body, &kg)).await;
@@ -98,8 +123,13 @@ async fn post_handler(State(kg): State<AppState>, headers: HeaderMap, body: Stri
     }
 }
 
-async fn get_handler() -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+async fn get_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
     // No server-initiated messages: an open, keep-alive'd stream for compliance.
     let stream = futures::stream::pending::<std::result::Result<Event, Infallible>>();
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

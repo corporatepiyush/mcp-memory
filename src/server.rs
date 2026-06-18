@@ -192,7 +192,7 @@ fn to_value(resp: JsonRpcResponse) -> Value {
 }
 
 pub struct MCPServer {
-    _config: Arc<Config>,
+    config: Arc<Config>,
     kg: Arc<GraphHandle>,
 }
 
@@ -202,7 +202,7 @@ impl MCPServer {
         let kg = GraphHandle::new(path, config.durability).map_err(MCSError::IoError)?;
 
         Ok(Self {
-            _config: Arc::new(config),
+            config: Arc::new(config),
             kg: Arc::new(kg),
         })
     }
@@ -226,15 +226,38 @@ impl MCPServer {
     pub async fn run_tcp(&self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
         let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
-        info!("Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS})");
+        let auth_token = self.config.auth_token.clone();
+        info!(
+            "Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS}, auth {})",
+            if auth_token.is_some() { "on" } else { "off" }
+        );
         loop {
             let permit = Arc::clone(&semaphore).acquire_owned().await;
             let (socket, peer) = listener.accept().await.map_err(MCSError::IoError)?;
             let kg = Arc::clone(&self.kg);
+            let auth_token = auth_token.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection lifetime
                 let (read_half, mut write_half) = socket.into_split();
                 let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, read_half);
+                // When a token is configured, the client must send it as the
+                // first line before any JSON-RPC traffic.
+                if let Some(ref expected) = auth_token {
+                    match authenticate_line_conn(&mut reader, expected).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let _ = write_half
+                                .write_all(AUTH_REQUIRED_LINE.as_bytes())
+                                .await;
+                            let _ = write_half.flush().await;
+                            return;
+                        }
+                        Err(e) => {
+                            error!("TCP auth error for {peer}: {e}");
+                            return;
+                        }
+                    }
+                }
                 if let Err(e) = serve_line_conn(&mut reader, &mut write_half, kg).await {
                     error!("TCP connection {peer} error: {e}");
                 }
@@ -244,7 +267,27 @@ impl MCPServer {
 
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
     pub async fn run_http(&self, addr: &str) -> Result<()> {
-        crate::http::run(addr, self.graph()).await
+        crate::http::run(addr, self.graph(), self.config.auth_token.clone()).await
+    }
+}
+
+/// JSON-RPC error line returned to a TCP client that fails authentication.
+const AUTH_REQUIRED_LINE: &str = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32001,\
+\"message\":\"Authentication required: send the bearer token as the first line\"},\"id\":null}\n";
+
+/// Read the first line of a connection and compare it (constant-time) to the
+/// expected bearer token. Returns `Ok(false)` on EOF / oversized first line.
+async fn authenticate_line_conn<R>(reader: &mut R, expected: &str) -> Result<bool>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut line = String::new();
+    match read_line_capped(reader, &mut line, MAX_REQUEST_BYTES)
+        .await
+        .map_err(MCSError::IoError)?
+    {
+        LineRead::Line => Ok(token_matches(&line, expected)),
+        _ => Ok(false),
     }
 }
 
@@ -302,7 +345,7 @@ where
 
 fn process_request(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResult> {
     match req.method.as_str() {
-        "initialize" => Ok(HandlerResult::Value(handle_initialize())),
+        "initialize" => Ok(HandlerResult::Value(handle_initialize(req))),
         "tools/list" => Ok(HandlerResult::Value(handle_tools_list())),
         "tools/call" => handle_tools_call(req, kg),
         "ping" => Ok(HandlerResult::Value(Value::Null)),
@@ -314,17 +357,62 @@ fn process_request(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResu
     }
 }
 
-fn handle_initialize() -> Value {
+/// MCP protocol revisions this server can speak, newest first (for `initialize`
+/// version negotiation).
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// Newest revision we implement; offered when the client requests an unknown one.
+const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// `instructions` surfaced to the client and appended to the model's system prompt.
+const SERVER_INSTRUCTIONS: &str = "Knowledge-graph memory MCP server. Entity names are unique and \
+case-sensitive. Use `create_entities`/`create_relations` to build the graph, `add_observations` to \
+attach facts, and `search_nodes`/`open_nodes`/`read_graph` to retrieve. Prefer `upsert_entities` for \
+idempotent writes and `merge_entities` to collapse duplicates. Tool failures are returned with \
+`isError: true` rather than as protocol errors — read the message and retry.";
+
+fn handle_initialize(req: &JsonRpcRequest) -> Value {
+    // Version negotiation: echo a supported requested revision, else offer latest.
+    let protocol_version = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+        .unwrap_or(LATEST_PROTOCOL_VERSION);
+
     json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": { "listChanged": false }
         },
         "serverInfo": {
             "name": "mcp-memory",
             "version": env!("CARGO_PKG_VERSION")
-        }
+        },
+        "instructions": SERVER_INSTRUCTIONS
     })
+}
+
+/// Wrap a tool execution failure as an MCP `CallToolResult` with `isError: true`
+/// so the model sees the message and can self-correct, instead of receiving an
+/// opaque JSON-RPC protocol error. (Successful results are already content-
+/// wrapped by the action handlers.)
+#[inline]
+fn tool_error(message: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": message }],
+        "isError": true
+    })
+}
+
+/// Constant-time bearer-token check. Accepts the raw token or a `Bearer <token>`
+/// form; surrounding whitespace is trimmed.
+pub fn token_matches(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let presented = presented.trim();
+    let presented = presented.strip_prefix("Bearer ").unwrap_or(presented).trim();
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 fn handle_tools_list() -> Value {
@@ -353,35 +441,42 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerRe
         return Err(MCSError::MethodNotFound(tool_name.to_string()));
     }
 
-    match tool_name {
+    let result = match tool_name {
         // Raw-result handlers (large payloads, avoid second serialization pass).
-        "read_graph" => Ok(HandlerResult::RawResult(memory::handle_read_graph(kg, tool_args)?)),
-        "search_nodes" => Ok(HandlerResult::RawResult(memory::handle_search_nodes(kg, tool_args)?)),
+        "read_graph" => memory::handle_read_graph(kg, tool_args).map(HandlerResult::RawResult),
+        "search_nodes" => memory::handle_search_nodes(kg, tool_args).map(HandlerResult::RawResult),
         // Standard Value handlers.
-        "create_entities" => Ok(HandlerResult::Value(memory::handle_create_entities(kg, tool_args)?)),
-        "create_relations" => Ok(HandlerResult::Value(memory::handle_create_relations(kg, tool_args)?)),
-        "add_observations" => Ok(HandlerResult::Value(memory::handle_add_observations(kg, tool_args)?)),
-        "delete_entities" => Ok(HandlerResult::Value(memory::handle_delete_entities(kg, tool_args)?)),
-        "delete_observations" => Ok(HandlerResult::Value(memory::handle_delete_observations(kg, tool_args)?)),
-        "delete_relations" => Ok(HandlerResult::Value(memory::handle_delete_relations(kg, tool_args)?)),
-        "open_nodes" => Ok(HandlerResult::Value(memory::handle_open_nodes(kg, tool_args)?)),
-        "get_entity" => Ok(HandlerResult::Value(memory::handle_get_entity(kg, tool_args)?)),
-        "graph_stats" => Ok(HandlerResult::Value(memory::handle_graph_stats(kg)?)),
-        "search_relations" => Ok(HandlerResult::Value(memory::handle_search_relations(kg, tool_args)?)),
-        "find_path" => Ok(HandlerResult::Value(memory::handle_find_path(kg, tool_args)?)),
-        "compact" => Ok(HandlerResult::Value(memory::handle_compact(kg)?)),
-        "get_neighbors" => Ok(HandlerResult::Value(memory::handle_get_neighbors(kg, tool_args)?)),
-        "describe_entity" => Ok(HandlerResult::Value(memory::handle_describe_entity(kg, tool_args)?)),
-        "list_entity_types" => Ok(HandlerResult::Value(memory::handle_list_entity_types(kg)?)),
-        "list_relation_types" => Ok(HandlerResult::Value(memory::handle_list_relation_types(kg)?)),
-        "upsert_entities" => Ok(HandlerResult::Value(memory::handle_upsert_entities(kg, tool_args)?)),
-        "export_graph" => Ok(HandlerResult::Value(memory::handle_export_graph(kg, tool_args)?)),
-        "merge_entities" => Ok(HandlerResult::Value(memory::handle_merge_entities(kg, tool_args)?)),
-        "extract_subgraph" => Ok(HandlerResult::Value(memory::handle_extract_subgraph(kg, tool_args)?)),
-        "batch_get_entities" => Ok(HandlerResult::Value(memory::handle_batch_get_entities(kg, tool_args)?)),
-        "find_all_paths" => Ok(HandlerResult::Value(memory::handle_find_all_paths(kg, tool_args)?)),
+        "create_entities" => memory::handle_create_entities(kg, tool_args).map(HandlerResult::Value),
+        "create_relations" => memory::handle_create_relations(kg, tool_args).map(HandlerResult::Value),
+        "add_observations" => memory::handle_add_observations(kg, tool_args).map(HandlerResult::Value),
+        "delete_entities" => memory::handle_delete_entities(kg, tool_args).map(HandlerResult::Value),
+        "delete_observations" => memory::handle_delete_observations(kg, tool_args).map(HandlerResult::Value),
+        "delete_relations" => memory::handle_delete_relations(kg, tool_args).map(HandlerResult::Value),
+        "open_nodes" => memory::handle_open_nodes(kg, tool_args).map(HandlerResult::Value),
+        "get_entity" => memory::handle_get_entity(kg, tool_args).map(HandlerResult::Value),
+        "graph_stats" => memory::handle_graph_stats(kg).map(HandlerResult::Value),
+        "search_relations" => memory::handle_search_relations(kg, tool_args).map(HandlerResult::Value),
+        "find_path" => memory::handle_find_path(kg, tool_args).map(HandlerResult::Value),
+        "compact" => memory::handle_compact(kg).map(HandlerResult::Value),
+        "get_neighbors" => memory::handle_get_neighbors(kg, tool_args).map(HandlerResult::Value),
+        "describe_entity" => memory::handle_describe_entity(kg, tool_args).map(HandlerResult::Value),
+        "list_entity_types" => memory::handle_list_entity_types(kg).map(HandlerResult::Value),
+        "list_relation_types" => memory::handle_list_relation_types(kg).map(HandlerResult::Value),
+        "upsert_entities" => memory::handle_upsert_entities(kg, tool_args).map(HandlerResult::Value),
+        "export_graph" => memory::handle_export_graph(kg, tool_args).map(HandlerResult::Value),
+        "merge_entities" => memory::handle_merge_entities(kg, tool_args).map(HandlerResult::Value),
+        "extract_subgraph" => memory::handle_extract_subgraph(kg, tool_args).map(HandlerResult::Value),
+        "batch_get_entities" => memory::handle_batch_get_entities(kg, tool_args).map(HandlerResult::Value),
+        "find_all_paths" => memory::handle_find_all_paths(kg, tool_args).map(HandlerResult::Value),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
-    }
+    };
+
+    // Tool execution failures become isError CallToolResults so the model can
+    // read the message and self-correct, instead of an opaque protocol error.
+    Ok(result.unwrap_or_else(|e| {
+        error!("Tool '{tool_name}' error: {e}");
+        HandlerResult::Value(tool_error(&e.to_string()))
+    }))
 }
 
 #[cfg(test)]
@@ -497,8 +592,46 @@ mod tests {
             HandlerResult::Value(v) => v,
             HandlerResult::RawResult(_) => panic!("expected Value"),
         };
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], LATEST_PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], "mcp-memory");
+        assert!(result["instructions"].is_string());
         cleanup(&path);
+    }
+
+    #[test]
+    fn test_initialize_version_negotiation() {
+        let (kg, path) = setup_kg();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params: Some(json!({ "protocolVersion": "2024-11-05" })),
+            id: Some(Value::Number(1.into())),
+        };
+        let result = match process_request(&req, &kg).unwrap() {
+            HandlerResult::Value(v) => v,
+            HandlerResult::RawResult(_) => panic!("expected Value"),
+        };
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_tool_error_on_bad_args() {
+        // A tool that fails returns an isError CallToolResult, not a protocol error.
+        let (kg, path) = setup_kg();
+        let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"get_entity","arguments":{}}}"#;
+        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
+        assert!(v["error"].is_null(), "should not be a protocol error: {v}");
+        assert_eq!(v["result"]["isError"], json!(true));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_token_matches() {
+        assert!(token_matches("secret", "secret"));
+        assert!(token_matches("Bearer secret", "secret"));
+        assert!(token_matches("  Bearer secret  ", "secret"));
+        assert!(!token_matches("wrong", "secret"));
+        assert!(!token_matches("", "secret"));
     }
 }

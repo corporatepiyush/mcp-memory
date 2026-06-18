@@ -6,6 +6,13 @@ observations stored in a compact custom binary log with write-ahead durability.
 
 Speaks MCP over stdio, TCP, and HTTP transports.
 
+> **MCP suite.** One of four high-performance MCP servers written in Rust —
+> [mcp-postgres](https://github.com/corporatepiyush/mcp-pg-rust) ·
+> [mcp-filesystem](https://github.com/corporatepiyush/mcp-filesystem-rust) ·
+> [mcp-memory](https://github.com/corporatepiyush/mcp-memory) ·
+> [mcp-web-search](https://github.com/corporatepiyush/mcp-web-search).
+> All implement MCP protocol revision **`2025-11-25`**.
+
 ```
                   ┌──────────────────────────────────────────┐
                   │           mcp-memory server              │
@@ -70,6 +77,39 @@ The memory file path is resolved in order:
   }
 }
 ```
+
+### Authentication
+
+The `tcp` and `http` transports accept an optional bearer token (stdio is never
+authenticated). Set it with `--auth-token`, `--auth-token-file` (trimmed; an
+empty file is rejected), or `MCP_MEMORY_AUTH_TOKEN`:
+
+```sh
+mcp-memory --transport tcp  --bind 0.0.0.0:8080 --auth-token "s3cr3t"   # send token as the first TCP line
+mcp-memory --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"   # send Authorization: Bearer s3cr3t
+```
+
+Binding a non-loopback address **without** a token exposes the entire graph to
+the network. Comparison is constant-time.
+
+## MCP Compliance
+
+Implements the [Model Context Protocol](https://modelcontextprotocol.io) revision **`2025-11-25`** over JSON-RPC 2.0, via stdio, TCP, or HTTP.
+
+| Area | Support |
+|---|---|
+| Transports | stdio, TCP, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
+| Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
+| `initialize` | ✅ version negotiation + `instructions` |
+| `tools/list`, `tools/call` | ✅ (24 tools) |
+| `CallToolResult` | ✅ `content[]` + `isError` |
+| Auth | ✅ optional bearer token on TCP/HTTP (constant-time) |
+| Capabilities advertised | `tools` only |
+| `resources` · `prompts` · `logging` · `completion` | ❌ roadmap — see [MIGRATION.md](./MIGRATION.md) |
+
+Tool failures are returned as `CallToolResult`s with `isError: true` (not as
+JSON-RPC protocol errors) so the model can self-correct. Upgrading from 1.x?
+See **[MIGRATION.md](./MIGRATION.md)**.
 
 ## Data model
 
@@ -755,6 +795,39 @@ The test suite includes:
 - **Fuzzy tests** — randomized CRUD sequences asserting graph invariants,
   Unicode/large-string stress, and concurrent mutation consistency
 
+## Versioning & Compatibility
+
+Follows [Semantic Versioning](https://semver.org). The current line is **2.x**,
+targeting MCP revision `2025-11-25`. The `2.0.0` release changed tool failures
+from JSON-RPC protocol errors to `isError` results and added optional auth — see
+**[MIGRATION.md](./MIGRATION.md)**.
+
+| mcp-memory | MCP revision (default) | Negotiates |
+|---|---|---|
+| 2.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
+| ≤ 1.x | `2024-11-05` | — |
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+
+## What we did so far
+
+### Core architecture
+* **Rust (edition 2024), v2.0.0**, Apache-2.0, by Piyush
+* **MCP spec 2024-11-05** with tools (no resources or prompts registered)
+* **24 tools**: 8 write (`create_entities`, `create_relations`, `add_observations`, `delete_entities`, `delete_observations`, `delete_relations`, `upsert_entities`, `merge_entities`, `compact`) and 16 read
+* **3 transports**: stdio (newline-delimited JSON-RPC), TCP (same framing, up to 128 concurrent connections), MCP Streamable HTTP (axum POST/GET `/mcp`)
+* **Concurrency**: `ArcSwap<ReadSnapshot>` for lock-free reads, `parking_lot::Mutex<KnowledgeGraph>` for serialized writes, background thread for WAL `fsync` every 1s
+* **Persistence**: Custom binary write-ahead log (magic `MCPMEMV1`/`MCPMEMV2`), CRC32 footer on each record for `V2`, crash-safe via `BufWriter` flush + deferred fsync
+* **Transactions**: `TxnBegin`/`TxnCommit` wrapping multi-record operations (e.g. `merge_entities`); unclosed txns are discarded on replay
+* **String interning**: Arena-backed `StringInterner` deduplicates repeated values
+* **Entity storage**: 4-shard open-addressing hash table (Swiss-table style) with ctrl-byte probing
+* **Search**: Inverted token index, case-insensitive prefix match, token-hit-count ranking
+* **Relation storage**: Flat `Vec<StoredRelation>` (12 B/record)
+* **Compaction**: Rewrites WAL via temp file + atomic rename, triggered manually or automatically when >30% entity slots are tombstones
+* **Exports**: JSON, Mermaid, Graphviz DOT
+* **Error handling**: Custom `MCSError` enum with thiserror, JSON-RPC error code mapping
+* **CLI**: clap-based, `--memory-file`/`-f` / `MEMORY_FILE_PATH` env / `memory.mcpmem` default
+* **Features**: `cache_align` (optional padding for hot records)
+* **Dependencies**: tokio (multi-thread rt), serde, ahash, parking_lot, arc-swap, crossbeam-channel, crc32fast, axum, clap, tracing
