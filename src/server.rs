@@ -633,5 +633,89 @@ mod tests {
         assert!(token_matches("  Bearer secret  ", "secret"));
         assert!(!token_matches("wrong", "secret"));
         assert!(!token_matches("", "secret"));
+        // Length-mismatch and prefix cases.
+        assert!(!token_matches("secre", "secret"));
+        assert!(!token_matches("secretx", "secret"));
+        assert!(!token_matches("Bearer ", "secret"));
+    }
+
+    // ── MCP 2025-11-25 compliance ─────────────────────────────────────────
+
+    fn init_result(params: Option<Value>, kg: &GraphHandle) -> Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params,
+            id: Some(json!(1)),
+        };
+        match process_request(&req, kg).unwrap() {
+            HandlerResult::Value(v) => v,
+            HandlerResult::RawResult(_) => panic!("expected Value"),
+        }
+    }
+
+    #[test]
+    fn test_compliance_negotiation_matrix() {
+        let (kg, path) = setup_kg();
+        for v in SUPPORTED_PROTOCOL_VERSIONS {
+            let r = init_result(Some(json!({ "protocolVersion": v })), &kg);
+            assert_eq!(&r["protocolVersion"], v);
+        }
+        // Unsupported / malformed → latest.
+        assert_eq!(
+            init_result(Some(json!({ "protocolVersion": "1900-01-01" })), &kg)["protocolVersion"],
+            LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(init_result(None, &kg)["protocolVersion"], "2025-11-25");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_compliance_initialize_honest_with_instructions() {
+        let (kg, path) = setup_kg();
+        let r = init_result(None, &kg);
+        assert!(r["capabilities"]["tools"].is_object());
+        for cap in ["resources", "prompts", "logging", "completions"] {
+            assert!(r["capabilities"][cap].is_null(), "must not advertise {cap}");
+        }
+        assert!(r["instructions"].as_str().is_some_and(|s| !s.is_empty()));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_compliance_tool_success_is_content_wrapped() {
+        let (kg, path) = setup_kg();
+        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_entities","arguments":{"entities":[{"name":"Ada","entityType":"person","observations":["math"]}]}}}"#;
+        let v: Value = serde_json::from_str(&dispatch_line(create, &kg).unwrap()).unwrap();
+        let content = v["result"]["content"].as_array().expect("content array");
+        assert!(!content.is_empty());
+        assert_eq!(content[0]["type"], "text");
+        assert!(v["error"].is_null());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_compliance_protocol_errors_remain_protocol_errors() {
+        let (kg, path) = setup_kg();
+        // Unknown tool → JSON-RPC error, not an isError result.
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
+        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+        assert!(v["result"].is_null());
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_compliance_tcp_auth_handshake() {
+        // First-line token handshake used by the TCP transport.
+        let mut ok = tokio::io::BufReader::new(&b"Bearer s3cr3t\n"[..]);
+        assert!(authenticate_line_conn(&mut ok, "s3cr3t").await.unwrap());
+
+        let mut bad = tokio::io::BufReader::new(&b"nope\n"[..]);
+        assert!(!authenticate_line_conn(&mut bad, "s3cr3t").await.unwrap());
+
+        // EOF / no first line → rejected.
+        let mut empty = tokio::io::BufReader::new(&b""[..]);
+        assert!(!authenticate_line_conn(&mut empty, "s3cr3t").await.unwrap());
     }
 }
