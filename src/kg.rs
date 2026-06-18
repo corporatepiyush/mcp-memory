@@ -1159,7 +1159,16 @@ impl ReadSnapshot {
 
 impl KnowledgeGraph {
     pub fn new(path: &Path) -> std::io::Result<Self> {
-        let store = BinaryStore::new(path)?;
+        Self::open(path, None)
+    }
+
+    /// Open the graph, optionally reusing an existing background-sync slot so the
+    /// fsync thread tracks the current file across a `compact` (D1).
+    fn open(
+        path: &Path,
+        sync_slot: Option<Arc<arc_swap::ArcSwap<std::fs::File>>>,
+    ) -> std::io::Result<Self> {
+        let store = BinaryStore::new_with_slot(path, sync_slot)?;
 
         // Replay into local collections, then assign into self — no raw pointers needed (X3).
         let mut interner = StringInterner::with_capacity(65536, 1024);
@@ -1611,7 +1620,10 @@ impl KnowledgeGraph {
         //    stale search-index entries — none of which the old reopen-only path
         //    reclaimed.
         let path = self.store.path().clone();
-        *self = KnowledgeGraph::new(&path).map_err(MCSError::IoError)?;
+        // Reuse the existing sync slot so the background fsync thread follows the
+        // compacted file instead of the renamed-away original (D1).
+        let sync_slot = Arc::clone(&self.store.sync_slot);
+        *self = KnowledgeGraph::open(&path, Some(sync_slot)).map_err(MCSError::IoError)?;
 
         Ok(())
     }
@@ -2506,6 +2518,26 @@ impl KnowledgeGraph {
             );
         }
 
+        // `apply_record` maintains `relations` but NOT the incremental
+        // `adjacency` index (it is built from scratch on load, where this never
+        // mattered). For a *live* merge we must keep adjacency in sync, or every
+        // adjacency consumer — find_path, neighbors(depth>=2), extract_subgraph,
+        // find_all_paths — would return stale results until the next restart
+        // (M2). The merge removed `source` and added the `redirect` edges, so
+        // mirror exactly those changes.
+        self.adjacency.remove(&source_id);
+        for list in self.adjacency.values_mut() {
+            list.retain(|(to, _)| *to != source_id);
+        }
+        for r in &redirect {
+            // All endpoints were interned above, so these lookups are infallible.
+            let from_id = self.interner.get_optional(&r.from).unwrap();
+            let to_id = self.interner.get_optional(&r.to).unwrap();
+            let type_id = self.interner.get_optional(&r.relation_type).unwrap();
+            self.adjacency.entry(from_id).or_default().push((to_id, type_id));
+            self.adjacency.entry(to_id).or_default().push((from_id, type_id));
+        }
+
         Ok(serde_json::json!({
             "source": source,
             "target": target,
@@ -2817,8 +2849,10 @@ impl GraphHandle {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         let kg = KnowledgeGraph::new(path)?;
         let snapshot = Arc::new(kg.snapshot());
-        // Clone the sync file handle before moving `kg` into the Mutex.
-        let sync_file = Arc::clone(&kg.store.sync_file);
+        // Clone the shared sync slot before moving `kg` into the Mutex. The slot
+        // is updated in place by `compact`/`reopen_truncated`, so the thread
+        // always fsyncs the current file (D1).
+        let sync_slot = Arc::clone(&kg.store.sync_slot);
         let inner = Arc::new(parking_lot::Mutex::new(kg));
 
         let sync_notify: Arc<(StdMutex<bool>, Condvar)> =
@@ -2853,14 +2887,16 @@ impl GraphHandle {
                     drop(guard);
 
                     if should_sync {
-                        if let Err(e) = sync_file.sync_data() {
+                        // Load the current handle each cycle so a compaction
+                        // that swapped the underlying file is picked up (D1).
+                        if let Err(e) = sync_slot.load().sync_data() {
                             tracing::error!("WAL fsync failed: {e}");
                         }
                     }
 
                     if sync_stop.load(Ordering::Relaxed) {
                         // One final fsync before exiting.
-                        if let Err(e) = sync_file.sync_data() {
+                        if let Err(e) = sync_slot.load().sync_data() {
                             tracing::error!("WAL final fsync failed: {e}");
                         }
                         break;

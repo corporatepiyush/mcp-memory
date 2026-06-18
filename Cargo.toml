@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted via custom binary log"
@@ -9,7 +9,7 @@ repository = "https://github.com/corporatepiyush/mcp-memory"
 readme = "README.md"
 keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent"]
 categories = ["database-implementations", "command-line-utilities"]
-exclude = ["/target", "OPTIMIZATION_PLAN.md", "*.bin"]
+exclude = ["/target", "REVIEW_MEMORY_IO_CONCURRENCY.md", "*.bin"]
 
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "net"] }

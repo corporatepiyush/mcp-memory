@@ -3,6 +3,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+
 const MAGIC: &[u8; 8] = b"MCPMEMV1";
 const MAX_RECORD_BYTES: u32 = 1 << 20;
 
@@ -44,10 +46,12 @@ impl RecordKind {
 pub struct BinaryStore {
     writer: BufWriter<File>,
     path: PathBuf,
-    /// A separate file handle on the same underlying file, used by the
-    /// background sync thread to call `fsync` without holding any lock.
-    /// Cloned via `File::try_clone()` during construction.
-    pub(crate) sync_file: Arc<File>,
+    /// Shared cell holding the *current* file handle for the background sync
+    /// thread to `fsync`, without holding any lock. It is updated every time the
+    /// underlying file is (re)opened — notably by `compact`/`reopen_truncated`,
+    /// which swap in a fresh inode — so the sync thread never keeps fsyncing a
+    /// stale fd that points at a renamed-away/unlinked inode (D1).
+    pub(crate) sync_slot: Arc<ArcSwap<File>>,
 }
 
 impl BinaryStore {
@@ -56,6 +60,17 @@ impl BinaryStore {
     }
 
     pub fn new(path: &Path) -> std::io::Result<Self> {
+        Self::new_with_slot(path, None)
+    }
+
+    /// Open (or create) the log. When `slot` is `Some`, the freshly opened file
+    /// handle is published into that existing shared cell instead of a new one —
+    /// this is how `compact` keeps the background sync thread pointed at the
+    /// post-compaction file rather than the renamed-away original (D1).
+    pub fn new_with_slot(
+        path: &Path,
+        slot: Option<Arc<ArcSwap<File>>>,
+    ) -> std::io::Result<Self> {
         let exists = path.exists();
         let file = OpenOptions::new()
             .create(true)
@@ -63,7 +78,14 @@ impl BinaryStore {
             .read(false)
             .open(path)?;
 
-        let sync_file = Arc::new(file.try_clone()?);
+        let handle = Arc::new(file.try_clone()?);
+        let sync_slot = match slot {
+            Some(s) => {
+                s.store(handle);
+                s
+            }
+            None => Arc::new(ArcSwap::new(handle)),
+        };
         let mut writer = BufWriter::with_capacity(65536, file);
 
         if !exists {
@@ -74,7 +96,7 @@ impl BinaryStore {
         Ok(Self {
             writer,
             path: path.to_path_buf(),
-            sync_file,
+            sync_slot,
         })
     }
 
@@ -153,14 +175,26 @@ impl BinaryStore {
             }
             let payload_len = total_len - 5;
 
+            // A crash can leave a record's length prefix written but its body
+            // only partially flushed. Treat a short read on the kind/payload as
+            // a torn tail (stop cleanly) rather than a hard error — otherwise a
+            // single interrupted write would make the whole log unopenable.
             let mut kind_buf = [0u8; 1];
-            reader.read_exact(&mut kind_buf)?;
+            match reader.read_exact(&mut kind_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            }
             let kind_val = kind_buf[0];
 
             payload_buf.clear();
             payload_buf.resize(payload_len, 0);
             if payload_len > 0 {
-                reader.read_exact(&mut payload_buf)?;
+                match reader.read_exact(&mut payload_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
 
             if let Some(kind) = RecordKind::from_u8(kind_val) {
@@ -184,7 +218,9 @@ impl BinaryStore {
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        self.sync_file = Arc::new(file.try_clone()?);
+        // Publish the new handle so the background sync thread fsyncs this file,
+        // not the truncated-away one (D1).
+        self.sync_slot.store(Arc::new(file.try_clone()?));
         let mut writer = BufWriter::with_capacity(65536, file);
         writer.write_all(MAGIC)?;
         writer.flush()?;
@@ -520,6 +556,38 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_slot_follows_reopen_truncated() {
+        // The background sync thread fsyncs through the shared slot; after a
+        // reopen it must observe the *new* file handle, not the old one (D1).
+        let path = tmp_path();
+        let mut store = BinaryStore::new(&path).unwrap();
+        let slot = Arc::clone(&store.sync_slot);
+        let before = Arc::as_ptr(&slot.load_full());
+        store.reopen_truncated().unwrap();
+        let after = Arc::as_ptr(&slot.load_full());
+        assert_ne!(before, after, "reopen must publish the new handle into the slot");
+        assert!(Arc::ptr_eq(&slot, &store.sync_slot), "slot identity must be stable");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_new_with_slot_reuses_shared_cell() {
+        // compact() reopens via new_with_slot(.., Some(existing_slot)) so the
+        // sync thread keeps tracking the same cell across the swap (D1).
+        let path = tmp_path();
+        let store1 = BinaryStore::new(&path).unwrap();
+        let slot = Arc::clone(&store1.sync_slot);
+        let before = Arc::as_ptr(&slot.load_full());
+        drop(store1);
+
+        let store2 = BinaryStore::new_with_slot(&path, Some(Arc::clone(&slot))).unwrap();
+        assert!(Arc::ptr_eq(&slot, &store2.sync_slot), "must reuse the passed slot");
+        let after = Arc::as_ptr(&slot.load_full());
+        assert_ne!(before, after, "reopened handle must be published into the slot");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_record_too_large() {
         let path = tmp_path();
         let mut store = BinaryStore::new(&path).unwrap();
@@ -571,6 +639,48 @@ mod tests {
         let mut count = 0;
         replay_store.replay(|_, _| count += 1).unwrap();
         assert_eq!(count, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_torn_record_mid_stream_recovers_prefix() {
+        // A crash that writes a record's length prefix but only part of its
+        // body must not brick the log: replay should return the records written
+        // before the torn one and stop cleanly (D2).
+        let path = tmp_path();
+        let mut store = BinaryStore::new(&path).unwrap();
+        let mut buf = Vec::new();
+        encode_create_entity(&mut buf, "Alice", "person", &["likes coffee".into()]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf).unwrap();
+        store.flush_and_sync().unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+
+        // Append a second record, then chop it in half to simulate a torn write
+        // (length prefix present, payload incomplete).
+        buf.clear();
+        encode_create_entity(&mut buf, "Bob", "person", &["drinks tea".into()]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf).unwrap();
+        store.flush_and_sync().unwrap();
+        drop(store);
+
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        // Cut somewhere inside the second record's body.
+        let torn_len = good_len + (full_len - good_len) / 2;
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(torn_len).unwrap();
+        drop(file);
+
+        let replay_store = BinaryStore::new(&path).unwrap();
+        let mut names = Vec::new();
+        replay_store
+            .replay(|_, data| {
+                if let Some((name, _, _)) = decode_create_entity(data) {
+                    names.push(name.to_string());
+                }
+            })
+            .expect("torn tail must not be a hard error");
+        // Only the fully-written first record survives.
+        assert_eq!(names, vec!["Alice"]);
         let _ = std::fs::remove_file(&path);
     }
 }

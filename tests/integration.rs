@@ -1715,6 +1715,78 @@ fn test_merge_entities_redirect_with_third_party() {
     cleanup(&path);
 }
 
+// M2: merge_entities must keep the incremental `adjacency` index in sync, or
+// every adjacency consumer (find_path, neighbors depth>=2, extract_subgraph,
+// find_all_paths) returns stale results until the next restart/compact.
+
+#[test]
+fn test_merge_entities_updates_adjacency_for_find_path() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    // Charlie --knows--> Alice (incoming edge to the merge source).
+    kg.create_relations(&[Relation {
+        from: "Charlie".into(),
+        to: "Alice".into(),
+        relation_type: "knows".into(),
+    }])
+    .unwrap();
+
+    // Merge Alice into Bob: the edge becomes Charlie --knows--> Bob.
+    kg.merge_entities("Alice", "Bob").unwrap();
+
+    // find_path walks the adjacency index. Before the fix it still pointed at
+    // the deleted Alice and never reached Bob.
+    let p = kg.find_path("Charlie", "Bob").expect("redirected edge must be reachable");
+    assert_eq!(p, vec!["Charlie", "Bob"]);
+
+    // The deleted source must be gone from adjacency too: no path to Alice.
+    assert!(kg.find_path("Charlie", "Alice").is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_updates_adjacency_for_subgraph() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[Relation {
+        from: "Charlie".into(),
+        to: "Alice".into(),
+        relation_type: "knows".into(),
+    }])
+    .unwrap();
+
+    kg.merge_entities("Alice", "Bob").unwrap();
+
+    // extract_subgraph(depth 1) around Charlie must reach Bob (the redirect
+    // target) and never the deleted Alice.
+    let out = kg.extract_subgraph(&["Charlie".into()], 1).unwrap();
+    let mut names: Vec<&str> = out.entities.iter().map(|e| e.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, vec!["Bob", "Charlie"]);
+    cleanup(&path);
+}
+
+#[test]
+fn test_merge_entities_adjacency_matches_compact_rebuild() {
+    // The live adjacency after a merge must equal the adjacency rebuilt from the
+    // log on reload (compact rebuilds from scratch). find_path is the observable
+    // proxy: results must agree before and after compaction.
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[
+        Relation { from: "Charlie".into(), to: "Alice".into(), relation_type: "knows".into() },
+        knows_bob(), // Bob --knows--> Charlie
+    ])
+    .unwrap();
+    kg.merge_entities("Alice", "Bob").unwrap();
+
+    let live = kg.find_path("Charlie", "Bob").unwrap();
+    kg.compact().unwrap();
+    let rebuilt = kg.find_path("Charlie", "Bob").unwrap();
+    assert_eq!(live, rebuilt);
+    cleanup(&path);
+}
+
 // =========================================================================
 // extract_subgraph
 // =========================================================================
