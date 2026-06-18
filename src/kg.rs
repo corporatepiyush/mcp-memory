@@ -14,7 +14,6 @@ use crate::types::{Entity, Relation, KnowledgeGraphOut};
 use crate::search::SearchIndex;
 use crate::store::{self as store_enc, BinaryStore, RecordKind};
 
-const ENTITY_SLOT_LIVE: u8 = 1;
 const NAME_TABLE_SHARDS: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -63,16 +62,9 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 #[derive(Clone)]
 #[cfg_attr(feature = "cache_align", repr(align(64)))]
 pub(crate) struct StoredEntity {
-    state: u8,
     pub(crate) name: StrId,
     pub(crate) entity_type: StrId,
     pub(crate) observations: Vec<StrId>,
-}
-
-impl StoredEntity {
-    pub(crate) const fn is_live(&self) -> bool {
-        self.state == ENTITY_SLOT_LIVE
-    }
 }
 
 // Default layout: 12 B / align 4 → ~1 in 5 records straddles a 64-byte line.
@@ -559,15 +551,16 @@ impl ReadSnapshot {
     /// Serialize the full graph directly to a JSON string, avoiding intermediate
     /// owned `Entity`/`Relation` allocations. This is the fast path for handlers.
     pub fn read_graph_json(&self) -> String {
-        // Rough capacity: 40K entities × ~60 B + 120K relations × ~55 B = ~9 MB
-        let cap = self.entity_slots.len() * 64 + self.relations.len() * 60 + 128;
+        // Rough capacity: live entities × ~60 B + relations × ~55 B.
+        let live = self.entity_slots.iter().filter(|s| s.is_some()).count();
+        let cap = live * 64 + self.relations.len() * 60 + 128;
         let mut buf = String::with_capacity(cap);
 
         // entities array
         buf.push_str(r#"{"entities":["#);
         let mut first = true;
         for slot in self.entity_slots.iter() {
-            let Some(e) = slot.as_ref().filter(|e| e.is_live()) else { continue };
+            let Some(e) = slot.as_ref() else { continue };
             if first { first = false } else { buf.push(',') }
             buf.push('{');
             // name
@@ -614,7 +607,7 @@ impl ReadSnapshot {
         let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
-            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .filter_map(|s| s.as_ref())
             .collect();
         let relations: Vec<&StoredRelation> = self.relations.iter().collect();
         ReadGraphView { snap: self, entities, relations }
@@ -627,7 +620,7 @@ impl ReadSnapshot {
         self.entity_slots
             .get(slot as usize)
             .and_then(|s| s.as_ref())
-            .filter(|e| e.is_live())?;
+            ?;
         Some(slot)
     }
 
@@ -669,7 +662,7 @@ impl ReadSnapshot {
             .iter()
             .filter_map(|s| {
                 let e = s.as_ref()?;
-                if e.is_live() && name_ids.contains(&e.name) {
+                if name_ids.contains(&e.name) {
                     Some(self.entity_to_output(e))
                 } else {
                     None
@@ -693,7 +686,7 @@ impl ReadSnapshot {
         let entities: Vec<Entity> = self
             .entity_slots
             .iter()
-            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .filter_map(|s| s.as_ref())
             .map(|e| self.entity_to_output(e))
             .collect();
         let relations: Vec<Relation> = self
@@ -944,7 +937,7 @@ impl ReadSnapshot {
         let entity_count = self
             .entity_slots
             .iter()
-            .filter(|s| s.as_ref().is_some_and(|e| e.is_live()))
+            .filter(|s| s.is_some())
             .count();
         let relation_count = self.relations.len();
         let type_counts = self.entity_type_counts();
@@ -977,7 +970,7 @@ impl ReadSnapshot {
     pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
         let mut counts: AHashMap<StrId, usize> = AHashMap::new();
         for slot in self.entity_slots.iter() {
-            if let Some(e) = slot.as_ref().filter(|e| e.is_live()) {
+            if let Some(e) = slot.as_ref() {
                 *counts.entry(e.entity_type).or_default() += 1;
             }
         }
@@ -1032,7 +1025,7 @@ impl ReadSnapshot {
         out.push_str("digraph KG {\n");
         out.push_str("    rankdir=LR;\n");
         for slot in self.entity_slots.iter() {
-            if let Some(e) = slot.as_ref().filter(|e| e.is_live()) {
+            if let Some(e) = slot.as_ref() {
                 let name = sanitize_label(self.interner.lookup(e.name));
                 let etype = sanitize_label(self.interner.lookup(e.entity_type));
                 out.push_str(&format!("    \"{}\" [label=\"{}\n({})\"];\n", name, name, etype));
@@ -1148,7 +1141,6 @@ impl ReadSnapshot {
                 self.entity_slots
                     .get(*idx as usize)?
                     .as_ref()
-                    .filter(|e| e.is_live())
                     .map(|e| self.entity_to_output(e))
             })
             .collect())
@@ -1316,7 +1308,6 @@ impl KnowledgeGraph {
         let obs_ids: Vec<StrId> = observations.iter().map(|o| interner.intern(o)).collect();
         let slot = entities.len() as u32;
         entities.push(Some(StoredEntity {
-            state: ENTITY_SLOT_LIVE,
             name: name_id,
             entity_type: type_id,
             observations: obs_ids.clone(),
@@ -1416,9 +1407,6 @@ impl KnowledgeGraph {
         let hash = self.interner.get_hash(name_id);
         let slot = self.name_table.lookup(hash, name_id)?;
         let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
-        if !stored.is_live() {
-            return None;
-        }
         Some(self.entity_to_output(stored))
     }
 
@@ -1427,7 +1415,7 @@ impl KnowledgeGraph {
         let live_entities = self
             .entity_slots
             .iter()
-            .filter(|s| s.as_ref().is_some_and(|e| e.is_live()))
+            .filter(|s| s.is_some())
             .count();
         let total_relations = self.relations.len();
         let index_entries = self.search.len();
@@ -1435,7 +1423,6 @@ impl KnowledgeGraph {
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref())
-            .filter(|e| e.is_live())
             .map(|e| e.observations.len())
             .sum();
 
@@ -1565,7 +1552,7 @@ impl KnowledgeGraph {
         let mut create_relations: Vec<Relation> = Vec::new();
 
         for slot in &self.entity_slots {
-            if let Some(stored) = slot.as_ref().filter(|e| e.is_live()) {
+            if let Some(stored) = slot.as_ref() {
                 create_entities.push(self.entity_to_output(stored));
             }
         }
@@ -1637,9 +1624,9 @@ impl KnowledgeGraph {
                 ));
             }
         }
+        let mut records: Vec<(RecordKind, Vec<u8>)> = Vec::new();
         let mut created = Vec::new();
         for entity in entities {
-            // Check dedup before writing (using non-interning lookup)
             let existing = self.interner.get_optional(&entity.name)
                 .and_then(|id| {
                     let hash = self.interner.get_hash(id);
@@ -1648,13 +1635,24 @@ impl KnowledgeGraph {
             if existing.is_some() {
                 continue;
             }
-            // Write-ahead: encode and log before mutating state
             let mut buf = Vec::new();
             store_enc::encode_create_entity(&mut buf, &entity.name, &entity.entity_type, &entity.observations)
                 .map_err(MCSError::IoError)?;
-            self.store.write_record(RecordKind::CreateEntity, &buf)
-                .map_err(MCSError::IoError)?;
+            records.push((RecordKind::CreateEntity, buf));
+            created.push(entity.clone());
+        }
+        if records.is_empty() {
+            return Ok(created);
+        }
+        // Write-ahead, transactionally: begin, all records, commit.
+        self.store.write_record(RecordKind::TxnBegin, &[]).map_err(MCSError::IoError)?;
+        for (kind, data) in &records {
+            self.store.write_record(*kind, data).map_err(MCSError::IoError)?;
+        }
+        self.store.write_record(RecordKind::TxnCommit, &[]).map_err(MCSError::IoError)?;
 
+        // Logged and committed — now apply to in-memory state.
+        for entity in &created {
             let name_id = self.interner.intern(&entity.name);
             let hash = self.interner.get_hash(name_id);
             let type_id = self.interner.intern(&entity.entity_type);
@@ -1663,14 +1661,11 @@ impl KnowledgeGraph {
                 .iter()
                 .map(|o| self.interner.intern(o))
                 .collect();
-            // Reuse a tombstoned slot if one is free (M2); its old search-index
-            // entries were cleared on delete, so the slot starts clean.
             let reused = self.free_slots.pop();
             let slot = reused.unwrap_or(self.entity_slots.len() as u32);
             self.search
                 .index_entity(&mut self.interner, slot, name_id, type_id, &obs_ids);
             let stored = Some(StoredEntity {
-                state: ENTITY_SLOT_LIVE,
                 name: name_id,
                 entity_type: type_id,
                 observations: obs_ids,
@@ -1680,11 +1675,6 @@ impl KnowledgeGraph {
                 None => self.entity_slots.push(stored),
             }
             self.name_table.insert(&self.interner, hash, name_id, slot);
-            created.push(Entity {
-                name: entity.name.clone(),
-                entity_type: entity.entity_type.clone(),
-                observations: entity.observations.clone(),
-            });
         }
         Ok(created)
     }
@@ -1698,12 +1688,13 @@ impl KnowledgeGraph {
                 ));
             }
         }
-        let mut created = Vec::new();
         // Build a dedup set for O(1) duplicate checks (P5)
         let mut rel_set: AHashSet<(StrId, StrId, StrId)> = AHashSet::new();
         for rel in &self.relations {
             rel_set.insert((rel.from, rel.to, rel.relation_type));
         }
+        let mut records: Vec<(RecordKind, Vec<u8>)> = Vec::new();
+        let mut interned: Vec<StoredRelation> = Vec::new();
         for relation in relations {
             let from_id = self.interner.intern(&relation.from);
             let to_id = self.interner.intern(&relation.to);
@@ -1711,24 +1702,40 @@ impl KnowledgeGraph {
             if !rel_set.insert((from_id, to_id, type_id)) {
                 continue;
             }
-            // Write-ahead: log before mutation
             let mut buf = Vec::new();
             store_enc::encode_create_relation(&mut buf, &relation.from, &relation.to, &relation.relation_type)
                 .map_err(MCSError::IoError)?;
-            self.store.write_record(RecordKind::CreateRelation, &buf)
-                .map_err(MCSError::IoError)?;
-
-            self.relations.push(StoredRelation {
+            records.push((RecordKind::CreateRelation, buf));
+            interned.push(StoredRelation {
                 from: from_id,
                 to: to_id,
                 relation_type: type_id,
             });
-            self.adjacency.entry(from_id).or_default().push((to_id, type_id));
-            self.adjacency.entry(to_id).or_default().push((from_id, type_id));
+        }
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Write-ahead, transactionally.
+        self.store.write_record(RecordKind::TxnBegin, &[]).map_err(MCSError::IoError)?;
+        for (kind, data) in &records {
+            self.store.write_record(*kind, data).map_err(MCSError::IoError)?;
+        }
+        self.store.write_record(RecordKind::TxnCommit, &[]).map_err(MCSError::IoError)?;
+
+        // Logged and committed — now apply to in-memory state.
+        let mut created = Vec::new();
+        for sr in &interned {
+            self.relations.push(StoredRelation {
+                from: sr.from,
+                to: sr.to,
+                relation_type: sr.relation_type,
+            });
+            self.adjacency.entry(sr.from).or_default().push((sr.to, sr.relation_type));
+            self.adjacency.entry(sr.to).or_default().push((sr.from, sr.relation_type));
             created.push(Relation {
-                from: relation.from.clone(),
-                to: relation.to.clone(),
-                relation_type: relation.relation_type.clone(),
+                from: self.interner.lookup(sr.from).to_string(),
+                to: self.interner.lookup(sr.to).to_string(),
+                relation_type: self.interner.lookup(sr.relation_type).to_string(),
             });
         }
         Ok(created)
@@ -1795,6 +1802,7 @@ impl KnowledgeGraph {
     }
 
     pub fn delete_entities(&mut self, entity_names: &[String]) -> Result<()> {
+        let mut records: Vec<(RecordKind, Vec<u8>)> = Vec::new();
         let mut deleted_names = Vec::new();
         for name in entity_names {
             let name_id_opt = self.interner.get_optional(name);
@@ -1803,36 +1811,41 @@ impl KnowledgeGraph {
                 if let Some(slot) = self.name_table.lookup(hash, name_id)
                     && let Some(Some(_)) = self.entity_slots.get(slot as usize)
                 {
-                    // Write-ahead: log before mutation
                     let mut buf = Vec::new();
                     store_enc::encode_delete_entity(&mut buf, name)
                         .map_err(MCSError::IoError)?;
-                    self.store.write_record(RecordKind::DeleteEntity, &buf)
-                        .map_err(MCSError::IoError)?;
-
-                    self.entity_slots[slot as usize] = None;
-                    self.free_slots.push(slot);
-                    self.search.remove_entity(slot);
-                    self.name_table.remove(&self.interner, hash, name_id);
-                    deleted_names.push(name.clone());
+                    records.push((RecordKind::DeleteEntity, buf));
+                    deleted_names.push((name.clone(), name_id, hash, slot));
                 }
             }
         }
-        if !deleted_names.is_empty() {
-            // Use a AHashSet for O(1) retain checks (P5)
-            let deleted_ids: AHashSet<StrId> = deleted_names.iter()
-                .map(|n| self.interner.intern(n))
-                .collect();
-            self.relations
-                .retain(|r| !deleted_ids.contains(&r.from) && !deleted_ids.contains(&r.to));
-            // Clean adjacency index
-            for id in &deleted_ids {
-                self.adjacency.remove(id);
-                // Remove references from other entities' adjacency lists
-                for list in self.adjacency.values_mut() {
-                    list.retain(|(to, _)| !deleted_ids.contains(to));
-                }
-            }
+        if records.is_empty() {
+            return Ok(());
+        }
+        // Write-ahead, transactionally.
+        self.store.write_record(RecordKind::TxnBegin, &[]).map_err(MCSError::IoError)?;
+        for (kind, data) in &records {
+            self.store.write_record(*kind, data).map_err(MCSError::IoError)?;
+        }
+        self.store.write_record(RecordKind::TxnCommit, &[]).map_err(MCSError::IoError)?;
+
+        // Logged and committed — now apply to in-memory state.
+        for (_name, _name_id, _hash, slot) in &deleted_names {
+            self.entity_slots[*slot as usize] = None;
+            self.free_slots.push(*slot);
+            self.search.remove_entity(*slot);
+            self.name_table.remove(&self.interner, *_hash, *_name_id);
+        }
+        let deleted_ids: AHashSet<StrId> = deleted_names.iter()
+            .map(|(_, id, _, _)| *id)
+            .collect();
+        self.relations
+            .retain(|r| !deleted_ids.contains(&r.from) && !deleted_ids.contains(&r.to));
+        for id in &deleted_ids {
+            self.adjacency.remove(id);
+        }
+        for list in self.adjacency.values_mut() {
+            list.retain(|(to, _)| !deleted_ids.contains(to));
         }
         Ok(())
     }
@@ -1884,18 +1897,26 @@ impl KnowledgeGraph {
                 )
             })
             .collect();
-        // Write-ahead: log every deletion before mutating in-memory state (C3),
-        // so a failed write can't leave memory ahead of the log.
+        if rels.is_empty() {
+            return Ok(());
+        }
+        // Write-ahead, transactionally.
+        let mut records: Vec<(RecordKind, Vec<u8>)> = Vec::new();
         for relation in relations {
             let mut buf = Vec::new();
             store_enc::encode_delete_relation(&mut buf, &relation.from, &relation.to, &relation.relation_type)
                 .map_err(MCSError::IoError)?;
-            self.store.write_record(RecordKind::DeleteRelation, &buf)
-                .map_err(MCSError::IoError)?;
+            records.push((RecordKind::DeleteRelation, buf));
         }
+        self.store.write_record(RecordKind::TxnBegin, &[]).map_err(MCSError::IoError)?;
+        for (kind, data) in &records {
+            self.store.write_record(*kind, data).map_err(MCSError::IoError)?;
+        }
+        self.store.write_record(RecordKind::TxnCommit, &[]).map_err(MCSError::IoError)?;
+
+        // Logged and committed — now apply to in-memory state.
         self.relations
             .retain(|r| !rels.contains(&(r.from, r.to, r.relation_type)));
-        // Clean adjacency index
         for (f, t, rt) in &rels {
             if let Some(edges) = self.adjacency.get_mut(f) {
                 edges.retain(|(to, rtype)| to != t || rtype != rt);
@@ -1924,7 +1945,7 @@ impl KnowledgeGraph {
         let entities: Vec<&StoredEntity> = self
             .entity_slots
             .iter()
-            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .filter_map(|s| s.as_ref())
             .collect();
         let relations: Vec<&StoredRelation> = self.relations.iter().collect();
         GraphView { kg: self, entities, relations }
@@ -1950,7 +1971,7 @@ impl KnowledgeGraph {
             .iter()
             .filter_map(|s| {
                 s.as_ref()
-                    .filter(|stored| stored.is_live() && name_ids.contains(&stored.name))
+                    .filter(|stored| name_ids.contains(&stored.name))
             })
             .collect();
         let matched_names: AHashSet<StrId> = entities.iter().map(|e| e.name).collect();
@@ -1992,8 +2013,8 @@ impl KnowledgeGraph {
         let name_id = self.interner.get_optional(name)?;
         let hash = self.interner.get_hash(name_id);
         let slot = self.name_table.lookup(hash, name_id)?;
-        let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
-        stored.is_live().then_some(slot)
+        self.entity_slots.get(slot as usize)?.as_ref()?;
+        Some(slot)
     }
 
     /// Materialize a live entity from its interned name id.
@@ -2001,7 +2022,7 @@ impl KnowledgeGraph {
         let hash = self.interner.get_hash(name_id);
         let slot = self.name_table.lookup(hash, name_id)?;
         let stored = self.entity_slots.get(slot as usize)?.as_ref()?;
-        stored.is_live().then(|| self.entity_to_output(stored))
+        Some(self.entity_to_output(stored))
     }
 
     /// Tally distinct entity types and their live-entity counts, ranked by
@@ -2013,7 +2034,6 @@ impl KnowledgeGraph {
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref())
-            .filter(|e| e.is_live())
         {
             *counts.entry(st.entity_type).or_insert(0) += 1;
         }
@@ -2076,7 +2096,7 @@ impl KnowledgeGraph {
                 .entity_slots
                 .get(slot as usize)
                 .and_then(|s| s.as_ref())
-                .filter(|e| e.is_live())
+                
             else {
                 continue;
             };
@@ -2136,7 +2156,6 @@ impl KnowledgeGraph {
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref())
-            .filter(|e| e.is_live())
         {
             if type_id.is_some_and(|tid| st.entity_type != tid) {
                 continue;
@@ -2360,7 +2379,6 @@ impl KnowledgeGraph {
             .entity_slots
             .iter()
             .filter_map(|s| s.as_ref())
-            .filter(|e| e.is_live())
         {
             let n = ids.len();
             ids.insert(st.name, n);

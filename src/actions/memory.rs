@@ -73,7 +73,7 @@ pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Strin
         let entities: Vec<crate::types::Entity> = graph
             .entity_slots
             .iter()
-            .filter_map(|s| s.as_ref().filter(|e| e.is_live()))
+            .filter_map(|s| s.as_ref())
             .filter(|e| entity_type.is_none_or(|t| graph.interner.lookup(e.entity_type) == t))
             .skip(offset)
             .take(limit)
@@ -86,7 +86,7 @@ pub fn handle_read_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Strin
         if matched.is_empty() && entity_type.is_none() {
             // Full read without type filter but with pagination — need all names.
             matched = graph.entity_slots.iter()
-                .filter_map(|s| s.as_ref().filter(|e| e.is_live()).map(|e| e.name))
+                .filter_map(|s| s.as_ref().map(|e| e.name))
                 .collect();
         }
         let relations: Vec<crate::types::Relation> = graph
