@@ -82,8 +82,12 @@ Entity(name, entityType, observations[])
   `"likes coffee"`, `"founded in 2021"`).
 
 All strings are **interned** on write — repeated values share storage. The
-search index tokenizes names, types, and observations for case-insensitive
-substring match with relevance ranking.
+search index tokenizes names, types, and observations (on whitespace) and
+matches a query against tokens **case-insensitively by prefix** — e.g. `"cof"`
+matches the token `"coffee"`, but `"ffee"` does not. Results are ranked by a
+simple relevance proxy: the number of token hits an entity accumulates for the
+query (higher is better). This is a token-hit count, **not** BM25 — there is no
+TF saturation, length normalization, or IDF weighting.
 
 ## Data structures & performance
 
@@ -91,7 +95,7 @@ substring match with relevance ranking.
 |-----------|---------------|-------|
 | String interning | Arena-backed `StringInterner` with capacity-graded growth | O(1) intern/lookup via `get_optional` |
 | Entity lookup | 4-shard open-addressing hash table with ctrl-byte probing (Swiss-table style) | L1-touch on probe; ~1/128 false-positive key compares |
-| Search | Inverted index with position-free substring search, BM25-style ranking | Incremental re-index on add/delete; no full rebuild |
+| Search | Inverted token index; case-insensitive prefix match, token-hit-count ranking | Incremental insert on add; `remove_entity` is a single retain pass |
 | Relation storage | Flat `Vec<StoredRelation>` (12 B/record) | Bulk iteration is a single cache-friendly linear scan |
 | Temporary maps/sets | `ahash::AHashMap` / `AHashSet` (not SipHash) | 2-5x faster hashing for BFS, adjacency, dedup |
 | Concurrency | `parking_lot::RwLock` (no poisoning, fair queuing) | ~30% faster uncontended; readers never block readers |
@@ -297,9 +301,9 @@ endpoints are in the returned entity page (internally consistent slice).
 
 #### `search_nodes`
 
-Relevance-ranked full-text search over entity names, types, and observation
-content (case-insensitive substring). Returns matching entities and relations
-connected to them. Results ordered by relevance score descending.
+Relevance-ranked search over entity names, types, and observation content
+(case-insensitive, per-token **prefix** match). Returns matching entities and
+relations connected to them. Results ordered by token-hit count descending.
 
 **Input:**
 ```json
@@ -614,32 +618,49 @@ Every mutation goes through this sequence **before** touching in-memory state:
 4. On flush: `BufWriter::flush` + `File::sync_all`
 
 This means a crash between steps 2 and 3 results in the record being replayed
-on next startup — the mutation is applied during replay. The log format is
+on next startup — the mutation is applied during replay.
+
+The file begins with an 8-byte magic header (`MCPMEMV1`). Each record that
+follows is:
 
 | Field | Size | Description |
 |-------|------|-------------|
-| CRC32 | 4 B | Checksum of data payload |
-| Kind  | 1 B | Record variant (CreateEntity, etc.) |
-| Len   | 4 B | Data payload length (LE, max 64 KiB) |
-| Data  | variable | Bincode-encoded payload |
+| Len   | 4 B | Total record length (LE) = 1 (kind) + payload bytes; capped at 1 MiB |
+| Kind  | 1 B | Record variant (CreateEntity, CreateRelation, AddObservations, …) |
+| Data  | variable | Hand-rolled length-prefixed payload (see `src/store.rs`) |
+
+Strings inside a payload are encoded as a `u16` little-endian byte length
+followed by the UTF-8 bytes (so any single string is at most 64 KiB).
+
+> **No per-record checksum.** Replay tolerates a torn trailing record (a
+> partial write at the tail is dropped), but it does not detect a corrupted
+> record in the middle of the log. Treat the file as trusted local storage.
 
 `compact` rewrites the log to contain only the minimal `CreateEntity` /
 `CreateRelation` records needed to reconstruct the current state.
 
+**Transactions.** Multi-record operations (currently `merge_entities`) wrap
+their records in a `TxnBegin` … `TxnCommit` pair. On replay, records inside a
+transaction are buffered and applied only when the commit is seen; an unclosed
+transaction (the process crashed mid-operation) is discarded wholesale, so the
+graph can never observe a half-applied merge.
+
 ## Development
 
 ```sh
-cargo test                           # 201 tests: unit + integration + fuzzy
+cargo test                           # unit + integration + fuzzy
 cargo clippy --all-targets
 cargo build --release                # LTO + fat + panic=abort
 cargo bench                          # criterion benchmarks
 ```
 
 The test suite includes:
-- **60 unit tests** — intern, search, protocol, store encode/decode, tools, server dispatch
-- **118 integration tests** — CRUD, persistence roundtrip, search, paths, export, concurrency,
-  RwLock proofs, and all 24 tool handlers
-- **23 fuzzy tests** — randomized CRUD sequences asserting graph invariants,
+- **Unit tests** — intern, search (incl. prefix-vs-substring behavior), protocol,
+  store encode/decode, tools, server dispatch
+- **Integration tests** — CRUD, persistence roundtrip, WAL-ordering and stale-temp
+  compaction regressions, transactional `merge_entities` crash-atomicity, search, paths,
+  export, concurrency, RwLock proofs, and all 24 tool handlers
+- **Fuzzy tests** — randomized CRUD sequences asserting graph invariants,
   Unicode/large-string stress, and concurrent mutation consistency
 
 ## License

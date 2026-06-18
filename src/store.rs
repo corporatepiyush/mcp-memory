@@ -14,6 +14,13 @@ pub enum RecordKind {
     DeleteEntity = 3,
     DeleteObservations = 4,
     DeleteRelation = 5,
+    /// Opens a transaction: records that follow are buffered on replay and only
+    /// applied once a matching [`RecordKind::TxnCommit`] is seen. An unclosed
+    /// transaction (no commit before EOF) is discarded — this is how
+    /// multi-record operations like `merge_entities` stay crash-atomic.
+    TxnBegin = 6,
+    /// Closes a transaction opened by [`RecordKind::TxnBegin`].
+    TxnCommit = 7,
 }
 
 impl RecordKind {
@@ -26,6 +33,8 @@ impl RecordKind {
             3 => RecordKind::DeleteEntity,
             4 => RecordKind::DeleteObservations,
             5 => RecordKind::DeleteRelation,
+            6 => RecordKind::TxnBegin,
+            7 => RecordKind::TxnCommit,
             _ => return None,
         })
     }

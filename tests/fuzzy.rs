@@ -113,7 +113,7 @@ fn test_random_crud_sequence_small() {
             0..=35 => {
                 let entity = random_entity(&mut rng);
                 if !live_names.contains(&entity.name) {
-                    let created = kg.create_entities(&[entity.clone()]).unwrap();
+                    let created = kg.create_entities(std::slice::from_ref(&entity)).unwrap();
                     if !created.is_empty() {
                         live_names.insert(entity.name.clone());
                     }
@@ -123,7 +123,7 @@ fn test_random_crud_sequence_small() {
                 if !live_names.is_empty() {
                     let delete_count = rng.random_range(1..=3.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
-                        .choose_multiple(&mut rng, delete_count)
+                        .sample(&mut rng, delete_count)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -141,7 +141,7 @@ fn test_random_crud_sequence_small() {
                     if from != to {
                         let rtype = random_name(&mut rng, 4);
                         let rel = Relation { from, to, relation_type: rtype };
-                        let created = kg.create_relations(&[rel.clone()]).unwrap();
+                        let created = kg.create_relations(std::slice::from_ref(&rel)).unwrap();
                         if !created.is_empty() {
                             all_relations.push(rel);
                         }
@@ -152,7 +152,7 @@ fn test_random_crud_sequence_small() {
                 if !all_relations.is_empty() {
                     let del_count = rng.random_range(1..=2.min(all_relations.len()));
                     let to_del: Vec<Relation> = all_relations.iter()
-                        .choose_multiple(&mut rng, del_count)
+                        .sample(&mut rng, del_count)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -182,7 +182,7 @@ fn test_random_crud_sequence_small() {
                     if !entity.observations.is_empty() {
                         let del_count = rng.random_range(1..=entity.observations.len().min(2));
                         let to_del: Vec<String> = entity.observations.iter()
-                            .choose_multiple(&mut rng, del_count)
+                            .sample(&mut rng, del_count)
                             .into_iter()
                             .cloned()
                             .collect();
@@ -224,17 +224,16 @@ fn test_random_persistence_roundtrip() {
         match op {
             0..=50 => {
                 let entity = random_entity(&mut rng);
-                if !live_names.contains(&entity.name) {
-                    if !kg.create_entities(&[entity.clone()]).unwrap().is_empty() {
+                if !live_names.contains(&entity.name)
+                    && !kg.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty() {
                         live_names.insert(entity.name.clone());
                     }
-                }
             }
             51..=70 => {
                 if !live_names.is_empty() {
                     let pick = rng.random_range(1..=2.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
-                        .choose_multiple(&mut rng, pick)
+                        .sample(&mut rng, pick)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -266,11 +265,10 @@ fn test_random_persistence_roundtrip() {
     // Phase 3: more mutations after replay
     for _ in 0..50 {
         let entity = random_entity(&mut rng);
-        if !live_names.contains(&entity.name) {
-            if !kg2.create_entities(&[entity.clone()]).unwrap().is_empty() {
+        if !live_names.contains(&entity.name)
+            && !kg2.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty() {
                 live_names.insert(entity.name.clone());
             }
-        }
     }
     check_invariants(&kg2, &live_names);
     drop(kg2);
@@ -365,7 +363,7 @@ fn test_stress_observations_churn() {
             if !entity.observations.is_empty() {
                 let del_n = rng.random_range(1..=entity.observations.len().min(3));
                 let to_del: Vec<String> = entity.observations
-                    .choose_multiple(&mut rng, del_n)
+                    .sample(&mut rng, del_n)
                     .cloned()
                     .collect();
                 kg.delete_observations(&name, &to_del).unwrap();
@@ -397,11 +395,10 @@ fn test_fuzzy_compact_preserves_invariants() {
     // Build up some state
     for _ in 0..80 {
         let entity = random_entity(&mut rng);
-        if !live_names.contains(&entity.name) {
-            if !kg.create_entities(&[entity.clone()]).unwrap().is_empty() {
+        if !live_names.contains(&entity.name)
+            && !kg.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty() {
                 live_names.insert(entity.name.clone());
             }
-        }
     }
 
     // Create some relations
@@ -417,7 +414,7 @@ fn test_fuzzy_compact_preserves_invariants() {
 
     // Delete some entities
     let to_delete: Vec<String> = live_names.iter()
-        .choose_multiple(&mut rng, 20)
+        .sample(&mut rng, 20)
         .into_iter()
         .cloned()
         .collect();
@@ -584,11 +581,10 @@ fn test_fuzzy_search_invariants() {
     // Create entities with varied content
     for _ in 0..100 {
         let entity = random_entity(&mut rng);
-        if !live_names.contains(&entity.name) {
-            if !kg.create_entities(&[entity.clone()]).unwrap().is_empty() {
+        if !live_names.contains(&entity.name)
+            && !kg.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty() {
                 live_names.insert(entity.name.clone());
             }
-        }
     }
 
     // Search with various queries and verify invariants
@@ -615,7 +611,7 @@ fn test_fuzzy_search_invariants() {
     }
 
     // open_nodes invariants
-    let test_names: Vec<String> = live_names.iter().cloned().take(5).collect();
+    let test_names: Vec<String> = live_names.iter().take(5).cloned().collect();
     let result = kg.open_nodes(&test_names);
     assert_eq!(result.entities.len(), test_names.len());
     let mut names: HashSet<&str> = HashSet::new();
@@ -852,7 +848,7 @@ fn test_fuzzy_relation_dedup() {
 
     // Create the same relation 100 times
     for _ in 0..100 {
-        let created = kg.create_relations(&[rel.clone()]).unwrap();
+        let created = kg.create_relations(std::slice::from_ref(&rel)).unwrap();
         if created.is_empty() {
             break;
         }
@@ -880,7 +876,7 @@ fn test_fuzzy_entity_dedup() {
     };
 
     for i in 0..100 {
-        let created = kg.create_entities(&[entity.clone()]).unwrap();
+        let created = kg.create_entities(std::slice::from_ref(&entity)).unwrap();
         if i == 0 {
             assert_eq!(created.len(), 1);
         } else {
@@ -893,7 +889,7 @@ fn test_fuzzy_entity_dedup() {
 
     // Delete and re-create — should work
     kg.delete_entities(&["UniqueEntity".into()]).unwrap();
-    let created = kg.create_entities(&[entity.clone()]).unwrap();
+    let created = kg.create_entities(&[entity]).unwrap();
     assert_eq!(created.len(), 1);
 
     cleanup(&path);
@@ -915,17 +911,16 @@ fn test_fuzzy_stats_invariants() {
         match op {
             0..=45 => {
                 let entity = random_entity(&mut rng);
-                if !live_names.contains(&entity.name) {
-                    if !kg.create_entities(&[entity.clone()]).unwrap().is_empty() {
+                if !live_names.contains(&entity.name)
+                    && !kg.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty() {
                         live_names.insert(entity.name.clone());
                     }
-                }
             }
             46..=65 => {
                 if !live_names.is_empty() {
                     let pick = rng.random_range(1..=3.min(live_names.len()));
                     let names: Vec<String> = live_names.iter()
-                        .choose_multiple(&mut rng, pick)
+                        .sample(&mut rng, pick)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -947,16 +942,15 @@ fn test_fuzzy_stats_invariants() {
                 // delete_observations
                 if !live_names.is_empty() {
                     let name = known_entity(&mut rng, &live_names.iter().cloned().collect::<Vec<_>>());
-                    if let Some(entity) = kg.get_entity(&name) {
-                        if !entity.observations.is_empty() {
+                    if let Some(entity) = kg.get_entity(&name)
+                        && !entity.observations.is_empty() {
                             let del_n = rng.random_range(1..=entity.observations.len().min(2));
                             let to_del: Vec<String> = entity.observations
-                                .choose_multiple(&mut rng, del_n)
+                                .sample(&mut rng, del_n)
                                 .cloned()
                                 .collect();
                             kg.delete_observations(&name, &to_del).unwrap();
                         }
-                    }
                 }
             }
         }
@@ -1056,7 +1050,7 @@ fn test_fuzzy_open_nodes_invariants() {
         // Build a request mixing real names and never-created ghosts.
         let pick = rng.random_range(0..=5.min(name_vec.len()));
         let mut request: Vec<String> = name_vec
-            .choose_multiple(&mut rng, pick)
+            .sample(&mut rng, pick)
             .cloned()
             .collect();
         // Number of ghosts to append.
@@ -1189,7 +1183,7 @@ fn test_fuzzy_reopen_after_each_mutation() {
             0..=45 => {
                 let entity = random_entity(&mut rng);
                 if !live_names.contains(&entity.name)
-                    && !kg.create_entities(&[entity.clone()]).unwrap().is_empty()
+                    && !kg.create_entities(std::slice::from_ref(&entity)).unwrap().is_empty()
                 {
                     live_names.insert(entity.name);
                 }
@@ -1198,7 +1192,7 @@ fn test_fuzzy_reopen_after_each_mutation() {
                 if !live_names.is_empty() {
                     let names: Vec<String> = live_names.iter().cloned().collect();
                     let victim = names[rng.random_range(0..names.len())].clone();
-                    kg.delete_entities(&[victim.clone()]).unwrap();
+                    kg.delete_entities(std::slice::from_ref(&victim)).unwrap();
                     live_names.remove(&victim);
                     // Cascade: relations touching the victim are gone.
                     relations.retain(|(f, t, _)| f != &victim && t != &victim);

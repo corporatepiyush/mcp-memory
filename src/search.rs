@@ -70,9 +70,13 @@ impl SearchIndex {
         self.entries.retain(|&(_, idx)| idx != entity_idx);
     }
 
-    /// Search for entities matching the query.
-    /// Uses binary search for exact token matches (O(log n + matches))
-    /// and falls back to prefix matching for partial queries.
+    /// Search for entities whose name/type/observation tokens match `query`
+    /// case-insensitively by **prefix** (`"cof"` matches `"coffee"`).
+    ///
+    /// Note: this is an O(n) scan over every index entry. The binary-search
+    /// step below only narrows exact-token hits, but the subsequent prefix scan
+    /// already covers those (an exact match is also a prefix match), so the scan
+    /// dominates — do not read the binary search as making this sublinear.
     pub fn search(&self, query: &str, interner: &crate::intern::StringInterner) -> Vec<u32> {
         if query.is_empty() || self.entries.is_empty() {
             return Vec::new();
@@ -398,6 +402,33 @@ mod tests {
         let interner = StringInterner::new();
         let index = SearchIndex::new();
         assert!(index.search_ranked("", &interner).is_empty());
+    }
+
+    #[test]
+    fn test_search_is_prefix_not_substring() {
+        let mut interner = StringInterner::new();
+        let mut index = SearchIndex::new();
+        let name = interner.intern("coffee");
+        let typ = interner.intern("drink");
+        index.index_entity(&mut interner, 0, name, typ, &[]);
+        // Prefix of a token matches.
+        assert_eq!(index.search("cof", &interner), vec![0]);
+        assert_eq!(index.search("coffee", &interner), vec![0]);
+        // Interior substrings do NOT match — this documents real behavior, not
+        // the "substring search" the docs once claimed.
+        assert!(index.search("ffee", &interner).is_empty());
+        assert!(index.search("offe", &interner).is_empty());
+    }
+
+    #[test]
+    fn test_search_ranked_is_prefix_not_substring() {
+        let mut interner = StringInterner::new();
+        let mut index = SearchIndex::new();
+        let name = interner.intern("coffee");
+        let typ = interner.intern("drink");
+        index.index_entity(&mut interner, 0, name, typ, &[]);
+        assert!(!index.search_ranked("cof", &interner).is_empty());
+        assert!(index.search_ranked("ffee", &interner).is_empty());
     }
 
     #[test]

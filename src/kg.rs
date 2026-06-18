@@ -29,6 +29,26 @@ unsafe fn prefetch_addr(addr: *const u8) {
 #[inline(always)]
 const unsafe fn prefetch_addr(_addr: *const u8) {}
 
+/// fsync the directory containing `path` so a rename/create inside it is durable.
+/// On platforms where a directory cannot be opened/synced this is a no-op.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = match dir {
+        Some(d) => d,
+        None => Path::new("."),
+    };
+    match std::fs::File::open(dir) {
+        Ok(f) => match f.sync_all() {
+            Ok(()) => Ok(()),
+            // Some filesystems disallow fsync on a directory handle; tolerate it.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(e) => Err(e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StoredEntity / StoredRelation – internal representations using StrId.
 // ---------------------------------------------------------------------------
@@ -426,58 +446,31 @@ impl KnowledgeGraph {
         let mut relations: Vec<StoredRelation> = Vec::with_capacity(64);
         let mut search = SearchIndex::new();
 
+        // Transaction buffer: while `Some`, records are accumulated and only
+        // applied on `TxnCommit`. An unclosed transaction at EOF is discarded,
+        // which is what makes multi-record operations (e.g. `merge_entities`)
+        // crash-atomic.
+        let mut pending: Option<Vec<(RecordKind, Vec<u8>)>> = None;
         store.replay(|kind, data| {
             match kind {
-                RecordKind::CreateEntity => {
-                    if let Some((name, etype, obs)) = store_enc::decode_create_entity(data) {
-                        Self::replay_create_entity(
-                            &mut interner, &mut entity_slots, &mut search, &mut name_table, name, etype, &obs,
-                        );
+                RecordKind::TxnBegin => pending = Some(Vec::new()),
+                RecordKind::TxnCommit => {
+                    if let Some(buffered) = pending.take() {
+                        for (k, d) in &buffered {
+                            Self::apply_record(
+                                *k, d, &mut interner, &mut entity_slots, &mut search,
+                                &mut name_table, &mut relations,
+                            );
+                        }
                     }
                 }
-                RecordKind::CreateRelation => {
-                    if let Some((from, to, rtype)) = store_enc::decode_create_relation(data) {
-                        let from_id = interner.intern(from);
-                        let to_id = interner.intern(to);
-                        let type_id = interner.intern(rtype);
-                        relations.push(StoredRelation {
-                            from: from_id,
-                            to: to_id,
-                            relation_type: type_id,
-                        });
-                    }
-                }
-                RecordKind::AddObservations => {
-                    if let Some((name, obs)) = store_enc::decode_add_observations(data) {
-                        Self::replay_add_observations(
-                            &mut interner, &mut entity_slots, &mut search, &mut name_table, name, &obs,
-                        );
-                    }
-                }
-                RecordKind::DeleteEntity => {
-                    if let Some(name) = store_enc::decode_delete_entity(data) {
-                        Self::replay_delete_entity(
-                            &mut interner, &mut entity_slots, &mut relations, &mut search, &mut name_table, name,
-                        );
-                    }
-                }
-                RecordKind::DeleteObservations => {
-                    if let Some((name, obs)) = store_enc::decode_delete_observations(data) {
-                        Self::replay_delete_observations(
-                            &mut interner, &mut entity_slots, &mut search, &mut name_table, name, &obs,
-                        );
-                    }
-                }
-                RecordKind::DeleteRelation => {
-                    if let Some((from, to, rtype)) = store_enc::decode_delete_relation(data) {
-                        let from_id = interner.intern(from);
-                        let to_id = interner.intern(to);
-                        let type_id = interner.intern(rtype);
-                        relations.retain(|r| {
-                            !(r.from == from_id && r.to == to_id && r.relation_type == type_id)
-                        });
-                    }
-                }
+                other => match pending.as_mut() {
+                    Some(buffered) => buffered.push((other, data.to_vec())),
+                    None => Self::apply_record(
+                        other, data, &mut interner, &mut entity_slots, &mut search,
+                        &mut name_table, &mut relations,
+                    ),
+                },
             }
         })?;
 
@@ -503,6 +496,74 @@ impl KnowledgeGraph {
     // -----------------------------------------------------------------------
     // Replay helpers (static to avoid borrow issues in the closure)
     // -----------------------------------------------------------------------
+
+    /// Apply one already-decoded log record to the in-memory collections.
+    /// Shared by direct replay and by transaction commit. `TxnBegin`/`TxnCommit`
+    /// are handled by the caller and are no-ops here.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_record(
+        kind: RecordKind,
+        data: &[u8],
+        interner: &mut StringInterner,
+        entity_slots: &mut Vec<Option<StoredEntity>>,
+        search: &mut SearchIndex,
+        name_table: &mut ShardedNameTable,
+        relations: &mut Vec<StoredRelation>,
+    ) {
+        match kind {
+            RecordKind::CreateEntity => {
+                if let Some((name, etype, obs)) = store_enc::decode_create_entity(data) {
+                    Self::replay_create_entity(
+                        interner, entity_slots, search, name_table, name, etype, &obs,
+                    );
+                }
+            }
+            RecordKind::CreateRelation => {
+                if let Some((from, to, rtype)) = store_enc::decode_create_relation(data) {
+                    let from_id = interner.intern(from);
+                    let to_id = interner.intern(to);
+                    let type_id = interner.intern(rtype);
+                    relations.push(StoredRelation {
+                        from: from_id,
+                        to: to_id,
+                        relation_type: type_id,
+                    });
+                }
+            }
+            RecordKind::AddObservations => {
+                if let Some((name, obs)) = store_enc::decode_add_observations(data) {
+                    Self::replay_add_observations(
+                        interner, entity_slots, search, name_table, name, &obs,
+                    );
+                }
+            }
+            RecordKind::DeleteEntity => {
+                if let Some(name) = store_enc::decode_delete_entity(data) {
+                    Self::replay_delete_entity(
+                        interner, entity_slots, relations, search, name_table, name,
+                    );
+                }
+            }
+            RecordKind::DeleteObservations => {
+                if let Some((name, obs)) = store_enc::decode_delete_observations(data) {
+                    Self::replay_delete_observations(
+                        interner, entity_slots, search, name_table, name, &obs,
+                    );
+                }
+            }
+            RecordKind::DeleteRelation => {
+                if let Some((from, to, rtype)) = store_enc::decode_delete_relation(data) {
+                    let from_id = interner.intern(from);
+                    let to_id = interner.intern(to);
+                    let type_id = interner.intern(rtype);
+                    relations.retain(|r| {
+                        !(r.from == from_id && r.to == to_id && r.relation_type == type_id)
+                    });
+                }
+            }
+            RecordKind::TxnBegin | RecordKind::TxnCommit => {}
+        }
+    }
 
     #[allow(clippy::ptr_arg)]
     fn replay_create_entity(
@@ -787,8 +848,18 @@ impl KnowledgeGraph {
             });
         }
 
-        // 2. Write to a temp file first
+        // 2. Write to a temp file first.
+        //    Remove any stale temp left by a previously-interrupted compact:
+        //    `BinaryStore::new` opens in append mode and only writes the MAGIC
+        //    header when the file does not already exist, so appending to a
+        //    leftover temp would produce a duplicated, header-corrupted log
+        //    once renamed over the real one (C1).
         let tmp_path = self.store.path().with_extension("tmp");
+        if let Err(e) = std::fs::remove_file(&tmp_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(MCSError::IoError(e));
+        }
         let mut tmp_store = BinaryStore::new(&tmp_path).map_err(MCSError::IoError)?;
         for entity in &create_entities {
             let mut buf = Vec::new();
@@ -805,8 +876,12 @@ impl KnowledgeGraph {
         tmp_store.flush_and_sync().map_err(MCSError::IoError)?;
         drop(tmp_store);
 
-        // 3. Atomically rename over the original (atomic on POSIX)
+        // 3. Atomically rename over the original (atomic on POSIX), then fsync
+        //    the containing directory so the rename itself is durable across a
+        //    crash — content swap is atomic, but the directory entry update is
+        //    not durable until the dir is synced (C2).
         std::fs::rename(&tmp_path, self.store.path()).map_err(MCSError::IoError)?;
+        sync_parent_dir(self.store.path()).map_err(MCSError::IoError)?;
 
         // 4. Rebuild the entire in-memory graph from the compacted log (M1/M2).
         //    Replaying into fresh structures reclaims the interner arena (stale
@@ -933,38 +1008,55 @@ impl KnowledgeGraph {
             .name_table
             .lookup(hash, name_id)
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
+        // Snapshot the current observations so we can compute the deduplicated
+        // additions *without* mutating in-memory state yet.
+        let existing: AHashSet<StrId> = self
+            .entity_slots
+            .get(slot as usize)
+            .and_then(|e| e.as_ref())
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?
+            .observations
+            .iter()
+            .copied()
+            .collect();
+
+        // Deduplicate against existing observations *and* within this batch, so
+        // the live result matches what replay (which dedups one-by-one) rebuilds.
+        let mut added = Vec::new();
+        let mut interned_added = Vec::new();
+        let mut seen: AHashSet<StrId> = AHashSet::new();
+        for content in contents {
+            let cid = self.interner.intern(content);
+            if existing.contains(&cid) || !seen.insert(cid) {
+                continue;
+            }
+            interned_added.push(cid);
+            added.push(content.clone());
+        }
+        if added.is_empty() {
+            return Ok(added);
+        }
+
+        // Write-ahead: the record must hit the log *before* any in-memory
+        // mutation, so a failed write leaves memory and disk in agreement (C3).
+        let mut buf = Vec::new();
+        store_enc::encode_add_observations(&mut buf, entity_name, &added)
+            .map_err(MCSError::IoError)?;
+        self.store.write_record(RecordKind::AddObservations, &buf)
+            .map_err(MCSError::IoError)?;
+
+        // Logged — now apply to in-memory state.
         let stored = self
             .entity_slots
             .get_mut(slot as usize)
             .and_then(|e| e.as_mut())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
+        stored.observations.extend_from_slice(&interned_added);
 
-        // Deduplicate new observations (P7) — use AHashSet for O(1) lookups
-        let existing: AHashSet<StrId> = stored.observations.iter().copied().collect();
-        let mut added = Vec::new();
-        let mut interned_added = Vec::new();
-        for content in contents {
-            let cid = self.interner.intern(content);
-            if existing.contains(&cid) {
-                continue;
-            }
-            stored.observations.push(cid);
-            interned_added.push(cid);
-            added.push(content.clone());
-        }
-        if !added.is_empty() {
-            // Write-ahead: log before re-indexing
-            let mut buf = Vec::new();
-            store_enc::encode_add_observations(&mut buf, entity_name, &added)
-                .map_err(MCSError::IoError)?;
-            self.store.write_record(RecordKind::AddObservations, &buf)
-                .map_err(MCSError::IoError)?;
-
-            // Incrementally index only the new observation tokens (P3) — no
-            // full remove + re-index of the whole entity.
-            self.search
-                .index_additional(&mut self.interner, slot, &interned_added);
-        }
+        // Incrementally index only the new observation tokens (P3) — no
+        // full remove + re-index of the whole entity.
+        self.search
+            .index_additional(&mut self.interner, slot, &interned_added);
         Ok(added)
     }
 
@@ -1011,20 +1103,27 @@ impl KnowledgeGraph {
             .name_table
             .lookup(hash, name_id)
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
-        let stored = self
-            .entity_slots
-            .get_mut(slot as usize)
-            .and_then(|e| e.as_mut())
+        // Confirm the slot is live before logging.
+        self.entity_slots
+            .get(slot as usize)
+            .and_then(|e| e.as_ref())
             .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
         let remove_ids: AHashSet<StrId> = observations.iter().map(|o| self.interner.intern(o)).collect();
-        stored.observations.retain(|o| !remove_ids.contains(o));
-        // Write-ahead: log before re-indexing
+
+        // Write-ahead: log before touching in-memory state (C3).
         let mut buf = Vec::new();
         store_enc::encode_delete_observations(&mut buf, entity_name, observations)
             .map_err(MCSError::IoError)?;
         self.store.write_record(RecordKind::DeleteObservations, &buf)
             .map_err(MCSError::IoError)?;
 
+        // Logged — now apply.
+        let stored = self
+            .entity_slots
+            .get_mut(slot as usize)
+            .and_then(|e| e.as_mut())
+            .ok_or_else(|| MCSError::InvalidParams(format!("Entity '{entity_name}' not found")))?;
+        stored.observations.retain(|o| !remove_ids.contains(o));
         self.search.remove_entity(slot);
         self.search
             .index_entity(&mut self.interner, slot, stored.name, stored.entity_type, &stored.observations);
@@ -1043,8 +1142,8 @@ impl KnowledgeGraph {
                 )
             })
             .collect();
-        self.relations
-            .retain(|r| !rels.contains(&(r.from, r.to, r.relation_type)));
+        // Write-ahead: log every deletion before mutating in-memory state (C3),
+        // so a failed write can't leave memory ahead of the log.
         for relation in relations {
             let mut buf = Vec::new();
             store_enc::encode_delete_relation(&mut buf, &relation.from, &relation.to, &relation.relation_type)
@@ -1052,6 +1151,8 @@ impl KnowledgeGraph {
             self.store.write_record(RecordKind::DeleteRelation, &buf)
                 .map_err(MCSError::IoError)?;
         }
+        self.relations
+            .retain(|r| !rels.contains(&(r.from, r.to, r.relation_type)));
         Ok(())
     }
 
@@ -1539,8 +1640,13 @@ impl KnowledgeGraph {
     /// Merge `source` entity into `target` entity. All observations from
     /// source are moved to target (deduplicated), all relations involving
     /// source are redirected to target (deduplicated), and source is then
-    /// deleted. Every underlying mutation goes through the write-ahead log.
-    /// Caller is responsible for `flush_and_sync()`.
+    /// deleted.
+    ///
+    /// The whole merge is **atomic**: every sub-record is written to the log
+    /// inside a single `TxnBegin`…`TxnCommit` transaction *before* any in-memory
+    /// mutation. A failed or torn write therefore leaves both memory and the
+    /// log untouched (an uncommitted transaction is discarded on replay), so the
+    /// graph can never observe a half-applied merge. Caller flushes.
     pub fn merge_entities(&mut self, source: &str, target: &str) -> Result<serde_json::Value> {
         if source == target {
             return Err(MCSError::InvalidParams(
@@ -1550,54 +1656,96 @@ impl KnowledgeGraph {
         self.lookup_live_slot(source).ok_or_else(|| {
             MCSError::InvalidParams(format!("Source entity '{source}' not found"))
         })?;
-        self.lookup_live_slot(target).ok_or_else(|| {
+        let target_slot = self.lookup_live_slot(target).ok_or_else(|| {
             MCSError::InvalidParams(format!("Target entity '{target}' not found"))
         })?;
 
         let source_entity = self.get_entity(source).unwrap();
         let moved_obs_count = source_entity.observations.len();
-
-        // Move observations to target (dedup via add_observations).
-        let added_count = if !source_entity.observations.is_empty() {
-            self.add_observations(target, &source_entity.observations)?.len()
-        } else {
-            0
-        };
-
-        // Redirect relations: create new ones with target in place of source.
         let source_id = self.interner.get_optional(source).unwrap();
-        let source_rels: Vec<Relation> = self
-            .relations
+        let target_id = self.interner.get_optional(target).unwrap();
+
+        // Observations to move: dedup against target's existing set and within
+        // the batch (matching what `add_observations` would have done).
+        let target_existing: AHashSet<StrId> = self.entity_slots[target_slot as usize]
+            .as_ref()
+            .unwrap()
+            .observations
             .iter()
-            .filter(|r| r.from == source_id || r.to == source_id)
-            .filter_map(|r| {
-                let new_from = if r.from == source_id {
-                    target
-                } else {
-                    self.interner.lookup(r.from)
-                };
-                let new_to = if r.to == source_id {
-                    target
-                } else {
-                    self.interner.lookup(r.to)
-                };
-                // Skip self-loops — they are meaningless after redirect.
-                if new_from == new_to {
-                    None
-                } else {
-                    Some(Relation {
-                        from: new_from.to_string(),
-                        to: new_to.to_string(),
-                        relation_type: self.interner.lookup(r.relation_type).to_string(),
-                    })
-                }
-            })
+            .copied()
             .collect();
+        let mut obs_seen: AHashSet<StrId> = AHashSet::new();
+        let mut obs_to_add: Vec<String> = Vec::new();
+        for o in &source_entity.observations {
+            if let Some(oid) = self.interner.get_optional(o)
+                && !target_existing.contains(&oid)
+                && obs_seen.insert(oid)
+            {
+                obs_to_add.push(o.clone());
+            }
+        }
 
-        let redirected = self.create_relations(&source_rels)?.len() as u32;
+        // Relations to redirect: replace source with target, drop self-loops,
+        // and dedup against existing relations and within the batch.
+        let existing_rels: AHashSet<(StrId, StrId, StrId)> =
+            self.relations.iter().map(|r| (r.from, r.to, r.relation_type)).collect();
+        let mut rel_seen: AHashSet<(StrId, StrId, StrId)> = AHashSet::new();
+        let mut redirect: Vec<Relation> = Vec::new();
+        for r in &self.relations {
+            if r.from != source_id && r.to != source_id {
+                continue;
+            }
+            let new_from = if r.from == source_id { target_id } else { r.from };
+            let new_to = if r.to == source_id { target_id } else { r.to };
+            if new_from == new_to {
+                continue; // self-loop after redirect
+            }
+            let key = (new_from, new_to, r.relation_type);
+            if existing_rels.contains(&key) || !rel_seen.insert(key) {
+                continue;
+            }
+            redirect.push(Relation {
+                from: self.interner.lookup(new_from).to_string(),
+                to: self.interner.lookup(new_to).to_string(),
+                relation_type: self.interner.lookup(r.relation_type).to_string(),
+            });
+        }
 
-        // Delete source entity (also removes stale relations).
-        self.delete_entities(&[source.to_string()])?;
+        let added_count = obs_to_add.len();
+        let redirected = redirect.len() as u32;
+
+        // Build every record up front so writing is the only fallible step.
+        let mut records: Vec<(RecordKind, Vec<u8>)> = Vec::new();
+        if !obs_to_add.is_empty() {
+            let mut buf = Vec::new();
+            store_enc::encode_add_observations(&mut buf, target, &obs_to_add)
+                .map_err(MCSError::IoError)?;
+            records.push((RecordKind::AddObservations, buf));
+        }
+        for r in &redirect {
+            let mut buf = Vec::new();
+            store_enc::encode_create_relation(&mut buf, &r.from, &r.to, &r.relation_type)
+                .map_err(MCSError::IoError)?;
+            records.push((RecordKind::CreateRelation, buf));
+        }
+        let mut del_buf = Vec::new();
+        store_enc::encode_delete_entity(&mut del_buf, source).map_err(MCSError::IoError)?;
+        records.push((RecordKind::DeleteEntity, del_buf));
+
+        // Write-ahead, transactionally: begin, all records, commit.
+        self.store.write_record(RecordKind::TxnBegin, &[]).map_err(MCSError::IoError)?;
+        for (kind, data) in &records {
+            self.store.write_record(*kind, data).map_err(MCSError::IoError)?;
+        }
+        self.store.write_record(RecordKind::TxnCommit, &[]).map_err(MCSError::IoError)?;
+
+        // Logged and committed — now apply to in-memory state (no more logging).
+        for (kind, data) in &records {
+            Self::apply_record(
+                *kind, data, &mut self.interner, &mut self.entity_slots, &mut self.search,
+                &mut self.name_table, &mut self.relations,
+            );
+        }
 
         Ok(serde_json::json!({
             "source": source,
@@ -1622,10 +1770,10 @@ impl KnowledgeGraph {
         let mut visited: AHashSet<StrId> = AHashSet::new();
         let mut queue: VecDeque<(StrId, u32)> = VecDeque::new();
         for name in names {
-            if let Some(id) = self.interner.get_optional(name) {
-                if visited.insert(id) {
-                    queue.push_back((id, 0));
-                }
+            if let Some(id) = self.interner.get_optional(name)
+                && visited.insert(id)
+            {
+                queue.push_back((id, 0));
             }
         }
         // Build an undirected adjacency map once.
@@ -1668,6 +1816,7 @@ impl KnowledgeGraph {
 
     /// Recursive DFS helper — collects every simple path from `current` to
     /// `target` up to `max_depth` hops, capped at `max_paths` results.
+    #[allow(clippy::too_many_arguments)]
     fn dfs_all_paths(
         adj: &AHashMap<StrId, Vec<StrId>>,
         current: StrId,

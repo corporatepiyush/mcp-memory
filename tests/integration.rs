@@ -104,8 +104,8 @@ fn test_create_entity_with_observations() {
 fn test_create_duplicate_entity_skipped() {
     let (mut kg, path) = setup();
     let e = alice();
-    let first = kg.create_entities(&[e.clone()]).unwrap();
-    let second = kg.create_entities(&[e.clone()]).unwrap();
+    let first = kg.create_entities(std::slice::from_ref(&e)).unwrap();
+    let second = kg.create_entities(&[e]).unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 0);
     cleanup(&path);
@@ -146,8 +146,8 @@ fn test_create_duplicate_relation_skipped() {
     let (mut kg, path) = setup();
     kg.create_entities(&[alice(), bob()]).unwrap();
     let r = knows_alice();
-    let first = kg.create_relations(&[r.clone()]).unwrap();
-    let second = kg.create_relations(&[r.clone()]).unwrap();
+    let first = kg.create_relations(std::slice::from_ref(&r)).unwrap();
+    let second = kg.create_relations(&[r]).unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 0);
     cleanup(&path);
@@ -400,7 +400,7 @@ fn test_get_entity_existing() {
 
 #[test]
 fn test_get_entity_nonexistent() {
-    let (mut kg, path) = setup();
+    let (kg, path) = setup();
     let entity = kg.get_entity("Ghost");
     assert!(entity.is_none());
     cleanup(&path);
@@ -652,7 +652,7 @@ fn test_search_relations_no_match() {
 
 #[test]
 fn test_search_relations_empty_graph() {
-    let (mut kg, path) = setup();
+    let (kg, path) = setup();
     let rels = kg.search_relations(None, None, None);
     assert!(rels.is_empty());
     cleanup(&path);
@@ -798,7 +798,7 @@ fn test_compact_then_replay() {
     drop(kg);
 
     // Re-create KG from the compacted log.
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     let entity = kg2.get_entity("Alice").unwrap();
     assert_eq!(entity.name, "Alice");
     assert_eq!(entity.entity_type, "person");
@@ -831,7 +831,7 @@ fn test_persistence_roundtrip() {
     drop(kg);
 
     // Reload from disk.
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     let graph = kg2.read_graph();
     assert_eq!(graph.entities.len(), 3);
     assert_eq!(graph.relations.len(), 3);
@@ -848,7 +848,7 @@ fn test_persistence_add_observations() {
     kg.add_observations("Alice", &["new obs".into()]).unwrap();
     drop(kg);
 
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     let entity = kg2.get_entity("Alice").unwrap();
     assert_eq!(entity.observations.len(), 3);
     cleanup(&path);
@@ -861,7 +861,7 @@ fn test_persistence_delete_entity() {
     kg.delete_entities(&["Alice".into()]).unwrap();
     drop(kg);
 
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     assert!(kg2.get_entity("Alice").is_none());
     assert!(kg2.get_entity("Bob").is_some());
     cleanup(&path);
@@ -874,7 +874,7 @@ fn test_persistence_delete_observations() {
     kg.delete_observations("Alice", &["likes coffee".into()]).unwrap();
     drop(kg);
 
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     let entity = kg2.get_entity("Alice").unwrap();
     assert_eq!(entity.observations, vec!["works at acme"]);
     cleanup(&path);
@@ -888,7 +888,7 @@ fn test_persistence_delete_relations() {
     kg.delete_relations(&[knows_alice()]).unwrap();
     drop(kg);
 
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     let rels = kg2.search_relations(None, None, None);
     assert!(rels.is_empty());
     cleanup(&path);
@@ -903,7 +903,7 @@ fn test_persistence_mixed_operations() {
     kg.delete_entities(&["Bob".into()]).unwrap();
     drop(kg);
 
-    let mut kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let kg2 = KnowledgeGraph::new(Path::new(&path)).unwrap();
     assert!(kg2.get_entity("Alice").is_some());
     assert!(kg2.get_entity("Bob").is_none());
 
@@ -960,7 +960,7 @@ fn test_large_observations() {
     let entity = Entity {
         name: "Big".into(),
         entity_type: "test".into(),
-        observations: obs.clone(),
+        observations: obs,
     };
     kg.create_entities(&[entity]).unwrap();
     let e = kg.get_entity("Big").unwrap();
@@ -1806,7 +1806,7 @@ fn test_batch_get_entities_mixed() {
 
 #[test]
 fn test_batch_get_entities_empty_list() {
-    let (mut kg, path) = setup();
+    let (kg, path) = setup();
     let results = kg.batch_get_entities(&[]);
     assert!(results.is_empty());
     cleanup(&path);
@@ -1866,5 +1866,197 @@ fn test_find_all_paths_bounded_by_depth() {
     assert!(result.is_err());
     let paths = kg.find_all_paths("Alice", "Charlie", 2, 50).unwrap();
     assert_eq!(paths.len(), 1);
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the durability / WAL-ordering fixes.
+// ---------------------------------------------------------------------------
+
+/// C1: a compact that crashed after writing+syncing its temp file but before
+/// the rename leaves a complete, valid prior log at `<path>.tmp`. The next
+/// compact must NOT append to it (that would duplicate the whole graph once
+/// renamed over the real log).
+#[test]
+fn test_compact_with_stale_tmp_does_not_duplicate() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+    kg.flush_and_sync().unwrap();
+    let before = serde_json::to_string(&kg.read_graph_view()).unwrap();
+
+    // Simulate the leftover temp: a byte-for-byte copy of the current log.
+    let tmp = Path::new(&path).with_extension("tmp");
+    std::fs::copy(&path, &tmp).unwrap();
+
+    kg.compact().unwrap();
+
+    let after = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    assert_eq!(before, after, "compact must not duplicate live state");
+    assert!(!tmp.exists(), "compact should consume its temp file");
+
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(
+        before,
+        serde_json::to_string(&reopened.read_graph_view()).unwrap(),
+        "compacted log on disk must replay to the same graph"
+    );
+    cleanup(&path);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// C1: a garbage temp file (no magic, junk bytes) must be discarded, not
+/// appended to, by the next compact.
+#[test]
+fn test_compact_overwrites_garbage_tmp() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    kg.flush_and_sync().unwrap();
+    let before = serde_json::to_string(&kg.read_graph_view()).unwrap();
+
+    let tmp = Path::new(&path).with_extension("tmp");
+    std::fs::write(&tmp, b"not a valid mcpmem log at all \x00\x01\x02").unwrap();
+
+    kg.compact().unwrap();
+
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(before, serde_json::to_string(&reopened.read_graph_view()).unwrap());
+    cleanup(&path);
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// C3 + divergence: duplicate observations within a single `add_observations`
+/// batch must be collapsed so the live result equals what replay rebuilds
+/// (replay dedups one-by-one).
+#[test]
+fn test_add_observations_dedup_within_batch_matches_replay() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[Entity {
+        name: "E".into(),
+        entity_type: "t".into(),
+        observations: vec![],
+    }])
+    .unwrap();
+
+    let added = kg
+        .add_observations("E", &["x".to_string(), "x".to_string(), "y".to_string()])
+        .unwrap();
+    assert_eq!(added, vec!["x".to_string(), "y".to_string()]);
+    kg.flush_and_sync().unwrap();
+
+    let live = kg.get_entity("E").unwrap().observations;
+    assert_eq!(live, vec!["x".to_string(), "y".to_string()]);
+
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(
+        reopened.get_entity("E").unwrap().observations,
+        live,
+        "live state must equal replayed state"
+    );
+    cleanup(&path);
+}
+
+/// C3: after `delete_observations`, the in-memory graph and the replayed log
+/// must agree (the log write happens before the in-memory mutation).
+#[test]
+fn test_delete_observations_consistent_after_reopen() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice()]).unwrap();
+    kg.delete_observations("Alice", &["likes coffee".to_string()]).unwrap();
+    kg.flush_and_sync().unwrap();
+
+    let live = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(live, serde_json::to_string(&reopened.read_graph_view()).unwrap());
+    assert!(!kg
+        .get_entity("Alice")
+        .unwrap()
+        .observations
+        .contains(&"likes coffee".to_string()));
+    cleanup(&path);
+}
+
+/// C3: after `delete_relations`, in-memory and replayed log must agree.
+#[test]
+fn test_delete_relations_consistent_after_reopen() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob()]).unwrap();
+    kg.create_relations(&[knows_alice()]).unwrap();
+    kg.delete_relations(&[knows_alice()]).unwrap();
+    kg.flush_and_sync().unwrap();
+
+    let live = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(live, serde_json::to_string(&reopened.read_graph_view()).unwrap());
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// D2: merge_entities is crash-atomic via a TxnBegin..TxnCommit transaction.
+// ---------------------------------------------------------------------------
+
+/// A committed merge replays from disk to exactly the live in-memory state.
+#[test]
+fn test_merge_entities_atomic_replay() {
+    let (mut kg, path) = setup();
+    kg.create_entities(&[alice(), bob(), charlie()]).unwrap();
+    kg.create_relations(&[knows_alice(), knows_bob()]).unwrap();
+
+    kg.merge_entities("Alice", "Bob").unwrap();
+    kg.flush_and_sync().unwrap();
+
+    let live = serde_json::to_string(&kg.read_graph_view()).unwrap();
+    let reopened = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert_eq!(live, serde_json::to_string(&reopened.read_graph_view()).unwrap());
+    cleanup(&path);
+}
+
+/// An UNcommitted transaction in the log (a merge that crashed before its
+/// TxnCommit) is discarded wholesale on replay — none of its records apply.
+#[test]
+fn test_uncommitted_transaction_discarded() {
+    use mcp_memory::store::{self, BinaryStore, RecordKind};
+
+    let (_, path) = setup();
+    {
+        let mut store = BinaryStore::new(Path::new(&path)).unwrap();
+        // A durable, committed entity outside the transaction.
+        let mut buf = Vec::new();
+        store::encode_create_entity(&mut buf, "Keeper", "person", &[]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf).unwrap();
+
+        // A transaction that never commits: begin + a create, then nothing.
+        store.write_record(RecordKind::TxnBegin, &[]).unwrap();
+        let mut buf2 = Vec::new();
+        store::encode_create_entity(&mut buf2, "Ghost", "person", &[]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf2).unwrap();
+        store.flush_and_sync().unwrap();
+    }
+
+    let kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    assert!(kg.get_entity("Keeper").is_some(), "committed record must survive");
+    assert!(kg.get_entity("Ghost").is_none(), "uncommitted record must be discarded");
+    cleanup(&path);
+}
+
+/// A properly committed transaction in the log applies all of its records.
+#[test]
+fn test_committed_transaction_applied() {
+    use mcp_memory::store::{self, BinaryStore, RecordKind};
+
+    let (_, path) = setup();
+    {
+        let mut store = BinaryStore::new(Path::new(&path)).unwrap();
+        store.write_record(RecordKind::TxnBegin, &[]).unwrap();
+        let mut buf = Vec::new();
+        store::encode_create_entity(&mut buf, "Ghost", "person", &["boo".into()]).unwrap();
+        store.write_record(RecordKind::CreateEntity, &buf).unwrap();
+        store.write_record(RecordKind::TxnCommit, &[]).unwrap();
+        store.flush_and_sync().unwrap();
+    }
+
+    let kg = KnowledgeGraph::new(Path::new(&path)).unwrap();
+    let ghost = kg.get_entity("Ghost").expect("committed record must apply");
+    assert_eq!(ghost.observations, vec!["boo".to_string()]);
     cleanup(&path);
 }

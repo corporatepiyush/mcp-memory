@@ -46,7 +46,7 @@ mod tests {
         assert_eq!(MCSError::MethodNotFound("".into()).error_code(), -32601);
         assert_eq!(MCSError::InvalidParams("".into()).error_code(), -32602);
         assert_eq!(MCSError::MemoryError("".into()).error_code(), -32000);
-        assert_eq!(MCSError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "")).error_code(), -32003);
+        assert_eq!(MCSError::IoError(std::io::Error::other("")).error_code(), -32003);
         assert_eq!(MCSError::JsonError(serde_json::from_str::<()>("invalid").unwrap_err()).error_code(), -32700);
     }
 }

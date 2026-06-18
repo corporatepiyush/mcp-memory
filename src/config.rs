@@ -42,14 +42,14 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        let args = Args::parse_from(&["mcp-memory"]);
+        let args = Args::parse_from(["mcp-memory"]);
         let cfg = Config::from_args(&args).unwrap();
         assert_eq!(cfg.memory_file_path, "memory.mcpmem");
     }
 
     #[test]
     fn test_config_custom_path() {
-        let args = Args::parse_from(&["mcp-memory", "--memory-file", "/tmp/test.jsonl"]);
+        let args = Args::parse_from(["mcp-memory", "--memory-file", "/tmp/test.jsonl"]);
         let cfg = Config::from_args(&args).unwrap();
         assert_eq!(cfg.memory_file_path, "/tmp/test.jsonl");
     }

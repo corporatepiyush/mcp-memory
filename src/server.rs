@@ -90,9 +90,7 @@ pub fn process_value(value: Value, kg: &RwLock<KnowledgeGraph>) -> Option<Value>
         Err(e) => return Some(to_value(parse_error(e.to_string()))),
     };
     // Notifications never get a reply, even on error.
-    if req.id.is_none() {
-        return None;
-    }
+    req.id.as_ref()?;
     let response = match process_request(&req, kg) {
         Ok(result) => JsonRpcResponse::success(req.id, result),
         Err(e) => JsonRpcResponse::error(req.id, e.error_code(), e.to_string()),
