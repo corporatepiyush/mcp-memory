@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::prelude::*;
 
+use mcp_memory::config::Durability;
 use mcp_memory::kg::{Direction, GraphHandle, KnowledgeGraph};
 use mcp_memory::types::{Entity, Relation};
 
@@ -426,7 +427,7 @@ fn benches(c: &mut Criterion) {
     let gh_path = format!("{}/mcp_gh_{}_{}", std::env::temp_dir().display(), std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst));
     {
         // Populate a graph via GraphHandle
-        let gh = GraphHandle::new(Path::new(&gh_path)).unwrap();
+        let gh = GraphHandle::new(Path::new(&gh_path), Durability::Async).unwrap();
         let entities: Vec<Entity> = (0..10_000)
             .map(|i| Entity {
                 name: format!("entity_{i}"),
@@ -441,7 +442,7 @@ fn benches(c: &mut Criterion) {
         }
         drop(gh); // sync snapshot
     }
-    let gh = GraphHandle::new(Path::new(&gh_path)).unwrap();
+    let gh = GraphHandle::new(Path::new(&gh_path), Durability::Async).unwrap();
 
     c.bench_function("dispatch_read_graph", |b| {
         let line = r#"{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"read_graph","arguments":{}}}"#;
@@ -463,7 +464,7 @@ fn benches(c: &mut Criterion) {
     // the effect of cache + fast serialization vs. the old path.
     let small_path = format!("{}/mcp_gh_small_{}_{}", std::env::temp_dir().display(), std::process::id(), SEQ.fetch_add(1, Ordering::SeqCst));
     {
-        let gh = GraphHandle::new(Path::new(&small_path)).unwrap();
+        let gh = GraphHandle::new(Path::new(&small_path), Durability::Async).unwrap();
         let entities: Vec<Entity> = (0..100)
             .map(|i| Entity {
                 name: format!("entity_{i}"),
@@ -475,7 +476,7 @@ fn benches(c: &mut Criterion) {
         wg.create_entities(&entities).unwrap();
         wg.flush_and_sync().unwrap();
     }
-    let gh_small = GraphHandle::new(Path::new(&small_path)).unwrap();
+    let gh_small = GraphHandle::new(Path::new(&small_path), Durability::Async).unwrap();
 
     c.bench_function("dispatch_read_graph_small_100", |b| {
         let line = r#"{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"read_graph","arguments":{}}}"#;

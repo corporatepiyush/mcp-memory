@@ -40,6 +40,10 @@ cargo install mcp-memory
 mcp-memory -f ./my-memory.bin --transport stdio
 ```
 
+The official JS reference server is available as
+[`@modelcontextprotocol/server-memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory)
+on npm.
+
 The memory file path is resolved in order:
 
 1. `--memory-file` / `-f` flag
@@ -114,30 +118,30 @@ Results are from a MacBook Pro (Apple M4 Pro, 24 GB). Run `cargo bench` on your 
 
 | Operation | Latency | Ops/sec | vs JS |
 |-----------|---------|---------|-------|
-| `get_entity` (Swiss-table lookup) | 153 ns | 6,500,000 | **~325,000×** |
-| `batch_get_entities` (10 names) | 1.6 µs | 610,000 | — |
-| `graph_stats` (linear scan) | 38 µs | 26,000 | — |
-| `describe_entity` (entity + incident relations) | 60 µs | 16,700 | — |
-| `entity_type_counts` (linear scan + hash tally) | 91 µs | 11,000 | — |
+| `get_entity` (Swiss-table lookup) | 152 ns | 6,600,000 | **~330,000×** |
+| `batch_get_entities` (10 names) | 1.6 µs | 620,000 | — |
+| `graph_stats` (linear scan) | 28 µs | 36,000 | — |
+| `describe_entity` (entity + incident relations) | 61 µs | 16,400 | — |
+| `entity_type_counts` (linear scan + hash tally) | 85 µs | 11,800 | — |
 | `search_relations` (from/to filter, linear scan) | 39 µs | 25,600 | — |
-| `relation_type_counts` (linear scan + hash tally) | 262 µs | 3,800 | — |
-| `neighbors` depth=1 | 391 µs | 2,600 | — |
-| `read_graph_filtered` (type + pagination) | 479 µs | 2,100 | — |
-| `open_nodes` (10 names + incident relations) | 677 µs | 1,500 | — |
-| `read_graph_json_direct` (hand-rolled JSON) | 613 µs | 1,630 | — |
-| `search_nodes_filtered` (prefix index + filter) | 1.23 ms | 810 | — |
-| `find_all_paths` (DFS, maxDepth=4, maxPaths=10) | 1.68 ms | 595 | — |
-| `find_path` (BFS shortest path) | 2.5 ms | 400 | — |
-| `extract_subgraph` depth=1 (3 seeds) | 2.7 ms | 375 | — |
-| `extract_subgraph` depth=2 (3 seeds) | 2.8 ms | 350 | — |
-| `neighbors` depth=2 | 4.7 ms | 210 | — |
+| `relation_type_counts` (linear scan + hash tally) | 257 µs | 3,900 | — |
+| `neighbors` depth=1 | 389 µs | 2,600 | — |
+| `read_graph_filtered` (type + pagination) | 474 µs | 2,100 | — |
+| `open_nodes` (10 names + incident relations) | 678 µs | 1,500 | — |
+| `read_graph_json_direct` (hand-rolled JSON) | 616 µs | 1,620 | — |
+| `search_nodes_filtered` (prefix index + filter) | 1.24 ms | 810 | — |
+| `find_all_paths` (DFS, maxDepth=4, maxPaths=10) | 1.83 ms | 545 | — |
+| `find_path` (BFS shortest path) | 2.48 ms | 400 | — |
+| `extract_subgraph` depth=1 (3 seeds) | 2.66 ms | 375 | — |
+| `extract_subgraph` depth=2 (3 seeds) | 2.82 ms | 355 | — |
+| `neighbors` depth=2 | 4.82 ms | 210 | — |
 | `dispatch_read_graph` (10K ents, warm cache) | 1.46 ms | 685 | **~7×** |
-| `dispatch_search_nodes` (10K ents, broad query) | 2.87 ms | 349 | **~4×** |
+| `dispatch_search_nodes` (10K ents, broad query) | 2.85 ms | 350 | **~4×** |
 | `read_graph` (full dump via serde) | 10.6 ms | 94 | **~5×** |
 | `search_nodes` (prefix index, broad query) | 12.2 ms | 82 | **~4×** |
-| `export_json` | 21.3 ms | 47 | — |
-| `export_dot` | 18.6 ms | 54 | — |
-| `export_mermaid` | 23.1 ms | 43 | — |
+| `export_json` | 20.6 ms | 49 | — |
+| `export_dot` | 18.0 ms | 56 | — |
+| `export_mermaid` | 22.1 ms | 45 | — |
 
 `dispatch_*` benchmarks measure the **full server pipeline** (JSON-RPC parsing, handler dispatch, response serialization). `read_graph_json_direct` is the hand-rolled serialization used by the dispatch path, 2.1× faster than `serde_json`.
 
@@ -145,18 +149,23 @@ Results are from a MacBook Pro (Apple M4 Pro, 24 GB). Run `cargo bench` on your 
 
 | Operation | Latency | Ops/sec | vs JS |
 |-----------|---------|---------|-------|
-| `add_observations` (10 new, single entity) | 15 µs | 67,000 | — |
-| `merge_entities` (source→target full merge) | 25 µs | 40,000 | — |
-| `delete_observations` (per entity) | 11 µs | 90,000 | — |
-| `delete_relations` (100 tuples) | 70 µs | 14,000 | — |
-| `delete_entities` (100 names + cascade) | 130 µs | 7,700 | — |
-| `create_relations` (100 new) | 135 µs | 7,400 | — |
-| `create_entities` (100 new) | 450 µs | 2,200 | — |
-| `upsert_existing` (100 merges) | 360 µs | 2,800 | — |
-| `upsert_new` (100 creates) | 480 µs | 2,100 | — |
-| `compact` (after 50 deletes) | 12.5 ms | 80 | — |
+| `add_observations` (10 new, single entity) | 16 µs | 64,000 | — |
+| `merge_entities` (source→target full merge) | 36 µs | 28,000 | — |
+| `delete_observations` (per entity) | 7.3 µs | 136,000 | — |
+| `delete_relations` (100 tuples) | 70 µs | 14,300 | — |
+| `delete_entities` (100 names + cascade) | 12.6 ms | 80 | — |
+| `create_relations` (100 new) | 125 µs | 8,000 | — |
+| `create_entities` (100 new) | 398 µs | 2,500 | — |
+| `upsert_existing` (100 merges) | 287 µs | 3,500 | — |
+| `upsert_new` (100 creates) | 382 µs | 2,600 | — |
+| `compact` (after 50 deletes) | 12.1 ms | 83 | — |
 
 Writes flush to the kernel buffer immediately (~µs) and defer `fsync` to a background thread that syncs once per second. This eliminates write latency spikes from disk I/O.
+
+`delete_entities` now triggers automatic compaction when >30% of entity slots are
+tombstones — the latency increase (130 µs → 12.6 ms) on the 100-entity bench is
+the cost of rewriting the log + interner. On a warm graph with fewer deletes the
+cost stays under 200 µs.
 
 ### Why is Rust faster than the JS reference?
 
@@ -701,21 +710,23 @@ the last flushed state on replay. A background thread calls `fsync` every
 1 second to make the state OS-crash safe. This design trades up to 1 second of
 data loss on OS crash for sub-100 µs write latency.
 
-The file begins with an 8-byte magic header (`MCPMEMV1`). Each record that
-follows is:
+The file begins with an 8-byte magic header (`MCPMEMV1` or `MCPMEMV2`).
+`MCPMEMV2` adds a CRC32 footer on each record for corruption detection.
+Each record that follows is:
 
 | Field | Size | Description |
 |-------|------|-------------|
-| Len   | 4 B | Total record length (LE) = 1 (kind) + payload bytes; capped at 1 MiB |
+| Len   | 4 B | Total record length (LE) = 1 (kind) + payload bytes + 4 (CRC32); capped at 1 MiB |
 | Kind  | 1 B | Record variant (CreateEntity, CreateRelation, AddObservations, …) |
 | Data  | variable | Hand-rolled length-prefixed payload (see `src/store.rs`) |
+| CRC32 | 4 B | CRC32 (IEEE) of Data field (only in `MCPMEMV2` files) |
 
 Strings inside a payload are encoded as a `u16` little-endian byte length
 followed by the UTF-8 bytes (so any single string is at most 64 KiB).
 
-> **No per-record checksum.** Replay tolerates a torn trailing record (a
-> partial write at the tail is dropped), but it does not detect a corrupted
-> record in the middle of the log. Treat the file as trusted local storage.
+> **No per-record checksum.** Replay detects corruptions via a CRC32 footer on each record. Old-format
+> files (magic `MCPMEMV1`) are replayed without CRC check; new files use magic
+> `MCPMEMV2`.
 
 `compact` rewrites the log to contain only the minimal `CreateEntity` /
 `CreateRelation` records needed to reconstruct the current state.

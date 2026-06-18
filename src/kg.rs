@@ -8,6 +8,7 @@ use arc_swap::ArcSwap;
 
 use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
 
+use crate::config::Durability;
 use crate::errors::{MCSError, Result};
 use crate::intern::{StrId, StringInterner};
 use crate::types::{Entity, Relation, KnowledgeGraphOut};
@@ -1613,6 +1614,20 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Compact if the tombstones / deleted-string waste exceeds a heuristic
+    /// threshold — otherwise do nothing.
+    pub fn compact_if_needed(&mut self) -> Result<()> {
+        // When more than 30% of entity slots are tombstones, compaction is
+        // likely to reclaim significant interner arena space that is only
+        // reachable from deleted entities. The check is O(1).
+        let total = self.entity_slots.len();
+        let tombstones = self.free_slots.len();
+        if total > 16 && tombstones * 10 > total * 3 {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
     // ---- Public API with write-ahead log (C1) and error propagation ----
 
     pub fn create_entities(&mut self, entities: &[Entity]) -> Result<Vec<Entity>> {
@@ -1847,6 +1862,7 @@ impl KnowledgeGraph {
         for list in self.adjacency.values_mut() {
             list.retain(|(to, _)| !deleted_ids.contains(to));
         }
+        self.compact_if_needed()?;
         Ok(())
     }
 
@@ -2554,6 +2570,8 @@ impl KnowledgeGraph {
             self.adjacency.entry(to_id).or_default().push((from_id, type_id));
         }
 
+        self.compact_if_needed()?;
+
         Ok(serde_json::json!({
             "source": source,
             "target": target,
@@ -2788,6 +2806,7 @@ pub struct GraphHandle {
     sync_notify: Arc<(StdMutex<bool>, Condvar)>,
     /// Signal the background sync thread to stop. Set on `Drop`.
     stop_sync: Arc<AtomicBool>,
+    durability: Durability,
 }
 
 /// RAII guard that publishes a fresh [`ReadSnapshot`] on drop.
@@ -2796,6 +2815,7 @@ pub struct WriteGuard<'a> {
     snapshot: &'a ArcSwap<ReadSnapshot>,
     read_cache: &'a ArcSwap<Option<Arc<str>>>,
     sync_notify: &'a (StdMutex<bool>, Condvar),
+    durability: Durability,
     did_publish: bool,
 }
 
@@ -2804,7 +2824,11 @@ impl WriteGuard<'_> {
     /// Invalidates the serialized read cache. Flushes the WAL to kernel buffer
     /// (the background sync thread in [`GraphHandle`] handles the actual `fsync`).
     pub fn publish(&mut self) {
-        if let Err(e) = self.guard.flush() {
+        if self.durability.is_sync() {
+            if let Err(e) = self.guard.flush_and_sync() {
+                tracing::error!("WAL sync failed: {e}");
+            }
+        } else if let Err(e) = self.guard.flush() {
             tracing::error!("WAL flush failed: {e}");
         }
         let snap = Arc::new(self.guard.snapshot());
@@ -2861,7 +2885,7 @@ impl GraphHandle {
     /// Open or create the graph at `path`, seeding the initial snapshot.
     /// Spawns a background thread that `fsync`s the WAL so that write handlers
     /// never block on disk I/O.
-    pub fn new(path: &Path) -> std::io::Result<Self> {
+    pub fn new(path: &Path, durability: Durability) -> std::io::Result<Self> {
         let kg = KnowledgeGraph::new(path)?;
         let snapshot = Arc::new(kg.snapshot());
         // Clone the shared sync slot before moving `kg` into the Mutex. The slot
@@ -2926,6 +2950,7 @@ impl GraphHandle {
             read_cache: ArcSwap::new(Arc::new(None)),
             sync_notify,
             stop_sync,
+            durability,
         })
     }
 
@@ -2954,6 +2979,7 @@ impl GraphHandle {
             snapshot: &self.snapshot,
             read_cache: &self.read_cache,
             sync_notify: &self.sync_notify,
+            durability: self.durability,
             did_publish: false,
         }
     }

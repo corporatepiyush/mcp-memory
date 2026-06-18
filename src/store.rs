@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 const MAGIC: &[u8; 8] = b"MCPMEMV1";
+const MAGIC_CRC: &[u8; 8] = b"MCPMEMV2";
 const MAX_RECORD_BYTES: u32 = 1 << 20;
 
 #[repr(u8)]
@@ -46,6 +47,9 @@ impl RecordKind {
 pub struct BinaryStore {
     writer: BufWriter<File>,
     path: PathBuf,
+    /// Whether this store writes CRC32 footers on each record.
+    /// `true` for new files (magic `MCPMEMV2`); `false` for legacy V1 files.
+    has_crc: bool,
     /// Shared cell holding the *current* file handle for the background sync
     /// thread to `fsync`, without holding any lock. It is updated every time the
     /// underlying file is (re)opened — notably by `compact`/`reopen_truncated`,
@@ -75,7 +79,7 @@ impl BinaryStore {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .read(false)
+            .read(true)
             .open(path)?;
 
         let handle = Arc::new(file.try_clone()?);
@@ -86,22 +90,48 @@ impl BinaryStore {
             }
             None => Arc::new(ArcSwap::new(handle)),
         };
-        let mut writer = BufWriter::with_capacity(65536, file);
 
-        if !exists {
-            writer.write_all(MAGIC)?;
-            writer.flush()?;
-        }
+        // Determine CRC support and open the write handle.
+        let (has_crc, file) = if !exists {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(false)
+                .open(path)?;
+            let mut w = BufWriter::with_capacity(65536, f);
+            w.write_all(MAGIC_CRC)?;
+            w.flush()?;
+            (true, w.into_inner().map_err(|e| e.into_error())?)
+        } else {
+            // Probe the existing file's magic to determine CRC support.
+            let probe_file = OpenOptions::new().read(true).open(path)?;
+            let mut probe = [0u8; 8];
+            let has_crc = match std::io::BufReader::new(&probe_file).read_exact(&mut probe) {
+                Ok(()) => &probe == MAGIC_CRC,
+                _ => false,
+            };
+            drop(probe_file);
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(false)
+                .open(path)?;
+            (has_crc, f)
+        };
+
+        let writer = BufWriter::with_capacity(65536, file);
 
         Ok(Self {
             writer,
             path: path.to_path_buf(),
+            has_crc,
             sync_slot,
         })
     }
 
     pub fn write_record(&mut self, kind: RecordKind, payload: &[u8]) -> std::io::Result<()> {
-        let total_len = 4 + 1 + payload.len();
+        let crc_len: usize = if self.has_crc { 4 } else { 0 };
+        let total_len = 4 + 1 + payload.len() + crc_len;
         if total_len as u32 > MAX_RECORD_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -111,6 +141,10 @@ impl BinaryStore {
         self.writer.write_all(&(total_len as u32).to_le_bytes())?;
         self.writer.write_all(&[kind as u8])?;
         self.writer.write_all(payload)?;
+        if self.has_crc {
+            let crc = crc32fast::hash(payload);
+            self.writer.write_all(&crc.to_le_bytes())?;
+        }
         Ok(())
     }
 
@@ -148,14 +182,18 @@ impl BinaryStore {
         let mut magic = [0u8; 8];
 
         match reader.read_exact(&mut magic) {
-            Ok(()) => {
-                if &magic != MAGIC {
-                    return Ok(());
-                }
-            }
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         }
+
+        let has_crc = if &magic == MAGIC_CRC {
+            true
+        } else if &magic == MAGIC {
+            false
+        } else {
+            return Ok(());
+        };
 
         let mut payload_buf = Vec::with_capacity(4096);
 
@@ -173,7 +211,13 @@ impl BinaryStore {
                     format!("Invalid record length: {total_len}"),
                 ));
             }
-            let payload_len = total_len - 5;
+            let payload_len = if has_crc {
+                total_len.checked_sub(5 + 4).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Record too short for CRC")
+                })?
+            } else {
+                total_len - 5
+            };
 
             // A crash can leave a record's length prefix written but its body
             // only partially flushed. Treat a short read on the kind/payload as
@@ -194,6 +238,22 @@ impl BinaryStore {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(e) => return Err(e),
+                }
+            }
+
+            // Verify CRC32 for V2 records. A mismatch is treated as a torn
+            // tail (stop cleanly) rather than a hard corruption error.
+            if has_crc {
+                let mut crc_buf = [0u8; 4];
+                match reader.read_exact(&mut crc_buf) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+                let expected = u32::from_le_bytes(crc_buf);
+                if crc32fast::hash(&payload_buf) != expected {
+                    tracing::warn!("CRC mismatch at offset — torn tail detected, stopping replay");
+                    return Ok(());
                 }
             }
 
@@ -222,9 +282,10 @@ impl BinaryStore {
         // not the truncated-away one (D1).
         self.sync_slot.store(Arc::new(file.try_clone()?));
         let mut writer = BufWriter::with_capacity(65536, file);
-        writer.write_all(MAGIC)?;
+        writer.write_all(MAGIC_CRC)?;
         writer.flush()?;
         self.writer = writer;
+        self.has_crc = true;
         Ok(())
     }
 }

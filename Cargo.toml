@@ -24,6 +24,7 @@ ahash = "0.8"
 parking_lot = "0.12"
 arc-swap = "1.7"
 crossbeam-channel = "0.5"
+crc32fast = "1.4"
 axum = "0.8"
 futures = "0.3"
 

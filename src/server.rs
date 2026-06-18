@@ -199,7 +199,7 @@ pub struct MCPServer {
 impl MCPServer {
     pub fn new(config: Config) -> Result<Self> {
         let path = Path::new(&config.memory_file_path);
-        let kg = GraphHandle::new(path).map_err(MCSError::IoError)?;
+        let kg = GraphHandle::new(path, config.durability).map_err(MCSError::IoError)?;
 
         Ok(Self {
             _config: Arc::new(config),
@@ -387,6 +387,7 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Durability;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -395,7 +396,7 @@ mod tests {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = format!("/tmp/mcp_mem_test_{pid}_{seq}.bin");
-        let kg = GraphHandle::new(Path::new(&path)).unwrap();
+        let kg = GraphHandle::new(Path::new(&path), Durability::Async).unwrap();
         (Arc::new(kg), path)
     }
 
