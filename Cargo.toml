@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted in SQLite with FTS5 search"
