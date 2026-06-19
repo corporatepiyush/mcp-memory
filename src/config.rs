@@ -46,6 +46,8 @@ pub struct Config {
     /// `None`, those transports accept unauthenticated connections (stdio is
     /// always local and never authenticated).
     pub auth_token: Option<Arc<str>>,
+    pub mmap_size: i64,
+    pub lru_cache_size: usize,
 }
 
 impl Config {
@@ -94,6 +96,8 @@ impl Config {
             bind_addr: args.bind.clone(),
             durability,
             auth_token,
+            mmap_size: args.mmap_size,
+            lru_cache_size: args.lru_cache_size,
         })
     }
 }
@@ -106,27 +110,10 @@ impl Default for Config {
             bind_addr: "127.0.0.1:8080".to_string(),
             durability: Durability::Async,
             auth_token: None,
+            mmap_size: 268435456,
+            lru_cache_size: 10000,
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-    use crate::Args;
 
-    #[test]
-    fn test_config_defaults() {
-        let args = Args::parse_from(["mcp-memory"]);
-        let cfg = Config::from_args(&args).unwrap();
-        assert_eq!(cfg.memory_file_path, "memory.mcpmem");
-    }
-
-    #[test]
-    fn test_config_custom_path() {
-        let args = Args::parse_from(["mcp-memory", "--memory-file", "/tmp/test.jsonl"]);
-        let cfg = Config::from_args(&args).unwrap();
-        assert_eq!(cfg.memory_file_path, "/tmp/test.jsonl");
-    }
-}

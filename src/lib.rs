@@ -2,12 +2,9 @@ pub mod actions;
 pub mod config;
 pub mod errors;
 pub mod http;
-pub mod intern;
 pub mod kg;
 pub mod protocol;
-pub mod search;
 pub mod server;
-pub mod store;
 pub mod tools;
 pub mod types;
 
@@ -32,7 +29,7 @@ pub enum Transport {
 
 #[derive(Parser, Debug)]
 #[command(name = "MCP Memory Server")]
-#[command(about = "Knowledge graph memory server for MCP — entities, relations, and observations persisted via binary log", long_about = None)]
+#[command(about = "Knowledge graph memory server for MCP — entities, relations, and observations persisted in SQLite with FTS5 search", long_about = None)]
 pub struct Args {
     /// Path to the memory file
     #[arg(short = 'f', long = "memory-file")]
@@ -60,4 +57,12 @@ pub struct Args {
     /// file is rejected (fail closed). Ignored if `--auth-token` is set.
     #[arg(long = "auth-token-file")]
     pub auth_token_file: Option<String>,
+
+    /// SQLite mmap size in bytes (default: 256 MiB).
+    #[arg(long = "mmap-size", default_value_t = 268435456)]
+    pub mmap_size: i64,
+
+    /// Entity-metadata LRU cache capacity (0 = unbounded).
+    #[arg(long = "lru-cache-size", default_value_t = 10000)]
+    pub lru_cache_size: usize,
 }

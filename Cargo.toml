@@ -3,13 +3,13 @@ name = "mcp-memory"
 version = "2.0.0"
 edition = "2024"
 authors = ["Piyush"]
-description = "MCP server for knowledge graph memory — entities, relations, and observations persisted via custom binary log"
+description = "MCP server for knowledge graph memory — entities, relations, and observations persisted in SQLite with FTS5 search"
 license = "Apache-2.0"
 repository = "https://github.com/corporatepiyush/mcp-memory"
 readme = "README.md"
-keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent"]
-categories = ["database-implementations", "command-line-utilities"]
-exclude = ["/target", "PERF_OPTIMIZATION_PLAN.md", "OPTIMIZATION_PLAN.md", "REVIEW_MEMORY_IO_CONCURRENCY.md", "*.bin"]
+keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent", "sqlite"]
+categories = ["command-line-utilities"]
+exclude = ["/target", "*.mcpmem"]
 
 [dependencies]
 tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "net"] }
@@ -20,36 +20,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-ahash = "0.8"
 parking_lot = "0.12"
-arc-swap = "1.7"
-crossbeam-channel = "0.5"
-crc32fast = "1.4"
+rustc-hash = "2.1"
 axum = "0.8"
 futures = "0.3"
 subtle = "2.6"
-
-[features]
-# Pad/align the hot in-memory records (StoredEntity, StoredRelation) to
-# cache-line-friendly sizes so individual records never straddle a 64-byte
-# line. Helps point lookups/mutations (and any future atomic fields, which
-# would otherwise risk x86 split-locks) at the cost of extra memory and a
-# wider stride on bulk scans. Off by default — enable and benchmark on the
-# target box before adopting (`cargo bench --features cache_align`).
-cache_align = []
+lru = "0.12"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
-rand = "0.10"
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+tokio = { version = "1.41", features = ["process"] }
 
 [[bin]]
 name = "mcp-memory"
 path = "src/main.rs"
 
-[[bench]]
-name = "graph_bench"
-harness = false
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
 
 [profile.release]
 opt-level = 3

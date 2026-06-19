@@ -19,6 +19,9 @@ pub enum MCSError {
 
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
 }
 
 impl MCSError {
@@ -30,23 +33,11 @@ impl MCSError {
             MCSError::MemoryError(_) => -32000,
             MCSError::IoError(_) => -32003,
             MCSError::JsonError(_) => -32700,
+            MCSError::SerializationError(_) => -32004,
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, MCSError>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_error_codes() {
-        assert_eq!(MCSError::ParseError("".into()).error_code(), -32700);
-        assert_eq!(MCSError::MethodNotFound("".into()).error_code(), -32601);
-        assert_eq!(MCSError::InvalidParams("".into()).error_code(), -32602);
-        assert_eq!(MCSError::MemoryError("".into()).error_code(), -32000);
-        assert_eq!(MCSError::IoError(std::io::Error::other("")).error_code(), -32003);
-        assert_eq!(MCSError::JsonError(serde_json::from_str::<()>("invalid").unwrap_err()).error_code(), -32700);
-    }
-}

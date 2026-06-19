@@ -5,7 +5,12 @@
 *~
 *.bin
 
+# TidesDB data directories (the default store path and any *.mcpmem dir)
+/memory.mcpmem/
+*.mcpmem/
+
 # Local design notes, plans, and reviews (not for the published crate)
 PERF_OPTIMIZATION_PLAN.md
 OPTIMIZATION_PLAN.md
 REVIEW_MEMORY_IO_CONCURRENCY.md
+new arch plan.md

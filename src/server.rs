@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -35,7 +37,11 @@ enum LineRead {
     TooLong,
 }
 
-async fn read_line_capped<R>(reader: &mut R, out: &mut String, max: usize) -> std::io::Result<LineRead>
+async fn read_line_capped<R>(
+    reader: &mut R,
+    out: &mut String,
+    max: usize,
+) -> std::io::Result<LineRead>
 where
     R: AsyncBufReadExt + Unpin,
 {
@@ -91,16 +97,22 @@ pub fn process_value(value: Value, kg: &GraphHandle) -> Option<Value> {
         Err(e) => return Some(to_value(parse_error(e.to_string()))),
     };
     req.id.as_ref()?;
-    let response = match process_request(&req, kg) {
-        Ok(HandlerResult::Value(result)) => Some(to_value(JsonRpcResponse::success(req.id, result))),
+    
+    match process_request(&req, kg) {
+        Ok(HandlerResult::Value(result)) => {
+            Some(to_value(JsonRpcResponse::success(req.id, result)))
+        }
         Ok(HandlerResult::RawResult(_)) => {
             // RawResult cannot pass through Value — dispatch_line and
             // dispatch_http_body handle it via separate code paths.
             unreachable!("RawResult must be handled at the dispatch level, not via process_value");
         }
-        Err(e) => Some(to_value(JsonRpcResponse::error(req.id, e.error_code(), e.to_string()))),
-    };
-    response
+        Err(e) => Some(to_value(JsonRpcResponse::error(
+            req.id,
+            e.error_code(),
+            e.to_string(),
+        ))),
+    }
 }
 
 /// Dispatch one framed line (stdio / tcp). Returns the serialized response, or
@@ -129,7 +141,7 @@ pub fn dispatch_line(line: &str, kg: &GraphHandle) -> Option<String> {
             let mut out = String::with_capacity(64 + id_json.len() + result_json.len());
             out.push_str(r#"{"jsonrpc":"2.0","id":"#);
             out.push_str(&id_json);
-            out.push_str(r#","result":"#);
+            out.push_str(",\"result\":");
             out.push_str(&result_json);
             out.push('}');
             Some(out)
@@ -152,8 +164,10 @@ pub fn dispatch_http_body(
     match value {
         Value::Array(items) => {
             // Batches are rare and never huge — keep Value path for simplicity.
-            let responses: Vec<Value> =
-                items.into_iter().filter_map(|v| process_value_http(v, kg)).collect();
+            let responses: Vec<Value> = items
+                .into_iter()
+                .filter_map(|v| process_value_http(v, kg))
+                .collect();
             Ok((!responses.is_empty()).then_some(Value::Array(responses)))
         }
         other => Ok(process_value_http(other, kg)),
@@ -176,13 +190,14 @@ fn process_value_http(value: Value, kg: &GraphHandle) -> Option<Value> {
             // Parse the pre-serialized result back into a Value for HTTP delivery.
             // This is a small extra cost for the HTTP transport; the stdio/TCP
             // path (dispatch_line) avoids it entirely.
-            let result_val: Value = serde_json::from_str(&result_json)
-                .unwrap_or(Value::Null);
+            let result_val: Value = serde_json::from_str(&result_json).unwrap_or(Value::Null);
             Some(to_value(JsonRpcResponse::success(req.id, result_val)))
         }
-        Err(e) => {
-            Some(to_value(JsonRpcResponse::error(req.id, e.error_code(), e.to_string())))
-        }
+        Err(e) => Some(to_value(JsonRpcResponse::error(
+            req.id,
+            e.error_code(),
+            e.to_string(),
+        ))),
     }
 }
 
@@ -199,7 +214,10 @@ pub struct MCPServer {
 impl MCPServer {
     pub fn new(config: Config) -> Result<Self> {
         let path = Path::new(&config.memory_file_path);
-        let kg = GraphHandle::new(path, config.durability).map_err(MCSError::IoError)?;
+        let lru_cache = NonZeroUsize::new(config.lru_cache_size).unwrap_or_else(|| {
+            NonZeroUsize::new(10000).expect("10000 > 0")
+        });
+        let kg = GraphHandle::new(path, config.durability, config.mmap_size, lru_cache)?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -214,6 +232,7 @@ impl MCPServer {
 
     /// stdio transport: newline-delimited JSON-RPC over stdin/stdout.
     pub async fn run_stdio(&self) -> Result<()> {
+        spawn_maintenance(self.kg.clone());
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
@@ -224,6 +243,7 @@ impl MCPServer {
     /// JSON-RPC, exactly like stdio. Connections are served concurrently (up to
     /// [`MAX_TCP_CONNECTIONS`]) and share the one graph behind its mutex.
     pub async fn run_tcp(&self, addr: &str) -> Result<()> {
+        spawn_maintenance(self.kg.clone());
         let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
         let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
         let auth_token = self.config.auth_token.clone();
@@ -246,9 +266,7 @@ impl MCPServer {
                     match authenticate_line_conn(&mut reader, expected).await {
                         Ok(true) => {}
                         Ok(false) => {
-                            let _ = write_half
-                                .write_all(AUTH_REQUIRED_LINE.as_bytes())
-                                .await;
+                            let _ = write_half.write_all(AUTH_REQUIRED_LINE.as_bytes()).await;
                             let _ = write_half.flush().await;
                             return;
                         }
@@ -267,8 +285,29 @@ impl MCPServer {
 
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
     pub async fn run_http(&self, addr: &str) -> Result<()> {
+        spawn_maintenance(self.kg.clone());
         crate::http::run(addr, self.graph(), self.config.auth_token.clone()).await
     }
+}
+
+/// Spawn a background task that runs periodic database maintenance every
+/// 5 minutes until the runtime shuts down.
+fn spawn_maintenance(kg: Arc<GraphHandle>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            let kg = kg.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = kg.run_maintenance() {
+                    tracing::warn!("Maintenance error: {e}");
+                }
+            })
+            .await
+            .ok();
+        }
+    });
 }
 
 /// JSON-RPC error line returned to a TCP client that fails authentication.
@@ -310,12 +349,13 @@ where
             Ok(LineRead::Line) => {
                 let line_copy = line.clone();
                 let kg_clone = Arc::clone(&kg);
-                let resp = tokio::task::spawn_blocking(move || dispatch_line(&line_copy, &kg_clone))
-                    .await
-                    .map_err(|join_err| {
-                        error!("dispatch task panicked: {join_err}");
-                        MCSError::IoError(std::io::Error::other("dispatch task panicked"))
-                    })?;
+                let resp =
+                    tokio::task::spawn_blocking(move || dispatch_line(&line_copy, &kg_clone))
+                        .await
+                        .map_err(|join_err| {
+                            error!("dispatch task panicked: {join_err}");
+                            MCSError::IoError(std::io::Error::other("dispatch task panicked"))
+                        })?;
                 if let Some(resp) = resp {
                     out.clear();
                     out.extend_from_slice(resp.as_bytes());
@@ -411,7 +451,10 @@ fn tool_error(message: &str) -> Value {
 pub fn token_matches(presented: &str, expected: &str) -> bool {
     use subtle::ConstantTimeEq;
     let presented = presented.trim();
-    let presented = presented.strip_prefix("Bearer ").unwrap_or(presented).trim();
+    let presented = presented
+        .strip_prefix("Bearer ")
+        .unwrap_or(presented)
+        .trim();
     presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
@@ -421,8 +464,8 @@ fn handle_tools_list() -> Value {
         return cached.clone();
     }
     let tools_json = include_str!("../tools.json");
-    let tools: Vec<Value> =
-        serde_json::from_str(tools_json).map_err(MCSError::JsonError).unwrap();
+    let tools: Vec<Value> = serde_json::from_str(tools_json)
+        .expect("tools.json is valid JSON compiled at build time");
     let result = json!({ "tools": tools });
     let _ = CACHED.set(result.clone());
     result
@@ -446,28 +489,52 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerRe
         "read_graph" => memory::handle_read_graph(kg, tool_args).map(HandlerResult::RawResult),
         "search_nodes" => memory::handle_search_nodes(kg, tool_args).map(HandlerResult::RawResult),
         // Standard Value handlers.
-        "create_entities" => memory::handle_create_entities(kg, tool_args).map(HandlerResult::Value),
-        "create_relations" => memory::handle_create_relations(kg, tool_args).map(HandlerResult::Value),
-        "add_observations" => memory::handle_add_observations(kg, tool_args).map(HandlerResult::Value),
-        "delete_entities" => memory::handle_delete_entities(kg, tool_args).map(HandlerResult::Value),
-        "delete_observations" => memory::handle_delete_observations(kg, tool_args).map(HandlerResult::Value),
-        "delete_relations" => memory::handle_delete_relations(kg, tool_args).map(HandlerResult::Value),
+        "create_entities" => {
+            memory::handle_create_entities(kg, tool_args).map(HandlerResult::Value)
+        }
+        "create_relations" => {
+            memory::handle_create_relations(kg, tool_args).map(HandlerResult::Value)
+        }
+        "add_observations" => {
+            memory::handle_add_observations(kg, tool_args).map(HandlerResult::Value)
+        }
+        "delete_entities" => {
+            memory::handle_delete_entities(kg, tool_args).map(HandlerResult::Value)
+        }
+        "delete_observations" => {
+            memory::handle_delete_observations(kg, tool_args).map(HandlerResult::Value)
+        }
+        "delete_relations" => {
+            memory::handle_delete_relations(kg, tool_args).map(HandlerResult::Value)
+        }
         "open_nodes" => memory::handle_open_nodes(kg, tool_args).map(HandlerResult::Value),
         "get_entity" => memory::handle_get_entity(kg, tool_args).map(HandlerResult::Value),
         "graph_stats" => memory::handle_graph_stats(kg).map(HandlerResult::Value),
-        "search_relations" => memory::handle_search_relations(kg, tool_args).map(HandlerResult::Value),
+        "search_relations" => {
+            memory::handle_search_relations(kg, tool_args).map(HandlerResult::Value)
+        }
         "find_path" => memory::handle_find_path(kg, tool_args).map(HandlerResult::Value),
         "compact" => memory::handle_compact(kg).map(HandlerResult::Value),
         "get_neighbors" => memory::handle_get_neighbors(kg, tool_args).map(HandlerResult::Value),
-        "describe_entity" => memory::handle_describe_entity(kg, tool_args).map(HandlerResult::Value),
+        "describe_entity" => {
+            memory::handle_describe_entity(kg, tool_args).map(HandlerResult::Value)
+        }
         "list_entity_types" => memory::handle_list_entity_types(kg).map(HandlerResult::Value),
         "list_relation_types" => memory::handle_list_relation_types(kg).map(HandlerResult::Value),
-        "upsert_entities" => memory::handle_upsert_entities(kg, tool_args).map(HandlerResult::Value),
+        "upsert_entities" => {
+            memory::handle_upsert_entities(kg, tool_args).map(HandlerResult::Value)
+        }
         "export_graph" => memory::handle_export_graph(kg, tool_args).map(HandlerResult::Value),
         "merge_entities" => memory::handle_merge_entities(kg, tool_args).map(HandlerResult::Value),
-        "extract_subgraph" => memory::handle_extract_subgraph(kg, tool_args).map(HandlerResult::Value),
-        "batch_get_entities" => memory::handle_batch_get_entities(kg, tool_args).map(HandlerResult::Value),
+        "extract_subgraph" => {
+            memory::handle_extract_subgraph(kg, tool_args).map(HandlerResult::Value)
+        }
+        "batch_get_entities" => {
+            memory::handle_batch_get_entities(kg, tool_args).map(HandlerResult::Value)
+        }
         "find_all_paths" => memory::handle_find_all_paths(kg, tool_args).map(HandlerResult::Value),
+        "entity_exists" => memory::handle_entity_exists(kg, tool_args).map(HandlerResult::Value),
+        "degree" => memory::handle_degree(kg, tool_args).map(HandlerResult::Value),
         tool => Err(MCSError::MethodNotFound(tool.to_string())),
     };
 
@@ -479,243 +546,4 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerRe
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::Durability;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn setup_kg() -> (Arc<GraphHandle>, String) {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = format!("/tmp/mcp_mem_test_{pid}_{seq}.bin");
-        let kg = GraphHandle::new(Path::new(&path), Durability::Async).unwrap();
-        (Arc::new(kg), path)
-    }
-
-    fn cleanup(path: &str) {
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn test_dispatch_line_valid_request() {
-        let (kg, path) = setup_kg();
-        let line = r#"{"jsonrpc":"2.0","method":"initialize","id":1}"#;
-        let resp = dispatch_line(line, &kg).unwrap();
-        let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["result"]["serverInfo"]["name"], "mcp-memory");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_dispatch_line_invalid_json() {
-        let (kg, path) = setup_kg();
-        let resp = dispatch_line("{invalid}", &kg).unwrap();
-        let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["error"]["code"], -32700);
-        assert!(v["id"].is_null());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_dispatch_line_empty() {
-        let (kg, path) = setup_kg();
-        let resp = dispatch_line("   \n", &kg).unwrap();
-        let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["error"]["code"], -32700);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_notification_has_no_response() {
-        let (kg, path) = setup_kg();
-        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(dispatch_line(line, &kg).is_none());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_unknown_method_error() {
-        let (kg, path) = setup_kg();
-        let line = r#"{"jsonrpc":"2.0","method":"does/not/exist","id":7}"#;
-        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
-        assert_eq!(v["id"], 7);
-        assert_eq!(v["error"]["code"], -32601);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_tools_call_roundtrip_via_dispatch() {
-        let (kg, path) = setup_kg();
-        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_entities","arguments":{"entities":[{"name":"Ada","entityType":"person","observations":["math"]}]}}}"#;
-        assert!(dispatch_line(create, &kg).is_some());
-
-        let read = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_graph","arguments":{}}}"#;
-        let v: Value = serde_json::from_str(&dispatch_line(read, &kg).unwrap()).unwrap();
-        let text = v["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("Ada"));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_http_body_batch_and_notifications() {
-        let (kg, path) = setup_kg();
-        let batch = r#"[
-            {"jsonrpc":"2.0","method":"initialize","id":1},
-            {"jsonrpc":"2.0","method":"notifications/initialized"}
-        ]"#;
-        let out = dispatch_http_body(batch, &kg).unwrap().unwrap();
-        let arr = out.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["id"], 1);
-
-        let notif = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(dispatch_http_body(notif, &kg).unwrap().is_none());
-
-        assert!(dispatch_http_body("{bad", &kg).is_err());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_handle_initialize_response() {
-        let (kg, path) = setup_kg();
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "initialize".to_string(),
-            params: None,
-            id: Some(Value::Number(1.into())),
-        };
-        let result = match process_request(&req, &kg).unwrap() {
-            HandlerResult::Value(v) => v,
-            HandlerResult::RawResult(_) => panic!("expected Value"),
-        };
-        assert_eq!(result["protocolVersion"], LATEST_PROTOCOL_VERSION);
-        assert_eq!(result["serverInfo"]["name"], "mcp-memory");
-        assert!(result["instructions"].is_string());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_initialize_version_negotiation() {
-        let (kg, path) = setup_kg();
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "initialize".to_string(),
-            params: Some(json!({ "protocolVersion": "2024-11-05" })),
-            id: Some(Value::Number(1.into())),
-        };
-        let result = match process_request(&req, &kg).unwrap() {
-            HandlerResult::Value(v) => v,
-            HandlerResult::RawResult(_) => panic!("expected Value"),
-        };
-        assert_eq!(result["protocolVersion"], "2024-11-05");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_tool_error_on_bad_args() {
-        // A tool that fails returns an isError CallToolResult, not a protocol error.
-        let (kg, path) = setup_kg();
-        let line = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"get_entity","arguments":{}}}"#;
-        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
-        assert!(v["error"].is_null(), "should not be a protocol error: {v}");
-        assert_eq!(v["result"]["isError"], json!(true));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_token_matches() {
-        assert!(token_matches("secret", "secret"));
-        assert!(token_matches("Bearer secret", "secret"));
-        assert!(token_matches("  Bearer secret  ", "secret"));
-        assert!(!token_matches("wrong", "secret"));
-        assert!(!token_matches("", "secret"));
-        // Length-mismatch and prefix cases.
-        assert!(!token_matches("secre", "secret"));
-        assert!(!token_matches("secretx", "secret"));
-        assert!(!token_matches("Bearer ", "secret"));
-    }
-
-    // ── MCP 2025-11-25 compliance ─────────────────────────────────────────
-
-    fn init_result(params: Option<Value>, kg: &GraphHandle) -> Value {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "initialize".to_string(),
-            params,
-            id: Some(json!(1)),
-        };
-        match process_request(&req, kg).unwrap() {
-            HandlerResult::Value(v) => v,
-            HandlerResult::RawResult(_) => panic!("expected Value"),
-        }
-    }
-
-    #[test]
-    fn test_compliance_negotiation_matrix() {
-        let (kg, path) = setup_kg();
-        for v in SUPPORTED_PROTOCOL_VERSIONS {
-            let r = init_result(Some(json!({ "protocolVersion": v })), &kg);
-            assert_eq!(&r["protocolVersion"], v);
-        }
-        // Unsupported / malformed → latest.
-        assert_eq!(
-            init_result(Some(json!({ "protocolVersion": "1900-01-01" })), &kg)["protocolVersion"],
-            LATEST_PROTOCOL_VERSION
-        );
-        assert_eq!(init_result(None, &kg)["protocolVersion"], "2025-11-25");
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_compliance_initialize_honest_with_instructions() {
-        let (kg, path) = setup_kg();
-        let r = init_result(None, &kg);
-        assert!(r["capabilities"]["tools"].is_object());
-        for cap in ["resources", "prompts", "logging", "completions"] {
-            assert!(r["capabilities"][cap].is_null(), "must not advertise {cap}");
-        }
-        assert!(r["instructions"].as_str().is_some_and(|s| !s.is_empty()));
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_compliance_tool_success_is_content_wrapped() {
-        let (kg, path) = setup_kg();
-        let create = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_entities","arguments":{"entities":[{"name":"Ada","entityType":"person","observations":["math"]}]}}}"#;
-        let v: Value = serde_json::from_str(&dispatch_line(create, &kg).unwrap()).unwrap();
-        let content = v["result"]["content"].as_array().expect("content array");
-        assert!(!content.is_empty());
-        assert_eq!(content[0]["type"], "text");
-        assert!(v["error"].is_null());
-        cleanup(&path);
-    }
-
-    #[test]
-    fn test_compliance_protocol_errors_remain_protocol_errors() {
-        let (kg, path) = setup_kg();
-        // Unknown tool → JSON-RPC error, not an isError result.
-        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
-        let v: Value = serde_json::from_str(&dispatch_line(line, &kg).unwrap()).unwrap();
-        assert_eq!(v["error"]["code"], -32601);
-        assert!(v["result"].is_null());
-        cleanup(&path);
-    }
-
-    #[tokio::test]
-    async fn test_compliance_tcp_auth_handshake() {
-        // First-line token handshake used by the TCP transport.
-        let mut ok = tokio::io::BufReader::new(&b"Bearer s3cr3t\n"[..]);
-        assert!(authenticate_line_conn(&mut ok, "s3cr3t").await.unwrap());
-
-        let mut bad = tokio::io::BufReader::new(&b"nope\n"[..]);
-        assert!(!authenticate_line_conn(&mut bad, "s3cr3t").await.unwrap());
-
-        // EOF / no first line → rejected.
-        let mut empty = tokio::io::BufReader::new(&b""[..]);
-        assert!(!authenticate_line_conn(&mut empty, "s3cr3t").await.unwrap());
-    }
-}

@@ -217,11 +217,11 @@
       },
       "required": ["from", "to"]
     },
-    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+    "annotations": { "readOnlyHint": true }
   },
   {
     "name": "compact",
-    "description": "Rewrite the binary log from the current in-memory state, discarding all tombstone/delete records. Produces a fresh minimal log containing only the current entities and relations. Use periodically to reclaim space.",
+    "description": "Trigger storage compaction: merge segments and drop tombstoned/superseded records to reclaim space. Safe to call periodically; runs in the background.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -365,6 +365,31 @@
         "maxPaths": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Stop after finding this many paths (default 50, prevents combinatorial explosion)" }
       },
       "required": ["from", "to"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "entity_exists",
+    "description": "Check whether each named entity exists, WITHOUT fetching its observations. Returns an array of booleans parallel to the input names. Use this for cheap de-duplication or presence checks before create/update — far lighter than get_entity/open_nodes, which transfer full records.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": { "type": "array", "items": { "type": "string" }, "description": "Entity names to test for existence" }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "degree",
+    "description": "Return the number of relations incident to an entity in the given direction, without enumerating the neighbors. Transfers only an integer — use it to decide whether to paginate a high-degree hub before calling get_neighbors.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The entity whose degree to count" },
+        "direction": { "type": "string", "enum": ["in", "out", "both"], "description": "Which edges to count (default both)" }
+      },
+      "required": ["name"]
     },
     "annotations": { "readOnlyHint": true }
   }

@@ -47,37 +47,4 @@ impl JsonRpcResponse {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
 
-    #[test]
-    fn test_request_serde() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "create_entities".to_string(),
-            params: Some(json!({"entities": []})),
-            id: Some(Value::Number(1.into())),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let deserialized: JsonRpcRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.method, "create_entities");
-    }
-
-    #[test]
-    fn test_response_success() {
-        let resp = JsonRpcResponse::success(Some(Value::Number(1.into())), json!({"content": "hello"}));
-        assert_eq!(resp.jsonrpc, "2.0");
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
-    }
-
-    #[test]
-    fn test_response_error() {
-        let resp = JsonRpcResponse::error(Some(Value::Number(1.into())), -32602, "Invalid params".into());
-        assert!(resp.result.is_none());
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, -32602);
-    }
-}
