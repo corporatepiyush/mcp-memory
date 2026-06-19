@@ -14,10 +14,10 @@ use crate::errors::{MCSError, Result};
 use crate::types::{Entity, Relation};
 
 fn sqlite_err(e: rusqlite::Error) -> MCSError {
-    MCSError::IoError(std::io::Error::other(e.to_string()))
+    MCSError::IoError(std::io::Error::other(e))
 }
 
-fn is_not_found(e: &rusqlite::Error) -> bool {
+const fn is_not_found(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -33,7 +33,7 @@ fn now_us() -> i64 {
 pub(crate) fn name_hash(name: &str) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in name.bytes() {
-        h ^= b as u64;
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x100000001b3);
     }
     h as i64
@@ -211,7 +211,7 @@ pub fn push_json_str(buf: &mut String, raw: &str) {
     }
     // Control chars 0x00-0x1F not handled above: escape as \u00XX
     for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if b <= 0x07 || b == 0x0B || (b >= 0x0E && b <= 0x1F) {
+        if b <= 0x07 || b == 0x0B || (0x0E..=0x1F).contains(&b) {
             buf.push_str(&raw[start..i]);
             write_escape_unicode(buf, b);
             start = i + 1;
@@ -1252,7 +1252,7 @@ impl GraphHandle {
                     .unwrap_or(entity.clone());
                 results.push(updated);
             } else {
-                let c = self.create_entities(&[entity.clone()])?;
+                let c = self.create_entities(std::slice::from_ref(entity))?;
                 if let Some(e) = c.into_iter().next() {
                     results.push(e);
                 }
@@ -1459,11 +1459,10 @@ impl GraphHandle {
         let mut count: usize = 0;
         for eid in entity_ids {
             if let Ok(entity) = entity_by_id(&conn, eid) {
-                if let Some(ft) = filter_type {
-                    if !ft.is_empty() && entity.entity_type != ft {
+                if let Some(ft) = filter_type
+                    && !ft.is_empty() && entity.entity_type != ft {
                         continue;
                     }
-                }
                 if count < offset {
                     count += 1;
                     continue;
@@ -1746,13 +1745,12 @@ impl GraphHandle {
                      WHERE r.from_id = ?1 AND r.to_id = ?2 AND r.type_id = ?3
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![fid, tid, tpid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![fid, tid, tpid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (Some(fid), Some(tid), None) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1764,13 +1762,12 @@ impl GraphHandle {
                      WHERE r.from_id = ?1 AND r.to_id = ?2
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (Some(fid), None, Some(tpid)) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1782,13 +1779,12 @@ impl GraphHandle {
                      WHERE r.from_id = ?1 AND r.type_id = ?2
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![fid, tpid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![fid, tpid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (None, Some(tid), Some(tpid)) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1800,13 +1796,12 @@ impl GraphHandle {
                      WHERE r.to_id = ?1 AND r.type_id = ?2
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![tid, tpid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![tid, tpid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (Some(fid), None, None) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1818,13 +1813,12 @@ impl GraphHandle {
                      WHERE r.from_id = ?1
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![fid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![fid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (None, Some(tid), None) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1836,13 +1830,12 @@ impl GraphHandle {
                      WHERE r.to_id = ?1
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![tid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![tid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (None, None, Some(tpid)) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1854,13 +1847,12 @@ impl GraphHandle {
                      WHERE r.type_id = ?1
                        AND e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map(params![tpid], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map(params![tpid], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
             (None, None, None) => {
                 if let Ok(mut stmt) = conn.prepare_cached(
@@ -1871,13 +1863,12 @@ impl GraphHandle {
                      JOIN type_dict t ON t.id = r.type_id
                      WHERE e1.flags = 0 AND e2.flags = 0
                      ORDER BY r.from_id, r.to_id"
-                ) {
-                    if let Ok(rows) = stmt.query_map([], |row| {
+                )
+                    && let Ok(rows) = stmt.query_map([], |row| {
                         Ok(Relation { from: row.get(0)?, to: row.get(1)?, relation_type: row.get(2)? })
                     }) {
                         for row in rows.flatten() { results.push(row); }
                     }
-                }
             }
         }
         results
@@ -1920,8 +1911,7 @@ impl GraphHandle {
             // Fetch out-neighbors.
             if let Ok(mut stmt) =
                 conn.prepare_cached("SELECT to_id FROM relation WHERE from_id = ?1")
-            {
-                if let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
+                && let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
                     for row in rows.flatten() {
                         if visited.insert(row) {
                             parent.insert(row, cur);
@@ -1929,12 +1919,10 @@ impl GraphHandle {
                         }
                     }
                 }
-            }
             // Also check in-neighbors (undirected traversal).
             if let Ok(mut stmt) =
                 conn.prepare_cached("SELECT from_id FROM relation WHERE to_id = ?1")
-            {
-                if let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
+                && let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
                     for row in rows.flatten() {
                         if visited.insert(row) {
                             parent.insert(row, cur);
@@ -1942,7 +1930,6 @@ impl GraphHandle {
                         }
                     }
                 }
-            }
         }
 
         if !parent.contains_key(&to_id) && to_id != from_id {
@@ -2030,8 +2017,8 @@ impl GraphHandle {
             for fid in &frontier {
                 if let Ok(mut stmt) = conn.prepare_cached(
                     "SELECT from_id, to_id, type_id FROM relation WHERE from_id = ?1",
-                ) {
-                    if let Ok(rows) =
+                )
+                    && let Ok(rows) =
                         stmt.query_map(params![fid], |row| {
                             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
                         })
@@ -2044,11 +2031,10 @@ impl GraphHandle {
                             }
                         }
                     }
-                }
                 if let Ok(mut stmt) = conn.prepare_cached(
                     "SELECT from_id, to_id, type_id FROM relation WHERE to_id = ?1",
-                ) {
-                    if let Ok(rows) =
+                )
+                    && let Ok(rows) =
                         stmt.query_map(params![fid], |row| {
                             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
                         })
@@ -2061,7 +2047,6 @@ impl GraphHandle {
                             }
                         }
                     }
-                }
             }
             frontier = next_frontier;
             current_depth += 1;
@@ -2200,8 +2185,7 @@ impl GraphHandle {
             // Out-neighbors.
             if let Ok(mut stmt) =
                 conn.prepare_cached("SELECT to_id FROM relation WHERE from_id = ?1")
-            {
-                if let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
+                && let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
                     for next_id in rows.flatten() {
                         if next_id == to_id {
                             let mut full_path = path.clone();
@@ -2217,13 +2201,11 @@ impl GraphHandle {
                         }
                     }
                 }
-            }
 
             // In-neighbors (undirected).
             if let Ok(mut stmt) =
                 conn.prepare_cached("SELECT from_id FROM relation WHERE to_id = ?1")
-            {
-                if let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
+                && let Ok(rows) = stmt.query_map(params![cur], |row| row.get::<_, i64>(0)) {
                     for next_id in rows.flatten() {
                         if next_id == to_id {
                             let mut full_path = path.clone();
@@ -2239,7 +2221,6 @@ impl GraphHandle {
                         }
                     }
                 }
-            }
         }
 
         // Convert ids to names.
@@ -2401,8 +2382,8 @@ impl GraphHandle {
             for &fid in &frontier {
                 if direction == Direction::Outgoing || direction == Direction::Both {
                     if let Some(tid) = type_filter {
-                        if let Ok(ref mut stmt) = q_out_t {
-                            if let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
+                        if let Ok(ref mut stmt) = q_out_t
+                            && let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
                                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                             }) {
                                 for row in rows.flatten() {
@@ -2411,9 +2392,8 @@ impl GraphHandle {
                                     if all_ids.insert(to_id) { next_frontier.insert(to_id); }
                                 }
                             }
-                        }
-                    } else if let Ok(ref mut stmt) = q_out {
-                        if let Ok(rows) = stmt.query_map(params![fid], |row| {
+                    } else if let Ok(ref mut stmt) = q_out
+                        && let Ok(rows) = stmt.query_map(params![fid], |row| {
                             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                         }) {
                             for row in rows.flatten() {
@@ -2422,13 +2402,12 @@ impl GraphHandle {
                                 if all_ids.insert(to_id) { next_frontier.insert(to_id); }
                             }
                         }
-                    }
                 }
 
                 if direction == Direction::Incoming || direction == Direction::Both {
                     if let Some(tid) = type_filter {
-                        if let Ok(ref mut stmt) = q_in_t {
-                            if let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
+                        if let Ok(ref mut stmt) = q_in_t
+                            && let Ok(rows) = stmt.query_map(params![fid, tid], |row| {
                                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                             }) {
                                 for row in rows.flatten() {
@@ -2437,9 +2416,8 @@ impl GraphHandle {
                                     if all_ids.insert(from_id) { next_frontier.insert(from_id); }
                                 }
                             }
-                        }
-                    } else if let Ok(ref mut stmt) = q_in {
-                        if let Ok(rows) = stmt.query_map(params![fid], |row| {
+                    } else if let Ok(ref mut stmt) = q_in
+                        && let Ok(rows) = stmt.query_map(params![fid], |row| {
                             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                         }) {
                             for row in rows.flatten() {
@@ -2448,7 +2426,6 @@ impl GraphHandle {
                                 if all_ids.insert(from_id) { next_frontier.insert(from_id); }
                             }
                         }
-                    }
                 }
             }
 

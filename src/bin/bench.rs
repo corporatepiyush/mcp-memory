@@ -211,6 +211,6 @@ fn main() {
     // Cleanup
     let _ = std::fs::remove_file(path);
     for ext in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(&format!("/tmp/mcp_memory_bench.db{ext}"));
+        let _ = std::fs::remove_file(format!("/tmp/mcp_memory_bench.db{ext}"));
     }
 }
