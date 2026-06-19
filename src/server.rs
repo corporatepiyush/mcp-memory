@@ -53,7 +53,8 @@ where
             if buf.is_empty() {
                 return Ok(LineRead::Eof);
             }
-            *out = String::from_utf8(buf.clone()).map_err(|_| {
+            // Move `buf` into the String — no copy. `buf` is not used afterward.
+            *out = String::from_utf8(buf).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-UTF-8 input")
             })?;
             return Ok(LineRead::Line);
@@ -66,7 +67,7 @@ where
                 }
                 buf.extend_from_slice(&available[..=i]);
                 reader.consume(i + 1);
-                *out = String::from_utf8(buf.clone()).map_err(|_| {
+                *out = String::from_utf8(buf).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-UTF-8 input")
                 })?;
                 return Ok(LineRead::Line);
@@ -217,7 +218,13 @@ impl MCPServer {
         let lru_cache = NonZeroUsize::new(config.lru_cache_size).unwrap_or_else(|| {
             NonZeroUsize::new(10000).expect("10000 > 0")
         });
-        let kg = GraphHandle::new(path, config.durability, config.mmap_size, lru_cache)?;
+        let kg = GraphHandle::new(
+            path,
+            config.durability,
+            config.mmap_size,
+            lru_cache,
+            config.read_pool_size,
+        )?;
 
         Ok(Self {
             config: Arc::new(config),

@@ -13,7 +13,7 @@ fn main() {
         let _ = std::fs::remove_file(&p);
     }
 
-    let kg = GraphHandle::new(path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap()).expect("create KG");
+    let kg = GraphHandle::new(path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
 
     // ── Seed ──────────────────────────────────────────────────────────
     const N: usize = 1000;
@@ -174,7 +174,7 @@ fn main() {
         kg.neighbors("entity_50", Direction::Both, None, 2)
     });
 
-    measure!("export (json)", 5, { kg.export("json") });
+    measure!("export (json)", 5, { kg.export("json", i64::MAX) });
 
     measure!("find_all_paths (A→C, depth 5)", 20, {
         kg.find_all_paths("entity_0", "entity_2", 5, 10)

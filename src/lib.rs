@@ -65,4 +65,11 @@ pub struct Args {
     /// Entity-metadata LRU cache capacity (0 = unbounded).
     #[arg(long = "lru-cache-size", default_value_t = 10000)]
     pub lru_cache_size: usize,
+
+    /// Number of read-only SQLite connections backing concurrent reads. WAL
+    /// mode allows readers to run in parallel with each other and the single
+    /// writer; a larger pool raises read concurrency at the cost of a little
+    /// memory. Clamped to at least 1.
+    #[arg(long = "read-pool-size", default_value_t = 4)]
+    pub read_pool_size: usize,
 }

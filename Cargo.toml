@@ -1,13 +1,13 @@
 [package]
 name = "mcp-memory"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted in SQLite with FTS5 search"
 license = "Apache-2.0"
 repository = "https://github.com/corporatepiyush/mcp-memory"
 readme = "README.md"
-keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent", "sqlite"]
+keywords = ["mcp", "knowledge-graph", "memory", "llm", "agent"]
 categories = ["command-line-utilities"]
 exclude = ["/target", "*.mcpmem"]
 

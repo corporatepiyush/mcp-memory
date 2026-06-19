@@ -2,12 +2,12 @@ use rustc_hash::FxHashMap;
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lru::LruCache;
-use parking_lot::Mutex;
-use rusqlite::{params, types::ToSql, Connection};
+use parking_lot::{Mutex, MutexGuard};
+use rusqlite::{params, types::ToSql, Connection, OpenFlags};
 
 use crate::config::Durability;
 use crate::errors::{MCSError, Result};
@@ -82,6 +82,16 @@ fn get_type_id(conn: &Connection, type_name: &str, kind: i64) -> Result<i64> {
     )
     .map_err(sqlite_err)?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Read-only type lookup. Unlike [`get_type_id`] this never inserts, so it is
+/// safe to call on a `query_only` reader connection. Returns `None` when the
+/// type does not exist.
+fn lookup_type_id(conn: &Connection, type_name: &str, kind: i64) -> Option<i64> {
+    conn.prepare_cached("SELECT id FROM type_dict WHERE kind = ?1 AND name = ?2")
+        .ok()?
+        .query_row(params![kind, type_name], |row| row.get::<_, i64>(0))
+        .ok()
 }
 
 fn inc_type_count(conn: &Connection, type_id: i64, delta: i64) -> Result<()> {
@@ -237,7 +247,11 @@ struct TxGuard<'a> {
 
 impl<'a> TxGuard<'a> {
     fn begin(conn: &'a Connection) -> Result<Self> {
-        conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+        // BEGIN IMMEDIATE acquires the WAL write lock up front rather than
+        // lazily on the first write. This makes the busy-timeout apply to lock
+        // acquisition deterministically and avoids `SQLITE_BUSY_SNAPSHOT`
+        // surprises when readers are concurrently active.
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite_err)?;
         Ok(Self { conn, done: false })
     }
 
@@ -255,57 +269,79 @@ impl Drop for TxGuard<'_> {
     }
 }
 
-// ── JSON helpers (shared by GraphHandle methods) ─────────────────────────
+// ── Reader pool ───────────────────────────────────────────────────────────
 
-fn entities_json_raw(conn: &Connection, limit_sql: i64, offset_sql: i64) -> Result<String> {
-    conn.prepare_cached(
-        "SELECT COALESCE(json_group_array(json_object(
-            'name', e.name,
-            'entityType', t.name,
-            'observations', COALESCE((
-                SELECT json_group_array(o.body ORDER BY o.idx)
-                FROM observation o WHERE o.entity_id = e.id
-            ), json('[]'))
-        ) ORDER BY e.id), json('[]'))
-        FROM entity e
-        JOIN type_dict t ON t.id = e.type_id
-        WHERE e.flags = 0
-        LIMIT ?1 OFFSET ?2"
-    )
-    .map_err(sqlite_err)?
-    .query_row(params![limit_sql, offset_sql], |row| row.get::<_, String>(0))
-    .map_err(sqlite_err)
+/// A small fixed pool of `query_only` SQLite connections used for read
+/// operations. WAL mode permits any number of concurrent readers alongside the
+/// single writer, so spreading reads across several connections lets them run
+/// in parallel instead of serializing on the writer's mutex.
+struct ReaderPool {
+    conns: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
 }
 
-fn relations_json_raw(conn: &Connection) -> Result<String> {
-    conn.prepare_cached(
-        "SELECT COALESCE(json_group_array(json_object(
-            'from', e1.name,
-            'to', e2.name,
-            'relationType', t.name
-        )), json('[]'))
-        FROM relation r
-        JOIN entity e1 ON e1.id = r.from_id
-        JOIN entity e2 ON e2.id = r.to_id
-        JOIN type_dict t ON t.id = r.type_id
-        WHERE e1.flags = 0 AND e2.flags = 0"
-    )
-    .map_err(sqlite_err)?
-    .query_row([], |row| row.get::<_, String>(0))
-    .map_err(sqlite_err)
+impl ReaderPool {
+    /// Acquire a reader connection. Fast path: grab the first idle one. If every
+    /// connection is busy, block on a round-robin pick so callers still make
+    /// progress (and never spin).
+    fn get(&self) -> MutexGuard<'_, Connection> {
+        for c in &self.conns {
+            if let Some(g) = c.try_lock() {
+                return g;
+            }
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        self.conns[i].lock()
+    }
 }
 
 // ── GraphHandle ──────────────────────────────────────────────────────────
 
 pub struct GraphHandle {
-    conn: Mutex<Connection>,
+    /// The single read-write connection. SQLite allows only one writer, so all
+    /// mutations serialize here.
+    writer: Mutex<Connection>,
+    /// Pool of `query_only` connections for concurrent reads (WAL).
+    readers: ReaderPool,
     seq_entity: AtomicI64,
     seq_obs: AtomicI64,
     cache: Mutex<LruCache<String, EntityMeta>>,
 }
 
+/// Open one `query_only` reader connection against an existing WAL database.
+///
+/// The connection is opened read-write at the OS level (so it can attach to the
+/// `-shm` wal-index — SQLite cannot read a WAL database through a pure
+/// `SQLITE_OPEN_READ_ONLY` handle) and then locked to reads with
+/// `PRAGMA query_only = ON`, which makes any accidental write error out.
+fn open_reader(path: &Path, mmap_size: i64) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(sqlite_err)?;
+    conn.busy_timeout(Duration::from_secs(10)).map_err(sqlite_err)?;
+    conn.execute_batch(
+        "PRAGMA query_only   = ON;
+         PRAGMA cache_size   = -50000;
+         PRAGMA temp_store   = MEMORY;",
+    )
+    .map_err(sqlite_err)?;
+    conn.execute_batch(&format!("PRAGMA mmap_size = {mmap_size};"))
+        .map_err(sqlite_err)?;
+    Ok(conn)
+}
+
 impl GraphHandle {
-    pub fn new(path: &Path, durability: Durability, mmap_size: i64, lru_cache_size: NonZeroUsize) -> Result<Self> {
+    pub fn new(
+        path: &Path,
+        durability: Durability,
+        mmap_size: i64,
+        lru_cache_size: NonZeroUsize,
+        read_pool_size: usize,
+    ) -> Result<Self> {
         {
             let tmp = Connection::open(path).map_err(sqlite_err)?;
             tmp.execute_batch("PRAGMA page_size = 16384;")
@@ -314,6 +350,9 @@ impl GraphHandle {
         }
 
         let conn = Connection::open(path).map_err(sqlite_err)?;
+        // Apply the busy handler through the API so it is in force for every
+        // subsequent statement (including schema creation and BEGIN IMMEDIATE).
+        conn.busy_timeout(Duration::from_secs(10)).map_err(sqlite_err)?;
 
         conn.execute_batch(
              "PRAGMA journal_mode = WAL;
@@ -441,8 +480,21 @@ impl GraphHandle {
         let seq_entity = read_graph_stat(&conn, "entity_seq").unwrap_or(0);
         let seq_obs = read_graph_stat(&conn, "obs_seq").unwrap_or(0);
 
+        // Open the reader pool against the now-initialized database. At least one
+        // reader is always created.
+        let pool_size = read_pool_size.max(1);
+        let mut conns = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            conns.push(Mutex::new(open_reader(path, mmap_size)?));
+        }
+        let readers = ReaderPool {
+            conns,
+            next: AtomicUsize::new(0),
+        };
+
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers,
             seq_entity: AtomicI64::new(seq_entity),
             seq_obs: AtomicI64::new(seq_obs),
             cache: Mutex::new(LruCache::new(lru_cache_size)),
@@ -525,7 +577,7 @@ impl GraphHandle {
         }
 
         if let Some(m) = self.meta_get(name) {
-            let conn = self.conn.lock();
+            let conn = self.readers.get();
             let etype = name_of_type(&conn, m.type_id).unwrap_or_default();
             let observations = load_observations_opt(&conn, m.id);
             return Ok(Some(Entity {
@@ -535,7 +587,7 @@ impl GraphHandle {
             }));
         }
 
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let h = name_hash(name);
         let mut stmt = conn
             .prepare_cached(
@@ -573,7 +625,7 @@ impl GraphHandle {
     }
 
     pub fn create_entities(&self, entities: &[Entity]) -> Result<Vec<Entity>> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         let tx = TxGuard::begin(&conn)?;
 
         let mut ins_ent = conn
@@ -681,9 +733,9 @@ impl GraphHandle {
 
         tx.commit()?;
 
-        if total_entities > 0 {
-            conn.execute_batch("PRAGMA optimize(0x10000);").map_err(sqlite_err)?;
-        }
+        // Note: `PRAGMA optimize` is intentionally *not* run here. It analyzes
+        // indexes and writes to internal stat tables — pure overhead on the
+        // write hot path. The periodic `run_maintenance` task covers it.
 
         if !created_metas.is_empty() {
             let mut cache = self.cache.lock();
@@ -699,7 +751,7 @@ impl GraphHandle {
         if names.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
 
         // Phase 1: Resolve all names to (id, type_id).
         let mut resolved: Vec<(i64, i64, String)> = Vec::with_capacity(names.len());
@@ -814,7 +866,7 @@ impl GraphHandle {
     }
 
     pub fn create_relations(&self, relations: &[Relation]) -> Result<Vec<Relation>> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         let tx = TxGuard::begin(&conn)?;
 
         let mut ins = conn
@@ -889,9 +941,7 @@ impl GraphHandle {
 
         tx.commit()?;
 
-        if total_relations > 0 {
-            conn.execute_batch("PRAGMA optimize(0x10000);").map_err(sqlite_err)?;
-        }
+        // See `create_entities`: `PRAGMA optimize` is deferred to maintenance.
 
         if !created.is_empty() {
             let mut cache = self.cache.lock();
@@ -912,7 +962,7 @@ impl GraphHandle {
         if relations.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
 
         // Resolve names to IDs and collect valid triples.
         let mut triples: Vec<(i64, i64, i64)> = Vec::with_capacity(relations.len());
@@ -1067,7 +1117,7 @@ impl GraphHandle {
     }
 
     pub fn add_observations(&self, entity_name: &str, contents: &[String]) -> Result<Vec<String>> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         let (id, _type_id, _, _) = match self.get_entity_id(&conn, entity_name)? {
             Some(v) => v,
             None => {
@@ -1120,7 +1170,7 @@ impl GraphHandle {
         if observations.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         let (id, _, _, _) = match self.get_entity_id(&conn, entity_name)? {
             Some(v) => v,
             None => {
@@ -1166,7 +1216,7 @@ impl GraphHandle {
             if let Some(existing) = self.get_entity(&entity.name)? {
                 // Update type if different.
                 if existing.entity_type != entity.entity_type {
-                    let conn = self.conn.lock();
+                    let conn = self.writer.lock();
                     let old_type_id = conn
                         .query_row(
                             "SELECT type_id FROM entity WHERE name_hash = ?1 AND name = ?2 AND flags = 0",
@@ -1212,7 +1262,7 @@ impl GraphHandle {
     }
 
     pub fn merge_entities(&self, source: &str, target: &str) -> Result<Entity> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         let (src_id, _, _, _) = match self.get_entity_id(&conn, source)? {
             Some(v) => v,
             None => {
@@ -1365,10 +1415,11 @@ impl GraphHandle {
         if query.is_empty() {
             return Vec::new();
         }
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
 
-        // Single pass: collect IDs from name_fts then obs_fts, dedup by position.
+        // Single pass: collect IDs from name_fts then obs_fts, deduping with a set.
         let mut entity_ids: Vec<i64> = Vec::new();
+        let mut seen: HashSet<i64> = HashSet::new();
 
         if let Ok(mut stmt) = conn.prepare(
             "SELECT rowid FROM name_fts WHERE name_fts MATCH ?1 ORDER BY rank LIMIT ?2",
@@ -1378,7 +1429,9 @@ impl GraphHandle {
                 row.get::<_, i64>(0)
             }) {
                 for row in rows.flatten() {
-                    entity_ids.push(row);
+                    if seen.insert(row) {
+                        entity_ids.push(row);
+                    }
                 }
             }
         }
@@ -1394,7 +1447,7 @@ impl GraphHandle {
                 row.get::<_, i64>(0)
             }) {
                 for row in rows.flatten() {
-                    if !entity_ids.contains(&row) {
+                    if seen.insert(row) {
                         entity_ids.push(row);
                     }
                 }
@@ -1432,7 +1485,7 @@ impl GraphHandle {
         offset: usize,
         limit: usize,
     ) -> Result<String> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
 
         let limit_sql: i64 = if limit == usize::MAX {
             -1
@@ -1441,34 +1494,86 @@ impl GraphHandle {
         };
         let offset_sql: i64 = offset as i64;
 
-        let entities_json = if let Some(ft) = filter_type {
-            if !ft.is_empty() {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT COALESCE(json_group_array(json_object(
-                        'name', e.name,
-                        'entityType', t.name,
-                        'observations', COALESCE((
-                            SELECT json_group_array(o.body ORDER BY o.idx)
-                            FROM observation o WHERE o.entity_id = e.id
-                        ), json('[]'))
-                    ) ORDER BY e.id), json('[]'))
-                    FROM entity e
-                    JOIN type_dict t ON t.id = e.type_id
-                    WHERE e.type_id = (SELECT id FROM type_dict WHERE kind = 0 AND name = ?1)
-                      AND e.flags = 0
-                    LIMIT ?2 OFFSET ?3"
-                ).map_err(sqlite_err)?;
-                stmt.query_row(params![ft, limit_sql, offset_sql], |row| {
-                    row.get::<_, String>(0)
-                }).unwrap_or_else(|_| "[]".to_string())
-            } else {
-                entities_json_raw(&conn, limit_sql, offset_sql)?
-            }
+        // Resolve the requested page of entity ids first. Relations are then
+        // scoped to edges whose *both* endpoints fall inside this page, which
+        // keeps the response self-consistent (no dangling references to
+        // entities that were paged out) and bounds the relation payload by the
+        // page size instead of dumping every relation in the graph.
+        let filter = filter_type.filter(|ft| !ft.is_empty());
+        let ids: Vec<i64> = if let Some(ft) = filter {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT e.id FROM entity e
+                     WHERE e.type_id = (SELECT id FROM type_dict WHERE kind = 0 AND name = ?1)
+                       AND e.flags = 0
+                     ORDER BY e.id LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(sqlite_err)?;
+            stmt.query_map(params![ft, limit_sql, offset_sql], |r| r.get::<_, i64>(0))
+                .map_err(sqlite_err)?
+                .filter_map(|r| r.ok())
+                .collect()
         } else {
-            entities_json_raw(&conn, limit_sql, offset_sql)?
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT e.id FROM entity e WHERE e.flags = 0
+                     ORDER BY e.id LIMIT ?1 OFFSET ?2",
+                )
+                .map_err(sqlite_err)?;
+            stmt.query_map(params![limit_sql, offset_sql], |r| r.get::<_, i64>(0))
+                .map_err(sqlite_err)?
+                .filter_map(|r| r.ok())
+                .collect()
         };
 
-        let relations_json = relations_json_raw(&conn)?;
+        if ids.is_empty() {
+            return Ok(r#"{"entities":[],"relations":[]}"#.to_string());
+        }
+
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        let entities_json: String = {
+            let sql = format!(
+                "SELECT COALESCE(json_group_array(json_object(
+                    'name', e.name,
+                    'entityType', t.name,
+                    'observations', COALESCE((
+                        SELECT json_group_array(o.body ORDER BY o.idx)
+                        FROM observation o WHERE o.entity_id = e.id
+                    ), json('[]'))
+                ) ORDER BY e.id), json('[]'))
+                FROM entity e
+                JOIN type_dict t ON t.id = e.type_id
+                WHERE e.id IN ({placeholders}) AND e.flags = 0"
+            );
+            conn.query_row(&sql, rusqlite::params_from_iter(&ids), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sqlite_err)?
+        };
+
+        let relations_json: String = {
+            let sql = format!(
+                "SELECT COALESCE(json_group_array(json_object(
+                    'from', e1.name,
+                    'to', e2.name,
+                    'relationType', t.name
+                )), json('[]'))
+                FROM relation r
+                JOIN entity e1 ON e1.id = r.from_id
+                JOIN entity e2 ON e2.id = r.to_id
+                JOIN type_dict t ON t.id = r.type_id
+                WHERE r.from_id IN ({placeholders}) AND r.to_id IN ({placeholders})
+                  AND e1.flags = 0 AND e2.flags = 0"
+            );
+            let all_params: Vec<&dyn ToSql> = ids
+                .iter()
+                .map(|id| id as &dyn ToSql)
+                .chain(ids.iter().map(|id| id as &dyn ToSql))
+                .collect();
+            conn.query_row(&sql, all_params.as_slice(), |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
+        };
 
         let mut out = String::with_capacity(32 + entities_json.len() + relations_json.len());
         out.push_str("{\"entities\":");
@@ -1480,7 +1585,7 @@ impl GraphHandle {
     }
 
     pub fn open_nodes(&self, names: &[String]) -> String {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let mut entity_ids: Vec<i64> = Vec::new();
 
         for name in names {
@@ -1559,7 +1664,7 @@ impl GraphHandle {
     }
 
     pub fn entities_exist(&self, names: &[String]) -> Result<Vec<bool>> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let mut results = Vec::with_capacity(names.len());
         for name in names {
             let h = name_hash(name);
@@ -1576,7 +1681,7 @@ impl GraphHandle {
     }
 
     pub fn degree(&self, name: &str, direction: Direction) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let (_, _, out_d, in_d) = match self.get_entity_id(&conn, name)? {
             Some(v) => v,
             None => {
@@ -1593,14 +1698,14 @@ impl GraphHandle {
     }
 
     pub fn get_entity_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         read_graph_stat(&conn, "entities")
             .map(|v| v as usize)
             .map_err(|_| MCSError::MemoryError("Failed to read entity count".into()))
     }
 
     pub fn get_relation_count(&self) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         read_graph_stat(&conn, "relations")
             .map(|v| v as usize)
             .map_err(|_| MCSError::MemoryError("Failed to read relation count".into()))
@@ -1612,21 +1717,23 @@ impl GraphHandle {
         to: Option<&str>,
         rtype: Option<&str>,
     ) -> Vec<Relation> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let mut results = Vec::new();
 
-        let from_id = from.and_then(|f| {
-            if f.is_empty() { None }
-            else { entity_name_lookup(&conn, f).ok().flatten() }
-        });
-        let to_id = to.and_then(|t| {
-            if t.is_empty() { None }
-            else { entity_name_lookup(&conn, t).ok().flatten() }
-        });
-        let type_id = rtype.and_then(|rt| {
-            if rt.is_empty() { None }
-            else { get_type_id(&conn, rt, 1).ok() }
-        });
+        // A filter that is supplied but resolves to nothing uses the sentinel
+        // id -1 (which matches no row), so the query returns empty rather than
+        // silently dropping the filter and matching every relation. The lookups
+        // are read-only — `get_type_id` would *insert* a phantom type, which is
+        // both wrong and impossible on a `query_only` reader connection.
+        let from_id = from
+            .filter(|f| !f.is_empty())
+            .map(|f| entity_name_lookup(&conn, f).ok().flatten().unwrap_or(-1));
+        let to_id = to
+            .filter(|t| !t.is_empty())
+            .map(|t| entity_name_lookup(&conn, t).ok().flatten().unwrap_or(-1));
+        let type_id = rtype
+            .filter(|rt| !rt.is_empty())
+            .map(|rt| lookup_type_id(&conn, rt, 1).unwrap_or(-1));
 
         match (from_id, to_id, type_id) {
             (Some(fid), Some(tid), Some(tpid)) => {
@@ -1777,7 +1884,7 @@ impl GraphHandle {
     }
 
     pub fn find_path(&self, from: &str, to: &str) -> Result<Option<Vec<String>>> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let (from_id, _, _, _) = match self.get_entity_id(&conn, from)? {
             Some(v) => v,
             None => {
@@ -1869,7 +1976,7 @@ impl GraphHandle {
     }
 
     pub fn compact(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
         conn.execute_batch("PRAGMA incremental_vacuum;").map_err(sqlite_err)?;
         Ok(())
     }
@@ -1893,7 +2000,7 @@ impl GraphHandle {
             return Ok(r#"{"entities":[],"relations":[]}"#.to_string());
         }
 
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let mut all_entity_ids: HashSet<i64> = HashSet::new();
         let mut frontier: HashSet<i64> = HashSet::new();
         let mut all_rel_pairs: HashSet<(i64, i64, i64)> = HashSet::new();
@@ -2032,12 +2139,12 @@ impl GraphHandle {
     }
 
     pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         select_all_types(&conn, 0).unwrap_or_default()
     }
 
     pub fn relation_type_counts(&self) -> Vec<(String, usize)> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         select_all_types(&conn, 1).unwrap_or_default()
     }
 
@@ -2055,7 +2162,7 @@ impl GraphHandle {
         max_depth: usize,
         max_paths: usize,
     ) -> Result<Vec<Vec<String>>> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let (from_id, _, _, _) = match self.get_entity_id(&conn, from)? {
             Some(v) => v,
             None => {
@@ -2154,55 +2261,65 @@ impl GraphHandle {
         Ok(named_paths)
     }
 
-    pub fn export(&self, format: &str) -> Result<String> {
-        let conn = self.conn.lock();
-        match format {
-            "json" | _ => {
-                conn.query_row(
-                    "SELECT json_object(
-                        'entities', COALESCE((
-                            SELECT json_group_array(json_object(
-                                'name', e.name,
-                                'entityType', t.name,
-                                'observations', COALESCE((
-                                    SELECT json_group_array(o.body ORDER BY o.idx)
-                                    FROM observation o WHERE o.entity_id = e.id
-                                ), json('[]'))
-                            ) ORDER BY e.id)
-                            FROM entity e
-                            JOIN type_dict t ON t.id = e.type_id
-                            WHERE e.flags = 0
-                        ), json('[]')),
-                        'relations', COALESCE((
-                            SELECT json_group_array(json_object(
-                                'from', e1.name,
-                                'to', e2.name,
-                                'relationType', t.name
-                            ))
-                            FROM relation r
-                            JOIN entity e1 ON e1.id = r.from_id
-                            JOIN entity e2 ON e2.id = r.to_id
-                            JOIN type_dict t ON t.id = r.type_id
-                            WHERE e1.flags = 0 AND e2.flags = 0
+    /// Export the whole graph as a JSON string. `max_rows` caps both the entity
+    /// and relation arrays so a pathologically large graph cannot be coerced
+    /// into an unbounded in-memory string (DoS guard); callers pass a generous
+    /// constant. A negative value means "no limit".
+    pub fn export(&self, _format: &str, max_rows: i64) -> Result<String> {
+        let conn = self.readers.get();
+        // Only JSON is supported; the format argument is accepted for forward
+        // compatibility.
+        conn.query_row(
+            "SELECT json_object(
+                'entities', COALESCE((
+                    SELECT json_group_array(json_object(
+                        'name', e.name,
+                        'entityType', t.name,
+                        'observations', COALESCE((
+                            SELECT json_group_array(o.body ORDER BY o.idx)
+                            FROM observation o WHERE o.entity_id = e.id
                         ), json('[]'))
-                    )",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .map_err(sqlite_err)
-            }
-        }
+                    ) ORDER BY e.id)
+                    FROM (
+                        SELECT id, name, type_id FROM entity
+                        WHERE flags = 0 ORDER BY id LIMIT ?1
+                    ) e
+                    JOIN type_dict t ON t.id = e.type_id
+                ), json('[]')),
+                'relations', COALESCE((
+                    SELECT json_group_array(json_object(
+                        'from', e1.name,
+                        'to', e2.name,
+                        'relationType', t.name
+                    ))
+                    FROM (
+                        SELECT from_id, to_id, type_id FROM relation LIMIT ?1
+                    ) r
+                    JOIN entity e1 ON e1.id = r.from_id
+                    JOIN entity e2 ON e2.id = r.to_id
+                    JOIN type_dict t ON t.id = r.type_id
+                    WHERE e1.flags = 0 AND e2.flags = 0
+                ), json('[]'))
+            )",
+            params![max_rows],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sqlite_err)
     }
 
     pub fn wipe(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
+        // `name_fts`/`obs_fts` are external-content FTS5 tables; the supported
+        // way to empty them is the special `'delete-all'` command, not a bare
+        // `DELETE FROM` (which is invalid for external-content tables and can
+        // leave the index inconsistent). Run it after clearing the content rows.
         conn.execute_batch(
             "DELETE FROM observation;
              DELETE FROM relation;
              DELETE FROM entity;
              DELETE FROM type_dict;
-             DELETE FROM name_fts;
-             DELETE FROM obs_fts;
+             INSERT INTO name_fts(name_fts) VALUES('delete-all');
+             INSERT INTO obs_fts(obs_fts) VALUES('delete-all');
              UPDATE graph_stat SET value = 0 WHERE key IN ('entities', 'relations', 'observations');
              UPDATE graph_stat SET value = 0 WHERE key IN ('entity_seq', 'obs_seq');",
         )
@@ -2216,7 +2333,7 @@ impl GraphHandle {
     /// Periodic database maintenance: WAL checkpoint, query planner analysis,
     /// and FTS index optimization. Call from a background timer.
     pub fn run_maintenance(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let conn = self.writer.lock();
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(sqlite_err)?;
@@ -2242,7 +2359,7 @@ impl GraphHandle {
         // unused — we always include relations; the caller controls via depth
         _include_relations: bool,
     ) -> Result<String> {
-        let conn = self.conn.lock();
+        let conn = self.readers.get();
         let (start_id, _, _, _) = match self.get_entity_id(&conn, name)? {
             Some(v) => v,
             None => {
@@ -2258,7 +2375,14 @@ impl GraphHandle {
         all_ids.insert(start_id);
         frontier.insert(start_id);
 
-        let type_filter = rtype.and_then(|rt| get_type_id(&conn, rt, 1).ok());
+        // Read-only type resolution. A requested-but-missing type uses the
+        // sentinel id -1 (matches no edge), so traversal yields just the start
+        // entity instead of falling back to "no type filter" and walking every
+        // edge. `get_type_id` is avoided here: it inserts and cannot run on the
+        // `query_only` reader connection.
+        let type_filter: Option<i64> = rtype
+            .filter(|rt| !rt.is_empty())
+            .map(|rt| lookup_type_id(&conn, rt, 1).unwrap_or(-1));
 
         // Pre-compile all four possible queries outside the loop.
         let mut q_out_t = conn.prepare_cached(
@@ -2437,7 +2561,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("kg_test_{}_{}.db", std::process::id(), n));
         cleanup_db(&path);
-        let kg = GraphHandle::new(&path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap()).expect("create KG");
+        let kg = GraphHandle::new(&path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
         TestKg(kg, path)
     }
 
@@ -2758,7 +2882,7 @@ mod tests {
             name: "exp".into(), entity_type: "t".into(), observations: vec!["o".into()],
         }]).unwrap();
 
-        let exported = kg.export("json").unwrap();
+        let exported = kg.export("json", i64::MAX).unwrap();
         assert!(exported.contains("exp"));
         assert!(exported.contains("o"));
     }
@@ -3070,5 +3194,366 @@ mod tests {
         // delete reverts stats
         kg.delete_entities(&["stat".into()]).unwrap();
         assert_eq!(kg.get_entity_count().unwrap(), 0);
+    }
+
+    // ── Helpers for the fix-specific suites ────────────────────────────────
+
+    fn new_kg_with_pool(read_pool_size: usize) -> TestKg {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("kg_pool_{}_{}.db", std::process::id(), n));
+        cleanup_db(&path);
+        let kg = GraphHandle::new(
+            &path,
+            Durability::Async,
+            268_435_456,
+            NonZeroUsize::new(10_000).unwrap(),
+            read_pool_size,
+        )
+        .expect("create KG");
+        TestKg(kg, path)
+    }
+
+    fn seed_line(kg: &GraphHandle, n: usize) {
+        let entities: Vec<Entity> = (0..n)
+            .map(|i| Entity {
+                name: format!("n{i}"),
+                entity_type: "node".into(),
+                observations: vec![format!("obs of n{i}")],
+            })
+            .collect();
+        kg.create_entities(&entities).unwrap();
+        let rels: Vec<Relation> = (0..n.saturating_sub(1))
+            .map(|i| Relation {
+                from: format!("n{i}"),
+                to: format!("n{}", i + 1),
+                relation_type: "edge".into(),
+            })
+            .collect();
+        if !rels.is_empty() {
+            kg.create_relations(&rels).unwrap();
+        }
+    }
+
+    fn count_relations(graph_json: &str) -> usize {
+        let v: Value = serde_json::from_str(graph_json).unwrap();
+        v["relations"].as_array().unwrap().len()
+    }
+
+    fn count_entities(graph_json: &str) -> usize {
+        let v: Value = serde_json::from_str(graph_json).unwrap();
+        v["entities"].as_array().unwrap().len()
+    }
+
+    // ── Fix #1: reader pool / concurrency ──────────────────────────────────
+
+    #[test]
+    fn test_pool_size_one_still_works() {
+        let kg = new_kg_with_pool(1);
+        seed_line(&kg, 5);
+        assert_eq!(kg.get_entity_count().unwrap(), 5);
+        assert!(kg.get_entity("n2").unwrap().is_some());
+        let g = kg.read_graph_filtered(None, 0, usize::MAX).unwrap();
+        assert_eq!(count_entities(&g), 5);
+    }
+
+    #[test]
+    fn test_reads_see_committed_writes() {
+        // A read on a pool connection must observe a just-committed write made on
+        // the writer connection (WAL visibility).
+        let kg = new_kg_with_pool(4);
+        kg.create_entities(&[Entity {
+            name: "fresh".into(),
+            entity_type: "t".into(),
+            observations: vec!["v".into()],
+        }])
+        .unwrap();
+        // get_entity goes through the reader pool.
+        let got = kg.get_entity("fresh").unwrap().unwrap();
+        assert_eq!(got.observations, vec!["v"]);
+    }
+
+    #[test]
+    fn test_concurrent_readers_consistent() {
+        // Many readers hammering the pool while the writer mutates must never
+        // panic, deadlock, or observe a torn graph. The final counts must match.
+        let kg = new_kg_with_pool(4);
+        seed_line(&kg, 50);
+
+        std::thread::scope(|s| {
+            // 8 reader threads.
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        let _ = kg.get_entity("n10");
+                        let _ = kg.search_nodes_filtered("obs", None, 0, 10);
+                        let _ = kg.read_graph_filtered(None, 0, 100);
+                        let _ = kg.get_entity_count();
+                        let _ = kg.neighbors("n10", Direction::Both, None, 2);
+                    }
+                });
+            }
+            // 1 writer thread adding more entities concurrently.
+            s.spawn(|| {
+                for i in 100..160 {
+                    kg.create_entities(&[Entity {
+                        name: format!("w{i}"),
+                        entity_type: "node".into(),
+                        observations: vec![format!("w obs {i}")],
+                    }])
+                    .unwrap();
+                }
+            });
+        });
+
+        // 50 seeded + 60 written.
+        assert_eq!(kg.get_entity_count().unwrap(), 110);
+        assert!(kg.get_entity("w159").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_reader_pool_rejects_writes_internally() {
+        // Sanity: query_only readers cannot mutate. We can't call a write through
+        // the pool directly, but we can confirm a read method that *would* have
+        // inserted (search_relations resolving a missing type) does not create a
+        // phantom type — see the dedicated test below — and that reads under a
+        // size-1 pool serialize correctly without deadlock.
+        let kg = new_kg_with_pool(1);
+        seed_line(&kg, 3);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..100 {
+                        let _ = kg.read_graph_filtered(None, 0, 10);
+                    }
+                });
+            }
+        });
+        assert_eq!(kg.get_entity_count().unwrap(), 3);
+    }
+
+    // ── Fix #6: read_graph relation scoping + export bound ─────────────────
+
+    #[test]
+    fn test_read_graph_relations_scoped_to_page() {
+        let kg = new_kg_with_pool(2);
+        // n0 -> n1 -> n2 -> n3 (4 entities, 3 edges).
+        seed_line(&kg, 4);
+
+        // Full page: all 3 edges present.
+        let full = kg.read_graph_filtered(None, 0, usize::MAX).unwrap();
+        assert_eq!(count_entities(&full), 4);
+        assert_eq!(count_relations(&full), 3);
+
+        // Page of only the first entity (n0): its only edge n0->n1 has an
+        // endpoint (n1) outside the page, so no relations are returned.
+        let page1 = kg.read_graph_filtered(None, 0, 1).unwrap();
+        assert_eq!(count_entities(&page1), 1);
+        assert_eq!(count_relations(&page1), 0);
+
+        // Page of first two entities (n0, n1): edge n0->n1 fully inside, n1->n2
+        // straddles the boundary and is excluded.
+        let page2 = kg.read_graph_filtered(None, 0, 2).unwrap();
+        assert_eq!(count_entities(&page2), 2);
+        assert_eq!(count_relations(&page2), 1);
+    }
+
+    #[test]
+    fn test_read_graph_pagination_offset() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 5);
+        let g = kg.read_graph_filtered(None, 2, 2).unwrap();
+        assert_eq!(count_entities(&g), 2);
+        // Entities are ordered by id; offset 2 skips n0, n1.
+        assert!(!g.contains("\"n0\""));
+        assert!(!g.contains("\"n1\""));
+        assert!(g.contains("\"n2\""));
+        assert!(g.contains("\"n3\""));
+    }
+
+    #[test]
+    fn test_read_graph_empty() {
+        let kg = new_kg_with_pool(2);
+        let g = kg.read_graph_filtered(None, 0, usize::MAX).unwrap();
+        assert_eq!(g, r#"{"entities":[],"relations":[]}"#);
+    }
+
+    #[test]
+    fn test_read_graph_filtered_by_type() {
+        let kg = new_kg_with_pool(2);
+        kg.create_entities(&[
+            Entity { name: "p1".into(), entity_type: "person".into(), observations: vec![] },
+            Entity { name: "q1".into(), entity_type: "place".into(), observations: vec![] },
+            Entity { name: "p2".into(), entity_type: "person".into(), observations: vec![] },
+        ])
+        .unwrap();
+        let g = kg.read_graph_filtered(Some("person"), 0, usize::MAX).unwrap();
+        assert_eq!(count_entities(&g), 2);
+        assert!(g.contains("\"p1\""));
+        assert!(g.contains("\"p2\""));
+        assert!(!g.contains("\"q1\""));
+    }
+
+    #[test]
+    fn test_export_respects_max_rows() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 5);
+
+        // Unbounded export returns everything.
+        let full = kg.export("json", i64::MAX).unwrap();
+        assert_eq!(count_entities(&full), 5);
+        assert_eq!(count_relations(&full), 4);
+
+        // Capped export truncates both arrays to the cap.
+        let capped = kg.export("json", 2).unwrap();
+        assert_eq!(count_entities(&capped), 2);
+        assert_eq!(count_relations(&capped), 2);
+    }
+
+    #[test]
+    fn test_export_negative_max_rows_is_unbounded() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 3);
+        // SQLite treats a negative LIMIT as "no limit".
+        let out = kg.export("json", -1).unwrap();
+        assert_eq!(count_entities(&out), 3);
+    }
+
+    // ── Fix #8: writes remain correct without the per-write PRAGMA optimize ─
+
+    #[test]
+    fn test_many_small_write_batches_stay_consistent() {
+        let kg = new_kg_with_pool(2);
+        for i in 0..100 {
+            kg.create_entities(&[Entity {
+                name: format!("e{i}"),
+                entity_type: "t".into(),
+                observations: vec![format!("o{i}")],
+            }])
+            .unwrap();
+        }
+        assert_eq!(kg.get_entity_count().unwrap(), 100);
+        // Search must still find a needle inserted across many tiny batches,
+        // proving FTS stayed consistent without per-write optimization.
+        let hits = kg.search_nodes_filtered("e57", None, 0, 10);
+        assert!(hits.iter().any(|e| e.name == "e57"));
+    }
+
+    // ── Fix #9: wipe fully resets the FTS indexes ──────────────────────────
+
+    #[test]
+    fn test_wipe_clears_name_and_obs_fts() {
+        let kg = new_kg_with_pool(2);
+        kg.create_entities(&[Entity {
+            name: "Einstein".into(),
+            entity_type: "scientist".into(),
+            observations: vec!["physics".into()],
+        }])
+        .unwrap();
+
+        // Both FTS indexes resolve before the wipe.
+        assert_eq!(kg.search_nodes_filtered("Einstein", None, 0, 10).len(), 1);
+        assert_eq!(kg.search_nodes_filtered("physics", None, 0, 10).len(), 1);
+
+        kg.wipe().unwrap();
+
+        // After wipe both indexes must be empty (a bare DELETE on an
+        // external-content FTS5 table would have left stale rowids behind).
+        assert_eq!(kg.get_entity_count().unwrap(), 0);
+        assert!(kg.search_nodes_filtered("Einstein", None, 0, 10).is_empty());
+        assert!(kg.search_nodes_filtered("physics", None, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_wipe_then_recreate_search_works() {
+        // Recreating the same names after a wipe must produce a clean, searchable
+        // index — not a corrupted one or duplicate FTS rows.
+        let kg = new_kg_with_pool(2);
+        kg.create_entities(&[Entity {
+            name: "Einstein".into(),
+            entity_type: "scientist".into(),
+            observations: vec!["physics".into()],
+        }])
+        .unwrap();
+        kg.wipe().unwrap();
+
+        kg.create_entities(&[Entity {
+            name: "Einstein".into(),
+            entity_type: "scientist".into(),
+            observations: vec!["physics".into(), "relativity".into()],
+        }])
+        .unwrap();
+
+        let by_name = kg.search_nodes_filtered("Einstein", None, 0, 10);
+        assert_eq!(by_name.len(), 1, "exactly one Einstein after recreate");
+        let by_obs = kg.search_nodes_filtered("relativity", None, 0, 10);
+        assert_eq!(by_obs.len(), 1);
+        assert_eq!(kg.get_entity_count().unwrap(), 1);
+    }
+
+    // ── Read-only type/entity resolution (introduced by the reader pool) ───
+
+    #[test]
+    fn test_search_relations_missing_type_returns_empty() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 3); // edges of type "edge"
+        // A filter for a relation type that does not exist must return nothing,
+        // not every relation — and must not create a phantom type row.
+        let r = kg.search_relations(None, None, Some("does_not_exist"));
+        assert!(r.is_empty());
+        // The phantom type must not have been inserted by the read.
+        let types = kg.relation_type_counts();
+        assert!(types.iter().all(|(t, _)| t != "does_not_exist"));
+    }
+
+    #[test]
+    fn test_search_relations_missing_from_returns_empty() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 3);
+        let r = kg.search_relations(Some("ghost"), None, None);
+        assert!(r.is_empty(), "missing 'from' must not match every relation");
+    }
+
+    #[test]
+    fn test_search_relations_existing_filters_still_work() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 3);
+        let r = kg.search_relations(Some("n0"), None, Some("edge"));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].from, "n0");
+        assert_eq!(r[0].to, "n1");
+    }
+
+    #[test]
+    fn test_neighbors_missing_type_returns_only_start() {
+        let kg = new_kg_with_pool(2);
+        seed_line(&kg, 3);
+        let json = kg
+            .neighbors("n0", Direction::Both, Some("nonexistent"), 2)
+            .unwrap();
+        // No edge matches the bogus type, so only the start node comes back.
+        assert_eq!(count_entities(&json), 1);
+        assert_eq!(count_relations(&json), 0);
+    }
+
+    #[test]
+    fn test_neighbors_existing_type_filters() {
+        let kg = new_kg_with_pool(2);
+        kg.create_entities(&[
+            Entity { name: "a".into(), entity_type: "n".into(), observations: vec![] },
+            Entity { name: "b".into(), entity_type: "n".into(), observations: vec![] },
+            Entity { name: "c".into(), entity_type: "n".into(), observations: vec![] },
+        ])
+        .unwrap();
+        kg.create_relations(&[
+            Relation { from: "a".into(), to: "b".into(), relation_type: "knows".into() },
+            Relation { from: "a".into(), to: "c".into(), relation_type: "likes".into() },
+        ])
+        .unwrap();
+        let json = kg.neighbors("a", Direction::Outgoing, Some("knows"), 1).unwrap();
+        assert!(json.contains("\"b\""));
+        assert!(!json.contains("\"c\""));
+        assert_eq!(count_relations(&json), 1);
     }
 }

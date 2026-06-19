@@ -357,6 +357,34 @@ fn e2e_relations_and_describe() {
 }
 
 #[test]
+fn e2e_read_graph_relations_scoped_to_page() {
+    let mut c = spawn_server();
+
+    c.tool_text("create_entities", serde_json::json!({"entities": [
+        {"name": "A", "entityType": "n", "observations": []},
+        {"name": "B", "entityType": "n", "observations": []},
+        {"name": "C", "entityType": "n", "observations": []}
+    ]}));
+    c.tool_text("create_relations", serde_json::json!({"relations": [
+        {"from": "A", "to": "B", "relationType": "edge"},
+        {"from": "B", "to": "C", "relationType": "edge"}
+    ]}));
+
+    // Full read_graph: both edges present.
+    let full = c.tool_text("read_graph", serde_json::json!({}));
+    let v: serde_json::Value = serde_json::from_str(&full).unwrap();
+    assert_eq!(v["entities"].as_array().unwrap().len(), 3, "all entities: {full}");
+    assert_eq!(v["relations"].as_array().unwrap().len(), 2, "both edges: {full}");
+
+    // First-entity page (A): its edge A->B straddles the page boundary, so no
+    // relations are returned.
+    let page = c.tool_text("read_graph", serde_json::json!({"limit": 1}));
+    let v: serde_json::Value = serde_json::from_str(&page).unwrap();
+    assert_eq!(v["entities"].as_array().unwrap().len(), 1, "one entity: {page}");
+    assert_eq!(v["relations"].as_array().unwrap().len(), 0, "no scoped edges: {page}");
+}
+
+#[test]
 fn e2e_search_edge_cases() {
     let mut c = spawn_server();
 

@@ -48,6 +48,8 @@ pub struct Config {
     pub auth_token: Option<Arc<str>>,
     pub mmap_size: i64,
     pub lru_cache_size: usize,
+    /// Size of the read-only connection pool (concurrent reads). Always >= 1.
+    pub read_pool_size: usize,
 }
 
 impl Config {
@@ -98,6 +100,7 @@ impl Config {
             auth_token,
             mmap_size: args.mmap_size,
             lru_cache_size: args.lru_cache_size,
+            read_pool_size: args.read_pool_size.max(1),
         })
     }
 }
@@ -112,6 +115,7 @@ impl Default for Config {
             auth_token: None,
             mmap_size: 268435456,
             lru_cache_size: 10000,
+            read_pool_size: 4,
         }
     }
 }

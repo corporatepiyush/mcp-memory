@@ -14,6 +14,10 @@ const MAX_SEARCH_LIMIT: usize = 1000;
 const MAX_RELATION_SEARCH_RESULTS: usize = 1000;
 const MAX_FIND_ALL_PATHS_DEPTH: usize = 10;
 const MAX_FIND_ALL_PATHS_RESULTS: usize = 100;
+/// Upper bound on rows returned per array by `export_graph`. A guard against an
+/// unbounded in-memory JSON string, not a functional limit — realistic graphs
+/// are far smaller.
+const MAX_EXPORT_ROWS: i64 = 1_000_000;
 /// Default page size for `search_nodes` when the caller omits `limit`.
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 
@@ -561,6 +565,6 @@ pub fn handle_export_graph(kg: &GraphHandle, args: Option<&Value>) -> Result<Val
         .and_then(|v| v.as_str())
         .unwrap_or("json");
 
-    let text = kg.export(format)?;
+    let text = kg.export(format, MAX_EXPORT_ROWS)?;
     Ok(text_content!(text))
 }
