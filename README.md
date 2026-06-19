@@ -2,27 +2,27 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server providing
 LLM agents with a persistent **knowledge graph memory** — entities, relations, and
-observations stored in an LSM-tree-backed embedded database.
+observations stored in an embedded SQLite database with FTS5 full-text search.
 
 Speaks MCP over stdio, TCP, and HTTP transports.
 
 ```
-                   ┌──────────────────────────────────────────────┐
-                   │              mcp-memory server               │
-                   │                                              │
-    ┌───────┐      │  ┌──────────┐   ┌───────────────────────┐   │
-    │Claude │──────│─>│  stdio /  │──>│ GraphHandle           │   │
-    │Desktop│      │  │  TCP /   │   │  ├ LRU entity cache    │   │
-    └───────┘      │  │  HTTP    │   │  ├ LRU adj cache       │   │
-                   │  └──────────┘   │  ├ BM25 search index   │   │
-                   │         │       │  └──→ TidesStore ──→   │   │
-                   │         v       └──────────┬──────────────┘   │
-                   │  ┌─────────────────────────┴─────────────┐   │
-                   │  │  TidesDB (LSM-tree, 6 column families) │   │
-                   │  │  entities, rel_out/in, search/inv,    │   │
-                   │  │  metadata                              │   │
-                   │  └───────────────────────────────────────┘   │
-                   └──────────────────────────────────────────────┘
+                    ┌──────────────────────────────────────────────┐
+                    │              mcp-memory server               │
+                    │                                              │
+     ┌───────┐      │  ┌──────────┐   ┌───────────────────────┐   │
+     │Claude │──────│─>│  stdio /  │──>│ GraphHandle           │   │
+     │Desktop│      │  │  TCP /   │   │  ├ LRU entity cache    │   │
+     └───────┘      │  │  HTTP    │   │  ├ FxHashMap name→ID   │   │
+                    │  └──────────┘   │  ├ FTS5 full-text idx  │   │
+                    │         │       │  └──→ SQLite ──→       │   │
+                    │         v       └──────────┬──────────────┘   │
+                    │  ┌─────────────────────────┴─────────────┐   │
+                    │  │  SQLite (WAL mode, 16 KB pages)        │   │
+                    │  │  entity, observation, relation,        │   │
+                    │  │  name_fts, obs_fts, type_dict          │   │
+                    │  └───────────────────────────────────────┘   │
+                    └──────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -63,6 +63,18 @@ The database path is resolved in order:
 }
 ```
 
+### Claude Code config
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "mcp-memory"
+    }
+  }
+}
+```
+
 ### Authentication
 
 The `tcp` and `http` transports accept an optional bearer token (stdio is never
@@ -86,7 +98,7 @@ Implements the [Model Context Protocol](https://modelcontextprotocol.io) revisio
 | Transports | stdio, TCP, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
 | Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
 | `initialize` | version negotiation + `instructions` |
-| `tools/list`, `tools/call` | 24 tools |
+| `tools/list`, `tools/call` | 26 tools |
 | `CallToolResult` | `content[]` + `isError` |
 | Auth | optional bearer token on TCP/HTTP (constant-time) |
 | Capabilities advertised | `tools` only |
@@ -99,7 +111,7 @@ JSON-RPC protocol errors) so the model can self-correct.
 ```
 Entity(name, entityType, observations[])
   |                          |
-  |  ——— relationType ———→   |
+  |  —— relationType ——→   |
   v                          v
 Entity(name, entityType, observations[])
 ```
@@ -110,74 +122,92 @@ Entity(name, entityType, observations[])
   entities. Relations are undirected in traversal (BFS follows both ways).
 - **Observation** — an unstructured fact attached to an entity.
 
-Search uses [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) tokenization via
-the `bm25` crate. The inverted index maps token IDs to entity names with BM25
-weights, stored in the `search_inv` column family.
+Search uses FTS5 full-text indexing with `unicode61 remove_diacritics 2`
+tokenization. Name and observation bodies live in separate FTS5 virtual tables
+(`name_fts`, `obs_fts`) with external content referencing the core tables.
 
 ## Data structures & performance
 
-### Storage engine: TidesDB (embedded LSM-tree)
+### Storage engine: SQLite (WAL mode)
 
-Six column families in a single TidesDB database:
+A single SQLite database in WAL mode with the following schema:
 
-| Column family | Key | Value | Purpose |
-|---|---|---|---|
-| `entities` | entity name (UTF-8) | bincode-serialized Entity | Primary entity storage |
-| `rel_out` | `from\|to\|type` | `[0u8]` (1 byte) | Outgoing relation index |
-| `rel_in` | `to\|from\|type` | `[0u8]` (1 byte) | Incoming relation index |
-| `search` | entity name (UTF-8) | bincode (token indices + weights) | BM25 embedding storage |
-| `search_inv` | `{:010}\|name` (padded token idx) | f32 LE bytes | Inverted token → entity index |
-| `metadata` | — | — | Reserved |
+| Table | Key | Purpose |
+|---|---|---|
+| `entity` | `INTEGER PRIMARY KEY` (rowid) | Primary entity storage; materialized `obs_count`, `out_deg`, `in_deg`; `name_hash` for O(1) routing |
+| `observation` | `entity_id` (FK) + rowid | 1:N observations per entity |
+| `relation` | composite indexes | Directed edges; covering indexes `rel_out(from_id,type_id,to_id)` and `rel_in(to_id,type_id,from_id)` for index-only scans |
+| `name_fts` | `content_rowid` | External-content FTS5 over `entity.name` |
+| `obs_fts` | `content_rowid` | External-content FTS5 over `observation.body` |
+| `type_dict` | name | Interned entity/relation types with live counts (loaded into RAM) |
+| `graph_stat` | key (singleton) | `WITHOUT ROWID` counters: entities, relations, observations, entity_seq, obs_seq |
+| `hub_degree` | entity_id | Degree spill for high-degree hubs |
+| `partition_map` | entity_id | Reserved for future entity-type partitioning |
+
+Key SQLite pragmas: `page_size=16384`, `journal_mode=WAL`, `synchronous=NORMAL`,
+`cache_size=-50000` (~50 MB), `mmap_size=256 MB`, `temp_store=MEMORY`,
+`busy_timeout=5000`.
 
 ### In-memory caches (GraphHandle)
 
 | Cache | Size | Purpose |
 |---|---|---|
-| Entity LRU | 10,000 entries | Avoids deserializing hot entities |
-| Adjacency LRU | 5,000 entries | Avoids re-reading relation iterators |
-| Token invert cache | 10,000 entries | Avoids re-reading search_inv rows |
+| Entity LRU | 10,000 entries | Avoids deserializing hot entities; stores `EntityMeta{id, type_id, obs_count, out_deg, in_deg}` |
+| Name hash FxHashMap | all loaded | O(1) name-to-ID resolution via 64-bit FNV-1a hash |
+| Prepared statement cache | SQLite internal | Reuses compiled queries |
 
 ### Write batching
 
 Every mutation goes through a layered write path:
 
 1. **Existence checks** — batch-read entity existence in one read transaction
-2. **Batch commit** — all new entities written in one write transaction
-3. **Batch index** — all BM25 embeddings written in one write transaction
+2. **Batch commit** — all new entities/relations written in one write transaction
+3. **Batch index** — all FTS entries updated in one write transaction
 4. **Cache invalidation** — LRU entries for affected names are evicted
 
 This reduces transaction count from O(N) to O(1) per `create_entities`/`create_relations` call.
 
+### Durability
+
+| Mode | Behavior | Data loss window |
+|---|---|---|
+| `async` (default) | Flush to kernel page cache, background sync | Up to ~1 second on power failure |
+| `sync` | fsync before every write | Zero |
+
+Set via `MCP_MEMORY_DURABILITY=sync`.
+
+### Background maintenance
+
+A background tokio task runs every 5 minutes and performs WAL checkpointing
+(`PRAGMA wal_checkpoint(TRUNCATE)`), query planner analysis (`PRAGMA optimize`),
+and FTS optimization.
+
 ## Benchmarks
 
-Measured end-to-end via stdio (spawn server subprocess, JSON-RPC round-trip).
-1,000 entities + 200 relations pre-populated. MacBook Pro (M4 Pro, 24 GB).
+Measured end-to-end via the `bench` binary. 1,000 entities + 200 relations
+pre-populated. MacBook Pro (M4 Pro, 24 GB).
 
-Run `cargo run --release --bin bench_stdio` on your target hardware.
+Run `cargo run --release --bin bench` on your target hardware.
 
 | Operation | Avg latency | Notes |
 |---|---|---|
-| `get_entity` | 20 µs | LRU cache hit hot path |
-| `search_nodes` | 30 µs | Query token → invert index → entity lookup |
-| `open_nodes` (10 names) | 25 µs | Batch get via LRU + store |
-| `neighbors` depth=1 | 30 µs | Outgoing relation scan |
-| `find_path` (BFS) | 670 µs | Worst case: target not found, full BFS |
-| `describe_entity` | 30 µs | Entity + incident relations |
-| `graph_stats` | 135 µs | Entity count + obs count + relation count |
-| `read_graph` | 900 µs | Full dump: all entities + all relations |
-| `graph_stats` (throughput, pipelined) | — | **8,200 req/s** |
-| `create_entities` (10 new) | 35 µs | Batch existence check + batch put + batch index |
-| `create_relations` (10 new) | 47 µs | Batch entity checks + batch dup check + batch put |
-
-### How writes scale
-
-| Batch size | `create_entities` | `create_relations` |
-|---|---|---|
-| 1 entity | ~15 µs | — |
-| 10 entities | **35 µs** (0.29 µs/entity overhead) | — |
-| 10 relations | — | **47 µs** (0.47 µs/relation overhead) |
-
-Per-element overhead comes from BM25 embedding computation (Rust-side, not I/O bound).
+| `get_entity` (cache hit) | ~20 µs | LRU hit; no SQLite I/O |
+| `search_nodes` (name match) | ~25 µs | FTS5 query + entity lookup |
+| `open_nodes` (single) | ~30 µs | LRU + SQLite |
+| `open_nodes` (5 names) | ~60 µs | Batch fetch |
+| `neighbors` depth=1 | ~30 µs | Index-only scan via covering index |
+| `neighbors` depth=2 | ~55 µs | Two-hop traversal |
+| `find_path` (BFS) | ~650 µs | Worst case: target not found, full BFS |
+| `describe_entity` | ~30 µs | Entity + incident relations |
+| `graph_stats` | ~15 µs | RAM counters (graph_stat table) |
+| `read_graph` (all) | ~1500 µs | Full dump: all entities + relations |
+| `create_entities` (1000) | ~2000 µs | Batch write + FTS index |
+| `create_relations` (999) | ~1200 µs | Batch write + degree updates |
+| `find_all_paths` (A→C, depth 5) | ~100 µs | Bounded DFS |
+| `export_graph` (JSON) | ~600 µs | Serialize all entities + relations |
+| `entity_type_counts` | ~10 µs | RAM-cached type dictionary |
+| `degree` (cache hit) | ~2 µs | Materialized column |
+| `entities_exist` (10 names) | ~15 µs | Hash lookup via FxHashMap |
 
 ## Tools
 
@@ -191,24 +221,26 @@ Per-element overhead comes from BM25 embedding computation (Rust-side, not I/O b
 - `delete_relations` — remove exact (from, to, type) tuples
 - `upsert_entities` — create or merge (type preserved, observations unioned)
 - `merge_entities` — source → target redirect with full dedup
-- `compact` — compact all column families in TidesDB
+- `compact` — trigger incremental vacuum + FTS optimize
 
 ### Read tools
 
-- `read_graph` — dump all entities + relations
-- `search_nodes` — BM25-ranked search over names, types, observations
-- `open_nodes` — fetch specific entities by name
+- `read_graph` — dump all entities + relations (with optional type filter, offset, limit)
+- `search_nodes` — FTS5-ranked search over names, types, observations (with optional type filter)
+- `open_nodes` — fetch specific entities by name (with their relations)
 - `batch_get_entities` — bulk entity fetch (order preserved, null for missing)
 - `get_entity` — single entity by name
+- `entity_exists` — cheap existence check (hash lookup, no observation bodies fetched)
 - `graph_stats` — entity count, relation count, total observations
 - `search_relations` — filter by from/to/type
 - `describe_entity` — entity + incident relations + neighbors + degree
+- `degree` — number of incident relations by direction (outgoing / incoming / both)
 - `find_path` — BFS shortest path (undirected)
 - `find_all_paths` — DFS all simple paths (bounded by maxDepth, maxPaths)
 - `extract_subgraph` — BFS around seed entities to given depth
-- `neighbors` — entity neighbors with direction + type + depth filters
-- `entity_type_counts` — type → count, ranked
-- `relation_type_counts` — type → count, ranked
+- `get_neighbors` — entity neighbors with direction + type + depth filters
+- `list_entity_types` — type → count, ranked
+- `list_relation_types` — type → count, ranked
 - `export_graph` — JSON, Mermaid, or Graphviz DOT
 
 ## Architecture
@@ -223,7 +255,7 @@ main.rs
         └── process_request()
               │
               ├── "initialize"     → protocol version + capabilities
-              ├── "tools/list"     → cached from tools.json
+              ├── "tools/list"     → cached from tools.rs
               ├── "tools/call"     → dispatches to handler by name
               ├── "ping"           → null
               └── "notifications/" → no reply
@@ -234,50 +266,74 @@ All three transports share `process_value()` / `dispatch_line()` / `dispatch_htt
 
 ### Locking
 
-- `GraphHandle` uses `parking_lot::RwLock` for LRU caches (entity_cache, adj_cache)
-- All `GraphHandle` methods take `&self` — internal `RwLock` handles mutation
+- `GraphHandle` uses `parking_lot::Mutex` for the SQLite connection and LRU caches
+- All `GraphHandle` methods take `&self` — internal `Mutex` handles mutation
 - Tokio multi-thread runtime handles concurrent requests
-- TidesDB handles its own internal locking (MVCC + latches)
+- SQLite WAL mode allows concurrent readers + one writer
+- Heavy dispatch (graph lock + optional fsync) is offloaded to `tokio::task::spawn_blocking`
 
 ### Write path
 
 ```
 create_entities([e1, e2, ...])
-  1. Batch-check existence: entities_exist_batch (one read txn)
-  2. Batch-put: put_entities_batch (one write txn)
-  3. Batch-index: search.index_entities_batch (BM25 embed + one write txn)
+  1. Batch-check existence (FxHashMap hash lookup)
+  2. Batch-insert entities (one write txn)
+  3. Batch-index FTS (one write txn for name_fts)
   4. Invalidate LRU caches
+  5. Update type_dict counts
 ```
 
-The same batching pattern applies to `create_relations`.
+The same batching pattern applies to `create_relations` (with degree updates).
 
-### Storage (TidesDB)
+### Storage (SQLite)
 
-TidesDB is an embedded LSM-tree database with:
+SQLite provides the storage layer with:
 
-- **Memtable** — in-memory write buffer (WAL-backed)
-- **SSTables** — sorted immutable files on disk (LZ4-compressed blocks)
-- **Bloom filters** — per-SSTable, ~1/128 false positive rate
-- **Compaction** — background level merge to maintain read performance
-- **WAL** — write-ahead log for crash recovery
+- **WAL mode** — concurrent readers + one writer without blocking readers
+- **16 KB pages** — shallower B-trees for faster lookups
+- **FTS5** — full-text search with `unicode61 remove_diacritics 2` tokenization
+- **mmap** — up to 256 MB of the database mapped for faster reads
+- **Covering indexes** — `rel_out` and `rel_in` enable index-only neighbor scans
+- **Materialized counters** — `obs_count`, `out_deg`, `in_deg`, `type_dict.count`, `graph_stat` are writer-maintained for O(1) reads
+- **External-content FTS5** — avoids duplicating text; stable `INTEGER PRIMARY KEY` ensures `content_rowid` correctness across VACUUM
 
-TidesDB uses `Async` durability by default (flush to kernel page cache, background
-sync). This gives sub-millisecond write latencies with at-most-1-second data loss
-on power failure. Set `MEMORY_MEMORY_DURABILITY=sync` for fsync-on-every-write.
+### Concurrency model
+
+- TCP connections limited to 128 concurrent connections
+- Mutating operations acquire `GraphHandle` lock and serialize through SQLite
+- Read operations can proceed concurrently under WAL mode
+- Background maintenance runs every 5 minutes as a tokio task
+
+### Request size limits
+
+| Parameter | Limit |
+|---|---|
+| Max request body | 16 MB |
+| Name max bytes | 1024 |
+| Observation max bytes | 65,536 |
+| Max entities per request | 1,000 |
+| Max relations per request | 1,000 |
+| Max observations per entity | 1,000 |
+| Max names per request | 1,000 |
+| Max search limit | 1,000 |
+| Max neighbor depth | 16 |
+| Max relation search results | 1,000 |
+| Max find_all_paths depth | 10 |
+| Max find_all_paths results | 100 |
 
 ## Development
 
 ```sh
-cargo test             # unit + integration + fuzzy (128+ tests)
+cargo test             # unit + integration + fuzzy (300+ tests)
 cargo clippy --all-targets
-cargo build --release  # LTO + panic=abort
-cargo run --release --bin bench_stdio  # stdio round-trip benchmarks
+cargo build --release  # LTO + fat, panic=abort, strip
+cargo run --release --bin bench  # standalone benchmark
 ```
 
 The test suite includes:
 - **Unit tests** — protocol, tools, config, error codes
 - **Integration tests** — CRUD persistence, search, paths, export, concurrency,
-  all 24 tool handlers, invariants
+  all 26 tool handlers, invariants
 - **Fuzzy tests** — randomized CRUD sequences asserting graph invariants
 
 ## Versioning & Compatibility
