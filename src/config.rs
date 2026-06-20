@@ -50,6 +50,12 @@ pub struct Config {
     pub lru_cache_size: usize,
     /// Size of the read-only connection pool (concurrent reads). Always >= 1.
     pub read_pool_size: usize,
+    /// PEM certificate chain for serving the `http` transport over TLS (HTTPS).
+    /// `None` (the default) keeps the transport plaintext. Engaged only when
+    /// both `tls_cert` and `tls_key` are set.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -92,6 +98,27 @@ impl Config {
             Durability::Async
         };
 
+        // TLS cert/key for the `http` transport, from CLI flags or env vars.
+        // Both must be supplied together; one without the other is a hard error.
+        let tls_cert = args
+            .tls_cert
+            .clone()
+            .or_else(|| std::env::var("MCP_TLS_CERT").ok())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let tls_key = args
+            .tls_key
+            .clone()
+            .or_else(|| std::env::var("MCP_TLS_KEY").ok())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        if tls_cert.is_some() != tls_key.is_some() {
+            return Err(MCSError::InvalidParams(
+                "--tls-cert and --tls-key must be provided together (or both omitted for plaintext HTTP)"
+                    .to_string(),
+            ));
+        }
+
         Ok(Config {
             memory_file_path,
             transport: args.transport,
@@ -101,6 +128,8 @@ impl Config {
             mmap_size: args.mmap_size,
             lru_cache_size: args.lru_cache_size,
             read_pool_size: args.read_pool_size.max(1),
+            tls_cert,
+            tls_key,
         })
     }
 }
@@ -116,6 +145,8 @@ impl Default for Config {
             mmap_size: 268435456,
             lru_cache_size: 10000,
             read_pool_size: 4,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }

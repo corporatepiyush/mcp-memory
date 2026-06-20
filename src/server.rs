@@ -293,7 +293,14 @@ impl MCPServer {
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
     pub async fn run_http(&self, addr: &str) -> Result<()> {
         spawn_maintenance(self.kg.clone());
-        crate::http::run(addr, self.graph(), self.config.auth_token.clone()).await
+        crate::http::run(
+            addr,
+            self.graph(),
+            self.config.auth_token.clone(),
+            self.config.tls_cert.clone(),
+            self.config.tls_key.clone(),
+        )
+        .await
     }
 }
 

@@ -5,6 +5,7 @@ pub mod http;
 pub mod kg;
 pub mod protocol;
 pub mod server;
+pub mod tls;
 pub mod tools;
 pub mod types;
 
@@ -72,4 +73,15 @@ pub struct Args {
     /// memory. Clamped to at least 1.
     #[arg(long = "read-pool-size", default_value_t = 4)]
     pub read_pool_size: usize,
+
+    /// Path to a PEM certificate chain to serve the `http` transport over TLS
+    /// (HTTPS). Requires --tls-key. Falls back to the MCP_TLS_CERT env var.
+    /// When unset, the `http` transport stays plaintext.
+    #[arg(long = "tls-cert")]
+    pub tls_cert: Option<String>,
+
+    /// Path to the PEM private key matching --tls-cert. Falls back to the
+    /// MCP_TLS_KEY env var.
+    #[arg(long = "tls-key")]
+    pub tls_key: Option<String>,
 }

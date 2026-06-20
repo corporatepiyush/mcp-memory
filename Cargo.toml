@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "3.0.1"
+version = "3.1.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations persisted in SQLite with FTS5 search"
@@ -23,6 +23,11 @@ clap = { version = "4.5", features = ["derive"] }
 parking_lot = "0.12"
 rustc-hash = "2.1"
 axum = "0.8"
+# Server-side TLS (HTTPS) for the axum HTTP transport. `tls-rustls-no-provider`
+# keeps rustls on the process default `ring` crypto provider (installed in
+# src/tls.rs) — no cmake/aws-lc toolchain required.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures = "0.3"
 subtle = "2.6"
 lru = "0.12"

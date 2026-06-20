@@ -49,15 +49,53 @@ pub fn router(state: HttpState) -> Router {
 }
 
 /// Bind `addr` and serve the HTTP transport until the process is killed.
-pub async fn run(addr: &str, kg: Arc<GraphHandle>, auth_token: Option<Arc<str>>) -> Result<()> {
-    let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
-    info!(
-        "Listening for HTTP (Streamable) MCP on http://{addr}/mcp (auth {})",
-        if auth_token.is_some() { "on" } else { "off" }
-    );
+///
+/// When `tls_cert` and `tls_key` are both set, the transport is served over TLS
+/// (HTTPS); otherwise it stays plaintext. The caller (`config.rs`) guarantees
+/// the two are set together.
+pub async fn run(
+    addr: &str,
+    kg: Arc<GraphHandle>,
+    auth_token: Option<Arc<str>>,
+    tls_cert: Option<std::path::PathBuf>,
+    tls_key: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let auth = if auth_token.is_some() { "on" } else { "off" };
     let state = HttpState { kg, auth_token };
-    axum::serve(listener, router(state)).await.map_err(MCSError::IoError)?;
+
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        let tls = crate::tls::server_config(&cert, &key)
+            .await
+            .map_err(MCSError::IoError)?;
+        let socket_addr = resolve_addr(addr)?;
+        info!("Listening for HTTPS (Streamable) MCP on https://{socket_addr}/mcp (TLS, auth {auth})");
+        axum_server::bind_rustls(socket_addr, tls)
+            .serve(router(state).into_make_service())
+            .await
+            .map_err(MCSError::IoError)?;
+    } else {
+        let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
+        info!("Listening for HTTP (Streamable) MCP on http://{addr}/mcp (auth {auth})");
+        axum::serve(listener, router(state))
+            .await
+            .map_err(MCSError::IoError)?;
+    }
     Ok(())
+}
+
+/// Resolve a `host:port` string to a single `SocketAddr` for `axum_server`,
+/// which binds an address rather than an already-bound listener.
+fn resolve_addr(addr: &str) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()
+        .map_err(MCSError::IoError)?
+        .next()
+        .ok_or_else(|| {
+            MCSError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("could not resolve bind address '{addr}'"),
+            ))
+        })
 }
 
 fn wants_sse(headers: &HeaderMap) -> bool {

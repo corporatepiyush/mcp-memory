@@ -89,6 +89,19 @@ mcp-memory --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
 Binding a non-loopback address **without** a token exposes the entire graph to
 the network. Comparison is constant-time.
 
+### TLS (HTTPS)
+
+The `http` transport can be served over TLS (rustls, `ring` provider). Provide a
+PEM certificate chain and private key via `--tls-cert`/`--tls-key` or the
+`MCP_TLS_CERT`/`MCP_TLS_KEY` environment variables and the server speaks HTTPS
+instead of plaintext. The two must be supplied together or startup is refused;
+when neither is set the transport stays plaintext (the default).
+
+```sh
+mcp-memory --transport http --bind 0.0.0.0:8080 \
+  --tls-cert ./cert.pem --tls-key ./key.pem
+```
+
 ## MCP Compliance
 
 Implements the [Model Context Protocol](https://modelcontextprotocol.io) revision **`2025-11-25`** over JSON-RPC 2.0, via stdio, TCP, or HTTP.

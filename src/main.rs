@@ -12,6 +12,10 @@ fn main() -> Result<()> {
 async fn inner_main() -> Result<()> {
     let args = mcp_memory::Args::parse();
 
+    // Install the rustls `ring` crypto provider as the process default up front
+    // (idempotent) so the HTTPS transport can build its TLS config. See src/tls.rs.
+    mcp_memory::tls::ensure_crypto_provider();
+
     init_tracing(&args.log_level)?;
 
     info!("Starting MCP Memory Server");
