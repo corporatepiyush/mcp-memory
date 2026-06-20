@@ -1,9 +1,9 @@
 [package]
 name = "mcp-memory"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 authors = ["Piyush"]
-description = "MCP server for knowledge graph memory — entities, relations, and observations persisted in SQLite with FTS5 search"
+description = "MCP server for knowledge graph memory — entities, relations, and observations in SQLite with FTS5 search, plus optional vector/semantic + hybrid search (usearch HNSW)"
 license = "Apache-2.0"
 repository = "https://github.com/corporatepiyush/mcp-memory"
 readme = "README.md"
@@ -32,6 +32,10 @@ futures = "0.3"
 subtle = "2.6"
 lru = "0.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
+dashmap = "6"
+petgraph = "0.7"
+usearch = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -44,6 +48,10 @@ path = "src/main.rs"
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+
+[[bin]]
+name = "mcp-memory-vec"
+path = "src/bin/vec_main.rs"
 
 [profile.release]
 opt-level = 3

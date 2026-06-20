@@ -1,28 +1,41 @@
 # mcp-memory
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server providing
-LLM agents with a persistent **knowledge graph memory** — entities, relations, and
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives
+LLM agents a persistent **knowledge graph memory** — entities, relations, and
 observations stored in an embedded SQLite database with FTS5 full-text search.
 
-Speaks MCP over stdio, TCP, and HTTP transports.
+The crate ships **two binaries**:
+
+| Binary | What it adds | Tools |
+|---|---|---|
+| `mcp-memory` | The knowledge-graph server | 26 |
+| `mcp-memory-vec` | Everything in `mcp-memory` **plus** vector embeddings and semantic / hybrid search (usearch HNSW) | 32 |
+
+Both speak MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth and TLS).
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │              mcp-memory server               │
-                    │                                              │
-     ┌───────┐      │  ┌──────────┐   ┌───────────────────────┐   │
-     │Claude │──────│─>│  stdio /  │──>│ GraphHandle           │   │
-     │Desktop│      │  │  TCP /   │   │  ├ LRU entity cache    │   │
-     └───────┘      │  │  HTTP    │   │  ├ FxHashMap name→ID   │   │
-                    │  └──────────┘   │  ├ FTS5 full-text idx  │   │
-                    │         │       │  └──→ SQLite ──→       │   │
-                    │         v       └──────────┬──────────────┘   │
-                    │  ┌─────────────────────────┴─────────────┐   │
-                    │  │  SQLite (WAL mode, 16 KB pages)        │   │
-                    │  │  entity, observation, relation,        │   │
-                    │  │  name_fts, obs_fts, type_dict          │   │
-                    │  └───────────────────────────────────────┘   │
-                    └──────────────────────────────────────────────┘
+                    ┌────────────────────────────────────────────────┐
+                    │         mcp-memory / mcp-memory-vec            │
+                    │                                                │
+     ┌───────┐      │  ┌──────────┐   ┌─────────────────────────┐   │
+     │Claude │──────│─>│  stdio / │──>│ GraphHandle             │   │
+     │ / LLM │      │  │  TCP /   │   │  ├ LRU entity cache      │   │
+     └───────┘      │  │  HTTP    │   │  ├ FxHashMap name→ID     │   │
+                    │  └────┬─────┘   │  └ FTS5 full-text index  │   │
+                    │       │         └───────────┬─────────────┘   │
+                    │       │   (vec binary only) │                 │
+                    │       v         ┌───────────┴─────────────┐   │
+                    │  ┌─────────┐    │ VectorStore             │   │
+                    │  │ dispatch│───>│  ├ usearch HNSW index    │   │
+                    │  └─────────┘    │  └ petgraph adjacency    │   │
+                    │       │         └───────────┬─────────────┘   │
+                    │       v                     v                  │
+                    │  ┌──────────────────────────────────────────┐ │
+                    │  │ SQLite (WAL, 16 KB pages)                 │ │
+                    │  │ entity, observation, relation, *_fts,     │ │
+                    │  │ type_dict, vector_embedding               │ │
+                    │  └──────────────────────────────────────────┘ │
+                    └────────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -31,17 +44,27 @@ Speaks MCP over stdio, TCP, and HTTP transports.
 cargo install mcp-memory
 ```
 
+This installs both `mcp-memory` and `mcp-memory-vec`.
+
 ## Quick start
 
 ```sh
+# Knowledge-graph server
 mcp-memory --transport stdio
+
+# Knowledge-graph + vector search
+mcp-memory-vec --transport stdio --embedding-dims 384
 ```
 
 The database path is resolved in order:
 
 1. `--memory-file` / `-f` flag
-2. `MEMORY_FILE_PATH` environment variable
+2. `MEMORY_FILE_PATH` environment variable (`mcp-memory` only)
 3. Default: `memory.mcpmem` in the working directory
+
+Both binaries open the **same** SQLite file, so you can populate the graph with
+`mcp-memory` and later serve it with `mcp-memory-vec` (or run a single
+`mcp-memory-vec` for everything).
 
 ### Transports
 
@@ -49,21 +72,9 @@ The database path is resolved in order:
 |-----------|------|-------------|
 | stdio | `--transport stdio` | Newline-delimited JSON over stdin/stdout (default, for Claude Desktop / Claude Code) |
 | tcp | `--transport tcp --bind 0.0.0.0:8080` | Newline-delimited JSON over TCP, concurrent connections |
-| http | `--transport http --bind 0.0.0.0:8080` | MCP Streamable HTTP (POST/GET `/mcp`) |
+| http | `--transport http --bind 0.0.0.0:8080` | MCP Streamable HTTP (POST/GET `/mcp`, SSE) |
 
-### Claude Desktop config
-
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "mcp-memory"
-    }
-  }
-}
-```
-
-### Claude Code config
+### Claude Desktop / Claude Code config
 
 ```json
 {
@@ -74,44 +85,90 @@ The database path is resolved in order:
   }
 }
 ```
+
+Swap `"command"` for `"mcp-memory-vec"` (and add `"args": ["--embedding-dims", "384"]`)
+to enable vector search.
 
 ### Authentication
 
 The `tcp` and `http` transports accept an optional bearer token (stdio is never
-authenticated). Set it with `--auth-token`, `--auth-token-file` (trimmed; an
-empty file is rejected), or `MCP_MEMORY_AUTH_TOKEN`:
+authenticated, on either binary). Set it with `--auth-token` or `--auth-token-file`
+(trimmed; an empty file is rejected). `mcp-memory` additionally falls back to the
+`MCP_MEMORY_AUTH_TOKEN` environment variable.
 
 ```sh
-mcp-memory --transport tcp --bind 0.0.0.0:8080 --auth-token "s3cr3t"
-mcp-memory --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
+mcp-memory      --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
+mcp-memory-vec  --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
 ```
 
-Binding a non-loopback address **without** a token exposes the entire graph to
-the network. Comparison is constant-time.
+On HTTP the token is sent as `Authorization: Bearer <token>`; on TCP it is the
+first line of the connection. Comparison is constant-time. Binding a non-loopback
+address **without** a token exposes the entire graph to the network.
 
 ### TLS (HTTPS)
 
 The `http` transport can be served over TLS (rustls, `ring` provider). Provide a
-PEM certificate chain and private key via `--tls-cert`/`--tls-key` or the
-`MCP_TLS_CERT`/`MCP_TLS_KEY` environment variables and the server speaks HTTPS
-instead of plaintext. The two must be supplied together or startup is refused;
-when neither is set the transport stays plaintext (the default).
+PEM certificate chain and private key via `--tls-cert` / `--tls-key`; both must be
+supplied together or startup is refused. `mcp-memory` also accepts the
+`MCP_TLS_CERT` / `MCP_TLS_KEY` environment variables. When neither is set the
+transport stays plaintext (the default).
 
 ```sh
-mcp-memory --transport http --bind 0.0.0.0:8080 \
+mcp-memory-vec --transport http --bind 0.0.0.0:8080 \
   --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
-## MCP Compliance
+## Vector search (`mcp-memory-vec`)
 
-Implements the [Model Context Protocol](https://modelcontextprotocol.io) revision **`2025-11-25`** over JSON-RPC 2.0, via stdio, TCP, or HTTP.
+`mcp-memory-vec` layers a vector store on top of the knowledge graph. Each
+embedding is attached to an **existing** entity (by name), indexed in an in-memory
+[usearch](https://github.com/unum-cloud/usearch) HNSW index, and persisted as a
+blob in the `vector_embedding` SQLite table. On startup the index is rebuilt from
+those blobs.
+
+- **Bring your own embeddings.** The server stores and searches vectors; it does
+  not call an embedding model. Compute embeddings client-side (e.g. with an
+  embedding API) and pass them in. All vectors must match `--embedding-dims`.
+- **Semantic search** — `vector_search_entities` returns the nearest entities by
+  cosine similarity (configurable), optionally filtered by entity type.
+- **Hybrid search** — `hybrid_search` runs vector search and FTS5 text search in
+  parallel and fuses the two rankings with Reciprocal Rank Fusion (RRF, constant
+  60), then optionally boosts results by graph centrality from an in-memory
+  petgraph adjacency cache.
+
+### Vector configuration
+
+The HNSW index is tunable from the command line:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--embedding-dims` | `384` | Vector dimension; all embeddings must match |
+| `--vec-metric` | `cos` | Distance metric: `cos`, `ip` (dot product), or `l2sq` |
+| `--vec-quantization` | `f32` | Scalar storage: `f32`, `f16`, or `i8` (lower = less memory) |
+| `--vec-connectivity` | `16` | HNSW graph degree `M` (higher = better recall, more memory) |
+| `--vec-expansion-add` | `200` | HNSW `efConstruction` (higher = better index quality, slower inserts) |
+| `--vec-expansion-search` | `50` | HNSW `efSearch` (higher = better recall, slower queries) |
+
+```sh
+mcp-memory-vec --transport http --bind 0.0.0.0:8080 \
+  --embedding-dims 768 --vec-metric cos --vec-quantization f16 \
+  --vec-connectivity 32 --vec-expansion-search 128
+```
+
+The petgraph adjacency cache used for the hybrid-search centrality boost is built
+lazily; call `vector_refresh_graph_cache` after mutating relations to refresh it.
+
+## MCP compliance
+
+Implements the [Model Context Protocol](https://modelcontextprotocol.io) revision
+**`2025-11-25`** over JSON-RPC 2.0, via stdio, TCP, or HTTP.
 
 | Area | Support |
 |---|---|
 | Transports | stdio, TCP, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
 | Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
 | `initialize` | version negotiation + `instructions` |
-| `tools/list`, `tools/call` | 26 tools |
+| `tools/list`, `tools/call` | 26 tools (`mcp-memory`) / 32 tools (`mcp-memory-vec`) |
 | `CallToolResult` | `content[]` + `isError` |
 | Auth | optional bearer token on TCP/HTTP (constant-time) |
 | Capabilities advertised | `tools` only |
@@ -122,28 +179,26 @@ JSON-RPC protocol errors) so the model can self-correct.
 ## Data model
 
 ```
-Entity(name, entityType, observations[])
-  |                          |
-  |  —— relationType ——→   |
-  v                          v
-Entity(name, entityType, observations[])
+Entity(name, entityType, observations[])   ──relationType──▶   Entity(...)
 ```
 
-- **Entity** — a named node with a type (e.g. `person`, `company`, `project`)
-  and free-form observation strings.
-- **Relation** — a directed edge `(from, to, relationType)` between two
-  entities. Relations are undirected in traversal (BFS follows both ways).
+- **Entity** — a named node with a type (e.g. `person`, `company`, `project`) and
+  free-form observation strings. Names are unique and case-sensitive.
+- **Relation** — a directed edge `(from, to, relationType)`. Traversal is
+  undirected (BFS/DFS follow both directions).
 - **Observation** — an unstructured fact attached to an entity.
+- **Embedding** *(vec binary)* — a fixed-dimension `f32` vector attached to an
+  entity, plus an optional model identifier.
 
 Search uses FTS5 full-text indexing with `unicode61 remove_diacritics 2`
-tokenization. Name and observation bodies live in separate FTS5 virtual tables
-(`name_fts`, `obs_fts`) with external content referencing the core tables.
+tokenization. Names and observation bodies live in separate external-content FTS5
+tables (`name_fts`, `obs_fts`).
 
-## Data structures & performance
+## Storage & performance
 
-### Storage engine: SQLite (WAL mode)
+### SQLite (WAL mode)
 
-A single SQLite database in WAL mode with the following schema:
+A single SQLite database in WAL mode:
 
 | Table | Key | Purpose |
 |---|---|---|
@@ -153,209 +208,168 @@ A single SQLite database in WAL mode with the following schema:
 | `name_fts` | `content_rowid` | External-content FTS5 over `entity.name` |
 | `obs_fts` | `content_rowid` | External-content FTS5 over `observation.body` |
 | `type_dict` | name | Interned entity/relation types with live counts (loaded into RAM) |
-| `graph_stat` | key (singleton) | `WITHOUT ROWID` counters: entities, relations, observations, entity_seq, obs_seq |
-| `hub_degree` | entity_id | Degree spill for high-degree hubs |
-| `partition_map` | entity_id | Reserved for future entity-type partitioning |
+| `graph_stat` | key (singleton) | `WITHOUT ROWID` counters: entities, relations, observations, sequences |
+| `vector_embedding` | `entity_id` | *(vec binary)* `dims`, `blob` (f32 vector), `model`, `created_us` |
 
-Key SQLite pragmas: `page_size=16384`, `journal_mode=WAL`, `synchronous=NORMAL`,
+Key pragmas: `page_size=16384`, `journal_mode=WAL`, `synchronous=NORMAL`,
 `cache_size=-50000` (~50 MB), `mmap_size=256 MB`, `temp_store=MEMORY`,
 `busy_timeout=5000`.
 
-### In-memory caches (GraphHandle)
+### In-memory caches
 
-| Cache | Size | Purpose |
-|---|---|---|
-| Entity LRU | 10,000 entries | Avoids deserializing hot entities; stores `EntityMeta{id, type_id, obs_count, out_deg, in_deg}` |
-| Name hash FxHashMap | all loaded | O(1) name-to-ID resolution via 64-bit FNV-1a hash |
-| Prepared statement cache | SQLite internal | Reuses compiled queries |
+| Cache | Purpose |
+|---|---|
+| Entity LRU (10,000 entries) | Avoids deserializing hot entities; stores `EntityMeta{id, type_id, obs_count, out_deg, in_deg}` |
+| Name-hash map | O(1) name-to-ID resolution via 64-bit hash |
+| Prepared-statement cache | Reuses compiled SQLite queries |
+| usearch HNSW index *(vec)* | In-memory ANN index, rebuilt from `vector_embedding` on startup |
+| petgraph adjacency *(vec)* | Directed graph cache for the hybrid-search centrality boost |
 
 ### Write batching
 
-Every mutation goes through a layered write path:
+Every mutation goes through a layered write path that collapses transaction count
+from O(N) to O(1) per `create_entities` / `create_relations` call:
 
-1. **Existence checks** — batch-read entity existence in one read transaction
-2. **Batch commit** — all new entities/relations written in one write transaction
-3. **Batch index** — all FTS entries updated in one write transaction
-4. **Cache invalidation** — LRU entries for affected names are evicted
-
-This reduces transaction count from O(N) to O(1) per `create_entities`/`create_relations` call.
+1. Batch existence checks in one read transaction
+2. Batch commit of all new entities/relations in one write transaction
+3. Batch FTS index updates in one write transaction
+4. Cache invalidation for affected names
 
 ### Durability
 
-| Mode | Behavior | Data loss window |
+| Mode | Behavior | Data-loss window |
 |---|---|---|
-| `async` (default) | Flush to kernel page cache, background sync | Up to ~1 second on power failure |
+| `async` (default) | Flush to kernel page cache, background sync | Up to ~1 s on power failure |
 | `sync` | fsync before every write | Zero |
 
-Set via `MCP_MEMORY_DURABILITY=sync`.
+Set on `mcp-memory` via `MCP_MEMORY_DURABILITY=sync`. (`mcp-memory-vec` runs in
+`async` mode.)
 
 ### Background maintenance
 
-A background tokio task runs every 5 minutes and performs WAL checkpointing
-(`PRAGMA wal_checkpoint(TRUNCATE)`), query planner analysis (`PRAGMA optimize`),
-and FTS optimization.
+A background tokio task runs every 5 minutes: WAL checkpoint
+(`PRAGMA wal_checkpoint(TRUNCATE)`), planner analysis (`PRAGMA optimize`), and FTS
+optimization.
 
 ## Benchmarks
 
-Measured end-to-end via the `bench` binary. 1,000 entities + 200 relations
-pre-populated. MacBook Pro (M4 Pro, 24 GB).
-
-Run `cargo run --release --bin bench` on your target hardware.
+Measured end-to-end via the `bench` binary, 1,000 entities (5 observations each) +
+999 relations pre-populated, on a **MacBook Pro (Apple M1 Pro, 32 GB)**. Numbers
+are averages and will vary by hardware — run `cargo run --release --bin bench` on
+your own target.
 
 | Operation | Avg latency | Notes |
 |---|---|---|
-| `get_entity` (cache hit) | ~20 µs | LRU hit; no SQLite I/O |
-| `search_nodes` (name match) | ~25 µs | FTS5 query + entity lookup |
-| `open_nodes` (single) | ~30 µs | LRU + SQLite |
-| `open_nodes` (5 names) | ~60 µs | Batch fetch |
-| `neighbors` depth=1 | ~30 µs | Index-only scan via covering index |
-| `neighbors` depth=2 | ~55 µs | Two-hop traversal |
-| `find_path` (BFS) | ~650 µs | Worst case: target not found, full BFS |
-| `describe_entity` | ~30 µs | Entity + incident relations |
-| `graph_stats` | ~15 µs | RAM counters (graph_stat table) |
-| `read_graph` (all) | ~1500 µs | Full dump: all entities + relations |
-| `create_entities` (1000) | ~2000 µs | Batch write + FTS index |
-| `create_relations` (999) | ~1200 µs | Batch write + degree updates |
-| `find_all_paths` (A→C, depth 5) | ~100 µs | Bounded DFS |
-| `export_graph` (JSON) | ~600 µs | Serialize all entities + relations |
-| `entity_type_counts` | ~10 µs | RAM-cached type dictionary |
-| `degree` (cache hit) | ~2 µs | Materialized column |
-| `entities_exist` (10 names) | ~15 µs | Hash lookup via FxHashMap |
+| `degree` (cache hit) | ~44 ns | Materialized column |
+| `relation_type_counts` | ~2.3 µs | RAM-cached type dictionary |
+| `get_entity_count` | ~3.0 µs | RAM counter |
+| `entity_type_counts` | ~4.5 µs | RAM-cached type dictionary |
+| `get_entity` (cache hit) | ~5.4 µs | LRU hit; no SQLite I/O |
+| `describe_entity` | ~5.4 µs | Entity + incident relations |
+| `search_relations` (from / from+type) | ~6.3 µs | Covering index scan |
+| `delete_observations` (1) | ~11 µs | |
+| `find_all_paths` (A→C, depth 5) | ~12 µs | Bounded DFS |
+| `upsert_entities` (type change + obs) | ~27 µs | |
+| `entities_exist` (10 names) | ~38 µs | Hash lookups |
+| `batch_get_entities` (10) | ~42 µs | Batch fetch |
+| `neighbors` (depth 1 / depth 2) | ~50 µs | Index-only covering scan |
+| `open_nodes` (single / 5 names) | ~53–77 µs | LRU + SQLite |
+| `search_nodes` (name match) | ~96 µs | FTS5 query + entity lookup |
+| `add_observations` (2) | ~163 µs | Append + FTS index |
+| `search_nodes` (obs match) | ~161 µs | FTS5 over observation bodies |
+| `find_path` (BFS) | ~453 µs | Worst case: full BFS |
+| `search_nodes` (filtered) | ~623 µs | FTS5 + type filter |
+| `export` (JSON) | ~2.5 ms | Serialize all entities + relations |
+| `read_graph` (all) | ~3.4 ms | Full dump |
+| `create_relations` (999) | ~10 ms | Batch write + degree updates |
+| `create_entities` (1000) | ~41 ms | Batch write + FTS index |
 
 ## Tools
 
-### Write tools
+### Knowledge-graph tools (both binaries)
 
-- `create_entities` — batch create, skips existing names
-- `create_relations` — batch create, skips missing entities and duplicates
-- `add_observations` — append to entity, deduplicates
-- `delete_entities` — cascade deletes incident relations
-- `delete_observations` — remove specific observations
-- `delete_relations` — remove exact (from, to, type) tuples
-- `upsert_entities` — create or merge (type preserved, observations unioned)
-- `merge_entities` — source → target redirect with full dedup
-- `compact` — trigger incremental vacuum + FTS optimize
+**Write:** `create_entities`, `create_relations`, `add_observations`,
+`delete_entities`, `delete_observations`, `delete_relations`, `upsert_entities`,
+`merge_entities`, `compact`.
 
-### Read tools
+**Read:** `read_graph`, `search_nodes`, `open_nodes`, `batch_get_entities`,
+`get_entity`, `entity_exists`, `graph_stats`, `search_relations`,
+`describe_entity`, `degree`, `find_path`, `find_all_paths`, `extract_subgraph`,
+`get_neighbors`, `list_entity_types`, `list_relation_types`, `export_graph`.
 
-- `read_graph` — dump all entities + relations (with optional type filter, offset, limit)
-- `search_nodes` — FTS5-ranked search over names, types, observations (with optional type filter)
-- `open_nodes` — fetch specific entities by name (with their relations)
-- `batch_get_entities` — bulk entity fetch (order preserved, null for missing)
-- `get_entity` — single entity by name
-- `entity_exists` — cheap existence check (hash lookup, no observation bodies fetched)
-- `graph_stats` — entity count, relation count, total observations
-- `search_relations` — filter by from/to/type
-- `describe_entity` — entity + incident relations + neighbors + degree
-- `degree` — number of incident relations by direction (outgoing / incoming / both)
-- `find_path` — BFS shortest path (undirected)
-- `find_all_paths` — DFS all simple paths (bounded by maxDepth, maxPaths)
-- `extract_subgraph` — BFS around seed entities to given depth
-- `get_neighbors` — entity neighbors with direction + type + depth filters
-- `list_entity_types` — type → count, ranked
-- `list_relation_types` — type → count, ranked
-- `export_graph` — JSON, Mermaid, or Graphviz DOT
+### Vector tools (`mcp-memory-vec` only)
+
+- `vector_upsert_embedding` — attach/replace an embedding on an existing entity
+- `vector_search_entities` — top-K nearest entities by vector similarity (optional type filter)
+- `vector_delete_embedding` — remove an entity's embedding (entity is kept)
+- `hybrid_search` — vector + FTS5 fused by RRF, optional graph-centrality boost
+- `vector_refresh_graph_cache` — rebuild the petgraph adjacency cache from relations
+- `vector_store_stats` — embedding count, dimension, index/graph sizes
 
 ## Architecture
 
 ```
-main.rs
-  │
-  ├── MCPServer::run_stdio()   — stdio transport (newline-delimited JSON-RPC)
-  ├── MCPServer::run_tcp()     — TCP transport (same framing, concurrent conns)
-  └── MCPServer::run_http()    — MCP Streamable HTTP (axum, POST/GET /mcp)
-        │
+main.rs / vec_main.rs
+  ├── run_stdio()  — newline-delimited JSON-RPC over stdio
+  ├── run_tcp()    — same framing, concurrent connections
+  └── run_http()   — MCP Streamable HTTP (axum, POST/GET /mcp)
         └── process_request()
-              │
-              ├── "initialize"     → protocol version + capabilities
-              ├── "tools/list"     → cached from tools.rs
-              ├── "tools/call"     → dispatches to handler by name
-              ├── "ping"           → null
-              └── "notifications/" → no reply
+              ├── "initialize"      → protocol version + capabilities
+              ├── "tools/list"      → cached tool list
+              ├── "tools/call"      → dispatch to handler by name
+              ├── "ping"            → null
+              └── "notifications/…" → no reply
 ```
 
-All three transports share `process_value()` / `dispatch_line()` / `dispatch_http_body()`
-— the dispatch core is **transport-agnostic**.
+All transports share the transport-agnostic dispatch core
+(`dispatch_line()` / `dispatch_http_body()`).
 
-### Locking
+### Concurrency & locking
 
-- `GraphHandle` uses `parking_lot::Mutex` for the SQLite connection and LRU caches
-- All `GraphHandle` methods take `&self` — internal `Mutex` handles mutation
-- Tokio multi-thread runtime handles concurrent requests
-- SQLite WAL mode allows concurrent readers + one writer
-- Heavy dispatch (graph lock + optional fsync) is offloaded to `tokio::task::spawn_blocking`
-
-### Write path
-
-```
-create_entities([e1, e2, ...])
-  1. Batch-check existence (FxHashMap hash lookup)
-  2. Batch-insert entities (one write txn)
-  3. Batch-index FTS (one write txn for name_fts)
-  4. Invalidate LRU caches
-  5. Update type_dict counts
-```
-
-The same batching pattern applies to `create_relations` (with degree updates).
-
-### Storage (SQLite)
-
-SQLite provides the storage layer with:
-
-- **WAL mode** — concurrent readers + one writer without blocking readers
-- **16 KB pages** — shallower B-trees for faster lookups
-- **FTS5** — full-text search with `unicode61 remove_diacritics 2` tokenization
-- **mmap** — up to 256 MB of the database mapped for faster reads
-- **Covering indexes** — `rel_out` and `rel_in` enable index-only neighbor scans
-- **Materialized counters** — `obs_count`, `out_deg`, `in_deg`, `type_dict.count`, `graph_stat` are writer-maintained for O(1) reads
-- **External-content FTS5** — avoids duplicating text; stable `INTEGER PRIMARY KEY` ensures `content_rowid` correctness across VACUUM
-
-### Concurrency model
-
-- TCP connections limited to 128 concurrent connections
-- Mutating operations acquire `GraphHandle` lock and serialize through SQLite
-- Read operations can proceed concurrently under WAL mode
-- Background maintenance runs every 5 minutes as a tokio task
+- `GraphHandle` uses `parking_lot::Mutex` for the writer connection and caches; a
+  read-only connection pool serves concurrent reads under WAL.
+- The `VectorStore` uses `DashMap` for name↔ID maps and an `RwLock` over the
+  petgraph cache; the usearch index is internally synchronized.
+- Heavy dispatch (graph lock + optional fsync) is offloaded to
+  `tokio::task::spawn_blocking` to keep the reactor responsive.
+- TCP connections are capped at 128 concurrent.
 
 ### Request size limits
 
 | Parameter | Limit |
 |---|---|
 | Max request body | 16 MB |
-| Name max bytes | 1024 |
+| Name max bytes | 1,024 |
 | Observation max bytes | 65,536 |
-| Max entities per request | 1,000 |
-| Max relations per request | 1,000 |
-| Max observations per entity | 1,000 |
-| Max names per request | 1,000 |
+| Max entities / relations / observations / names per request | 1,000 |
 | Max search limit | 1,000 |
 | Max neighbor depth | 16 |
-| Max relation search results | 1,000 |
-| Max find_all_paths depth | 10 |
-| Max find_all_paths results | 100 |
+| Max `find_all_paths` depth / results | 10 / 100 |
+| Max embedding dimensions *(vec)* | 4,096 |
+| Max `topK` *(vec)* | 100 |
 
 ## Development
 
 ```sh
-cargo test             # unit + integration + fuzzy (300+ tests)
-cargo clippy --all-targets
-cargo build --release  # LTO + fat, panic=abort, strip
+cargo test                       # 100+ unit + integration tests
+cargo clippy                     # lint (lib + binaries)
+cargo build --release            # LTO + fat, opt-level 3
 cargo run --release --bin bench  # standalone benchmark
 ```
 
-The test suite includes:
-- **Unit tests** — protocol, tools, config, error codes
-- **Integration tests** — CRUD persistence, search, paths, export, concurrency,
-  all 26 tool handlers, invariants
-- **Fuzzy tests** — randomized CRUD sequences asserting graph invariants
+The test suite covers protocol handling, all tool handlers, CRUD/search/path
+persistence, concurrency, fuzzy invariant checks, and — for the vector server —
+end-to-end stdio tool flows, input validation, the tunable index config, and HTTP
+bearer-token authentication.
 
-## Versioning & Compatibility
+## Versioning & compatibility
 
-Follows [Semantic Versioning](https://semver.org). The current line is **2.x**,
+Follows [Semantic Versioning](https://semver.org). The current line is **3.x**,
 targeting MCP revision `2025-11-25`.
 
 | mcp-memory | MCP revision (default) | Negotiates |
 |---|---|---|
+| 3.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
 | 2.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
 | ≤ 1.x | `2024-11-05` | — |
 

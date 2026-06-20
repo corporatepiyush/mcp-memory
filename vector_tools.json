@@ -1,0 +1,119 @@
+[
+  {
+    "name": "vector_upsert_embedding",
+    "description": "Upsert a vector embedding for an existing entity in the knowledge graph. The entity must already exist. Embedding dimension must match the configured embedding size (default 384). Use this to store pre-computed embeddings for semantic/vector search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": {
+          "type": "string",
+          "description": "The name of the entity to attach the embedding to (must already exist in the KG)"
+        },
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "The embedding vector as an array of f64 values"
+        },
+        "model": {
+          "type": "string",
+          "description": "Optional model identifier (e.g. 'text-embedding-3-small')"
+        }
+      },
+      "required": ["entityName", "embedding"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "vector_search_entities",
+    "description": "Search entities by vector similarity. Finds the top-K entities whose stored embeddings are closest (cosine similarity) to the query embedding. Optionally filter by entity type.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "The query embedding vector (f64 array, must match configured dimension)"
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of results to return (default 10)"
+        },
+        "entityType": {
+          "type": "string",
+          "description": "Optional: only return entities of this type"
+        }
+      },
+      "required": ["embedding"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_delete_embedding",
+    "description": "Delete the vector embedding for a given entity. The entity itself is NOT removed from the knowledge graph — only its embedding is deleted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": {
+          "type": "string",
+          "description": "The name of the entity whose embedding to delete"
+        }
+      },
+      "required": ["entityName"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "hybrid_search",
+    "description": "Combined vector + full-text search with Reciprocal Rank Fusion. Runs vector search on the query embedding and FTS5 text search on the query text simultaneously, then fuses results by rank. Optionally boosts results by graph centrality.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queryText": {
+          "type": "string",
+          "description": "Text query for FTS5 search against entity names and observations"
+        },
+        "queryEmbedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Query embedding vector for vector similarity search"
+        },
+        "textWeight": {
+          "type": "number",
+          "description": "Weight for text search rank in RRF fusion (default 0.5)"
+        },
+        "vecWeight": {
+          "type": "number",
+          "description": "Weight for vector search rank in RRF fusion (default 0.5)"
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of fused results to return (default 10)"
+        }
+      },
+      "required": ["queryText", "queryEmbedding"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_refresh_graph_cache",
+    "description": "Rebuild the in-memory petgraph adjacency cache from the SQLite relation table. Use this after adding/removing relations via KG tools if you want the petgraph-based centrality boost in hybrid_search to be up-to-date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "vector_store_stats",
+    "description": "Return statistics about the vector store: embedding count, dimension, usearch index size, petgraph node/edge count.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  }
+]

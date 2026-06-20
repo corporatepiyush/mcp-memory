@@ -8,6 +8,9 @@ pub mod server;
 pub mod tls;
 pub mod tools;
 pub mod types;
+pub mod vector_actions;
+pub mod vector_server;
+pub mod vector_store;
 
 use clap::{Parser, ValueEnum};
 
