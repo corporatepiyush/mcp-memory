@@ -1964,16 +1964,22 @@ impl GraphHandle {
         }
         path.reverse();
 
-        let mut name_path = Vec::with_capacity(path.len());
-        for id in path {
-            if let Ok(name) = conn.query_row(
-                "SELECT name FROM entity WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
+        let placeholders: Vec<String> = path.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT id, name FROM entity WHERE id IN ({})",
+            placeholders.join(",")
+        );
+        let name_map: FxHashMap<i64, String> = if let Ok(mut stmt) = conn.prepare(&sql)
+            && let Ok(rows) = stmt.query_map(
+                rusqlite::params_from_iter(&path),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             ) {
-                name_path.push(name);
-            }
-        }
+            rows.flatten().collect()
+        } else {
+            FxHashMap::default()
+        };
+
+        let name_path: Vec<String> = path.iter().filter_map(|id| name_map.get(id).cloned()).collect();
 
         Ok(Some(name_path))
     }
@@ -2029,40 +2035,53 @@ impl GraphHandle {
         while current_depth < depth && !frontier.is_empty() {
             let mut next_frontier: HashSet<i64> = HashSet::new();
 
-            // Collect relations for current frontier.
-            for fid in &frontier {
-                if let Ok(mut stmt) = conn.prepare_cached(
-                    "SELECT from_id, to_id, type_id FROM relation WHERE from_id = ?1",
+            // Collect relations for current frontier — batched IN queries
+            // instead of one query per frontier entity.
+            const CHUNK: usize = 500;
+            let frontier_ids: Vec<i64> = frontier.iter().copied().collect();
+            for chunk in frontier_ids.chunks(CHUNK) {
+                let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+                let in_clause = placeholders.join(",");
+
+                // Forward: from_id IN chunk.
+                if let Ok(mut stmt) = conn.prepare(
+                    &format!(
+                        "SELECT from_id, to_id, type_id FROM relation WHERE from_id IN ({in_clause})",
+                    )
                 )
-                    && let Ok(rows) =
-                        stmt.query_map(params![fid], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-                        })
-                    {
-                        for row in rows.flatten() {
-                            let (from_id, to_id, type_id) = row;
-                            all_rel_pairs.insert((from_id, to_id, type_id));
-                            if all_entity_ids.insert(to_id) {
-                                next_frontier.insert(to_id);
-                            }
+                    && let Ok(rows) = stmt.query_map(
+                        rusqlite::params_from_iter(chunk),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                    )
+                {
+                    for row in rows.flatten() {
+                        let (from_id, to_id, type_id) = row;
+                        all_rel_pairs.insert((from_id, to_id, type_id));
+                        if all_entity_ids.insert(to_id) {
+                            next_frontier.insert(to_id);
                         }
                     }
-                if let Ok(mut stmt) = conn.prepare_cached(
-                    "SELECT from_id, to_id, type_id FROM relation WHERE to_id = ?1",
+                }
+
+                // Backward: to_id IN chunk.
+                if let Ok(mut stmt) = conn.prepare(
+                    &format!(
+                        "SELECT from_id, to_id, type_id FROM relation WHERE to_id IN ({in_clause})",
+                    )
                 )
-                    && let Ok(rows) =
-                        stmt.query_map(params![fid], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-                        })
-                    {
-                        for row in rows.flatten() {
-                            let (from_id, to_id, type_id) = row;
-                            all_rel_pairs.insert((from_id, to_id, type_id));
-                            if all_entity_ids.insert(from_id) {
-                                next_frontier.insert(from_id);
-                            }
+                    && let Ok(rows) = stmt.query_map(
+                        rusqlite::params_from_iter(chunk),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                    )
+                {
+                    for row in rows.flatten() {
+                        let (from_id, to_id, type_id) = row;
+                        all_rel_pairs.insert((from_id, to_id, type_id));
+                        if all_entity_ids.insert(from_id) {
+                            next_frontier.insert(from_id);
                         }
                     }
+                }
             }
             frontier = next_frontier;
             current_depth += 1;
@@ -2251,19 +2270,31 @@ impl GraphHandle {
                 }
         }
 
-        // Convert ids to names.
-        let mut named_paths: Vec<Vec<String>> = Vec::new();
-        for path_ids in all_paths {
-            let mut named = Vec::with_capacity(path_ids.len());
-            for id in path_ids {
-                if let Ok(name) = conn.query_row(
-                    "SELECT name FROM entity WHERE id = ?1",
-                    params![id],
-                    |row| row.get::<_, String>(0),
+        // Convert ids to names — one batch query instead of N lookups per path.
+        let all_ids: HashSet<i64> = all_paths.iter().flat_map(|p| p.iter()).copied().collect();
+        let id_list: Vec<i64> = all_ids.into_iter().collect();
+        let name_map: FxHashMap<i64, String> = if id_list.is_empty() {
+            FxHashMap::default()
+        } else {
+            let placeholders: Vec<String> = id_list.iter().map(|_| "?".to_string()).collect();
+            let sql = format!(
+                "SELECT id, name FROM entity WHERE id IN ({})",
+                placeholders.join(",")
+            );
+            if let Ok(mut stmt) = conn.prepare(&sql)
+                && let Ok(rows) = stmt.query_map(
+                    rusqlite::params_from_iter(&id_list),
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 ) {
-                    named.push(name);
-                }
+                rows.flatten().collect()
+            } else {
+                FxHashMap::default()
             }
+        };
+
+        let mut named_paths: Vec<Vec<String>> = Vec::with_capacity(all_paths.len());
+        for path_ids in all_paths {
+            let named: Vec<String> = path_ids.iter().filter_map(|id| name_map.get(id).cloned()).collect();
             named_paths.push(named);
         }
 

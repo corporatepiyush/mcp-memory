@@ -546,10 +546,10 @@ impl VectorStore {
                 )
                 .unwrap_or_default();
 
-            if let Some(filter_type) = entity_type_filter {
-                if etype != filter_type {
-                    continue;
-                }
+            if let Some(filter_type) = entity_type_filter
+                && etype != filter_type
+            {
+                continue;
             }
 
             if !first {
@@ -819,6 +819,14 @@ impl VectorStore {
             }
         }
         Ok(out)
+    }
+
+    pub fn invalidate_entity_cache(&self, names: &[String]) {
+        for name in names {
+            if let Some((_, id)) = self.name_to_id.remove(name.as_str()) {
+                self.id_to_name.remove(&id);
+            }
+        }
     }
 
     pub fn name_to_id(&self) -> &DashMap<String, EntityId> {

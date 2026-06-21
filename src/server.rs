@@ -672,7 +672,15 @@ fn handle_tools_call(
             memory::handle_add_observations(kg, tool_args).map(HandlerResult::Value)
         }
         "delete_entities" => {
-            memory::handle_delete_entities(kg, tool_args).map(HandlerResult::Value)
+            let r = memory::handle_delete_entities(kg, tool_args);
+            if r.is_ok()
+                && let Some(vs) = vs
+                && let Some(args) = tool_args.and_then(|a| a.get("entityNames")).and_then(|v| v.as_array())
+            {
+                let names: Vec<String> = args.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                vs.invalidate_entity_cache(&names);
+            }
+            r.map(HandlerResult::Value)
         }
         "delete_observations" => {
             memory::handle_delete_observations(kg, tool_args).map(HandlerResult::Value)
