@@ -411,25 +411,6 @@ backends end-to-end, the modern retrieval tools (batch upsert, more-like-this,
 recommend, MMR), vector gating when `--vectors` is off, input validation, the
 tunable index config, and HTTP bearer-token authentication.
 
-## Versioning & compatibility
-
-Follows [Semantic Versioning](https://semver.org). The current line is **4.x**,
-targeting MCP revision `2025-11-25`.
-
-**4.0 breaking changes:** the separate `mcp-memory-vec` *server* is gone — vectors
-are now an opt-in subsystem of `mcp-memory` behind `--vectors`. The
-`mcp-memory-vec` binary remains as a thin alias (`= mcp-memory --vectors`), so
-existing configs and the shared on-disk format are unaffected. New fresh databases
-default to 4 KB SQLite pages (was 16 KB) and `auto_vacuum=INCREMENTAL`; existing
-databases keep their original page size.
-
-| mcp-memory | MCP revision (default) | Negotiates |
-|---|---|---|
-| 4.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
-| 3.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
-| 2.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
-| ≤ 1.x | `2024-11-05` | — |
-
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
