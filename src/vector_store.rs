@@ -538,25 +538,6 @@ impl VectorStore {
                 None => continue,
             };
 
-            if let Some(filter_type) = entity_type_filter {
-                let actual_type: Option<String> = conn
-                    .query_row(
-                        "SELECT t.name FROM entity e JOIN type_dict t ON t.id = e.type_id WHERE e.id = ?1 AND e.flags = 0",
-                        params![id],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                match actual_type {
-                    Some(t) if t == filter_type => {}
-                    _ => continue,
-                }
-            }
-
-            if !first {
-                out.push(',');
-            }
-            first = false;
-
             let etype: String = conn
                 .query_row(
                     "SELECT t.name FROM entity e JOIN type_dict t ON t.id = e.type_id WHERE e.id = ?1 AND e.flags = 0",
@@ -564,6 +545,17 @@ impl VectorStore {
                     |row| row.get(0),
                 )
                 .unwrap_or_default();
+
+            if let Some(filter_type) = entity_type_filter {
+                if etype != filter_type {
+                    continue;
+                }
+            }
+
+            if !first {
+                out.push(',');
+            }
+            first = false;
 
             out.push_str(r#"{"name":"#);
             push_json_str(&mut out, &name);
@@ -620,36 +612,39 @@ impl VectorStore {
         }
 
         if !ids.is_empty() {
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            let sql = format!(
-                "SELECT from_id, to_id FROM relation WHERE from_id IN ({}) AND to_id IN ({})",
-                placeholders.join(","),
-                placeholders.join(",")
-            );
-            let mut rel_stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            const BATCH_SIZE: usize = 5000;
+            for chunk in ids.chunks(BATCH_SIZE) {
+                let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "SELECT from_id, to_id FROM relation WHERE from_id IN ({}) AND to_id IN ({})",
+                    placeholders.join(","),
+                    placeholders.join(",")
+                );
+                let mut rel_stmt = conn.prepare(&sql).map_err(sqlite_err)?;
 
-            let mut param_values: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(ids.len() * 2);
-            for id in &ids {
-                param_values.push(id as &dyn rusqlite::types::ToSql);
-            }
-            for id in &ids {
-                param_values.push(id as &dyn rusqlite::types::ToSql);
-            }
+                let mut param_values: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() * 2);
+                for id in chunk {
+                    param_values.push(id as &dyn rusqlite::types::ToSql);
+                }
+                for id in chunk {
+                    param_values.push(id as &dyn rusqlite::types::ToSql);
+                }
 
-            let rel_rows = rel_stmt
-                .query_map(param_values.as_slice(), |row| {
-                    let from: i64 = row.get(0)?;
-                    let to: i64 = row.get(1)?;
-                    Ok((from, to))
-                })
-                .map_err(sqlite_err)?;
+                let rel_rows = rel_stmt
+                    .query_map(param_values.as_slice(), |row| {
+                        let from: i64 = row.get(0)?;
+                        let to: i64 = row.get(1)?;
+                        Ok((from, to))
+                    })
+                    .map_err(sqlite_err)?;
 
-            for rel in rel_rows {
-                let (from, to) = rel.map_err(sqlite_err)?;
-                if let (Some(f_nx), Some(t_nx)) = (nm.get(&from), nm.get(&to))
-                    && g.find_edge(*f_nx, *t_nx).is_none()
-                {
-                    g.add_edge(*f_nx, *t_nx, ());
+                for rel in rel_rows {
+                    let (from, to) = rel.map_err(sqlite_err)?;
+                    if let (Some(f_nx), Some(t_nx)) = (nm.get(&from), nm.get(&to))
+                        && g.find_edge(*f_nx, *t_nx).is_none()
+                    {
+                        g.add_edge(*f_nx, *t_nx, ());
+                    }
                 }
             }
         }

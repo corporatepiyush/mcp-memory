@@ -2190,6 +2190,8 @@ impl GraphHandle {
         let mut queue: VecDeque<(i64, Vec<i64>)> = VecDeque::new();
         queue.push_back((from_id, vec![from_id]));
 
+        const MAX_QUEUE_SIZE: usize = 10_000_000;
+
         while let Some((cur, path)) = queue.pop_front() {
             if all_paths.len() >= max_paths {
                 break;
@@ -2211,6 +2213,11 @@ impl GraphHandle {
                                 break;
                             }
                         } else if !path.contains(&next_id) && path.len() < max_depth {
+                            if queue.len() >= MAX_QUEUE_SIZE {
+                                return Err(MCSError::InvalidParams(
+                                    "Path exploration queue exceeded limit (too many paths on highly connected graph)".to_string()
+                                ));
+                            }
                             let mut new_path = path.clone();
                             new_path.push(next_id);
                             queue.push_back((next_id, new_path));
@@ -2231,6 +2238,11 @@ impl GraphHandle {
                                 break;
                             }
                         } else if !path.contains(&next_id) && path.len() < max_depth {
+                            if queue.len() >= MAX_QUEUE_SIZE {
+                                return Err(MCSError::InvalidParams(
+                                    "Path exploration queue exceeded limit (too many paths on highly connected graph)".to_string()
+                                ));
+                            }
                             let mut new_path = path.clone();
                             new_path.push(next_id);
                             queue.push_back((next_id, new_path));
