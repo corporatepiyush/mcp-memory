@@ -9,7 +9,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, types::ToSql, Connection, OpenFlags};
 
-use crate::config::Durability;
+use crate::config::{Durability, SqliteTuning};
 use crate::errors::{MCSError, Result};
 use crate::types::{Entity, Relation};
 
@@ -314,7 +314,7 @@ pub struct GraphHandle {
 /// `-shm` wal-index — SQLite cannot read a WAL database through a pure
 /// `SQLITE_OPEN_READ_ONLY` handle) and then locked to reads with
 /// `PRAGMA query_only = ON`, which makes any accidental write error out.
-fn open_reader(path: &Path, mmap_size: i64) -> Result<Connection> {
+fn open_reader(path: &Path, tuning: &SqliteTuning) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -322,15 +322,16 @@ fn open_reader(path: &Path, mmap_size: i64) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(sqlite_err)?;
-    conn.busy_timeout(Duration::from_secs(10)).map_err(sqlite_err)?;
-    conn.execute_batch(
-        "PRAGMA query_only   = ON;
-         PRAGMA cache_size   = -50000;
-         PRAGMA temp_store   = MEMORY;",
-    )
-    .map_err(sqlite_err)?;
-    conn.execute_batch(&format!("PRAGMA mmap_size = {mmap_size};"))
+    conn.busy_timeout(Duration::from_millis(tuning.busy_timeout_ms))
         .map_err(sqlite_err)?;
+    conn.execute_batch(&format!(
+        "PRAGMA query_only   = ON;
+         PRAGMA cache_size   = -{};
+         PRAGMA temp_store   = MEMORY;
+         PRAGMA mmap_size    = {};",
+        tuning.cache_size_kb, tuning.mmap_size
+    ))
+    .map_err(sqlite_err)?;
     Ok(conn)
 }
 
@@ -338,32 +339,42 @@ impl GraphHandle {
     pub fn new(
         path: &Path,
         durability: Durability,
-        mmap_size: i64,
+        tuning: SqliteTuning,
         lru_cache_size: NonZeroUsize,
         read_pool_size: usize,
     ) -> Result<Self> {
-        {
-            let tmp = Connection::open(path).map_err(sqlite_err)?;
-            tmp.execute_batch("PRAGMA page_size = 16384;")
-                .map_err(sqlite_err)?;
-            drop(tmp);
-        }
-
         let conn = Connection::open(path).map_err(sqlite_err)?;
         // Apply the busy handler through the API so it is in force for every
         // subsequent statement (including schema creation and BEGIN IMMEDIATE).
-        conn.busy_timeout(Duration::from_secs(10)).map_err(sqlite_err)?;
+        conn.busy_timeout(Duration::from_millis(tuning.busy_timeout_ms))
+            .map_err(sqlite_err)?;
 
-        conn.execute_batch(
+        // `page_size` and `auto_vacuum` are fixed when the database first gets
+        // content, and `page_size` additionally must precede `journal_mode=WAL`.
+        // Set both up front on this connection, before any table is created, so
+        // they take effect on a fresh database. On an existing database they are
+        // silently ignored (would require VACUUM to change).
+        conn.execute_batch(&format!(
+            "PRAGMA page_size    = {};
+             PRAGMA auto_vacuum  = INCREMENTAL;",
+            tuning.page_size
+        ))
+        .map_err(sqlite_err)?;
+
+        conn.execute_batch(&format!(
              "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = OFF;
-             PRAGMA cache_size    = -50000;
+             PRAGMA cache_size    = -{};
              PRAGMA temp_store    = MEMORY;
-             PRAGMA busy_timeout  = 5000;
+             PRAGMA busy_timeout  = {};
              PRAGMA synchronous   = NORMAL;
-             PRAGMA journal_size_limit = 67108864;
+             PRAGMA journal_size_limit = {};",
+            tuning.cache_size_kb, tuning.busy_timeout_ms, tuning.journal_size_limit
+        ))
+        .map_err(sqlite_err)?;
 
-             CREATE TABLE IF NOT EXISTS entity (
+        conn.execute_batch(
+             "CREATE TABLE IF NOT EXISTS entity (
                  id          INTEGER PRIMARY KEY,
                  name_hash   INTEGER NOT NULL,
                  name        TEXT    NOT NULL,
@@ -454,7 +465,7 @@ impl GraphHandle {
         )
         .map_err(sqlite_err)?;
 
-        conn.execute_batch(&format!("PRAGMA mmap_size = {mmap_size};"))
+        conn.execute_batch(&format!("PRAGMA mmap_size = {};", tuning.mmap_size))
             .map_err(sqlite_err)?;
 
         let sync_pragma = match durability {
@@ -462,6 +473,11 @@ impl GraphHandle {
             Durability::Async => "PRAGMA synchronous = NORMAL",
         };
         conn.execute_batch(sync_pragma).map_err(sqlite_err)?;
+
+        // Bound the cost of `PRAGMA optimize` (here and in maintenance) so a
+        // large database cannot stall startup/maintenance analyzing every index.
+        conn.execute_batch("PRAGMA analysis_limit = 400;")
+            .map_err(sqlite_err)?;
 
         let has_stat: bool = conn
             .query_row("SELECT 1 FROM graph_stat LIMIT 1", [], |_| Ok(()))
@@ -485,7 +501,7 @@ impl GraphHandle {
         let pool_size = read_pool_size.max(1);
         let mut conns = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
-            conns.push(Mutex::new(open_reader(path, mmap_size)?));
+            conns.push(Mutex::new(open_reader(path, &tuning)?));
         }
         let readers = ReaderPool {
             conns,
@@ -2331,6 +2347,16 @@ impl GraphHandle {
         Ok(())
     }
 
+    /// Run a non-blocking `wal_checkpoint(PASSIVE)` to fsync committed WAL frames
+    /// without stalling readers or writers. Call from a short-interval timer to
+    /// bound the durability window in `async` mode.
+    pub fn checkpoint_passive(&self) -> Result<()> {
+        let conn = self.writer.lock();
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
     fn _traverse(
         &self,
         name: &str,
@@ -2538,7 +2564,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("kg_test_{}_{}.db", std::process::id(), n));
         cleanup_db(&path);
-        let kg = GraphHandle::new(&path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
+        let kg = GraphHandle::new(&path, Durability::Async, SqliteTuning::default(), NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
         TestKg(kg, path)
     }
 
@@ -3184,7 +3210,7 @@ mod tests {
         let kg = GraphHandle::new(
             &path,
             Durability::Async,
-            268_435_456,
+            SqliteTuning::default(),
             NonZeroUsize::new(10_000).unwrap(),
             read_pool_size,
         )
@@ -3532,5 +3558,58 @@ mod tests {
         assert!(json.contains("\"b\""));
         assert!(!json.contains("\"c\""));
         assert_eq!(count_relations(&json), 1);
+    }
+
+    #[test]
+    fn test_sqlite_tuning_applied_to_fresh_db() {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(2_000_000);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("kg_tuning_{}_{}.db", std::process::id(), n));
+        cleanup_db(&path);
+
+        let tuning = SqliteTuning {
+            page_size: 8192,
+            ..SqliteTuning::default()
+        };
+        let kg = TestKg(
+            GraphHandle::new(&path, Durability::Async, tuning, NonZeroUsize::new(64).unwrap(), 2)
+                .expect("create KG"),
+            path.clone(),
+        );
+        kg.create_entities(&[Entity {
+            name: "a".into(),
+            entity_type: "n".into(),
+            observations: vec!["o".into()],
+        }])
+        .unwrap();
+
+        // page_size (fresh-DB only) and auto_vacuum=INCREMENTAL must have taken
+        // effect, and journal_mode must be WAL.
+        let probe = Connection::open(&path).unwrap();
+        let page_size: i64 = probe.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        assert_eq!(page_size, 8192);
+        let auto_vacuum: i64 = probe.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+        assert_eq!(auto_vacuum, 2, "expected INCREMENTAL auto_vacuum");
+        let journal: String = probe.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn test_checkpoint_passive_is_noop_safe() {
+        let kg = new_kg();
+        // On an empty / freshly-written DB a passive checkpoint must succeed.
+        kg.checkpoint_passive().unwrap();
+        kg.create_entities(&[Entity {
+            name: "a".into(),
+            entity_type: "n".into(),
+            observations: vec!["o".into()],
+        }])
+        .unwrap();
+        // And after a write, repeatedly, without error or deadlock.
+        kg.checkpoint_passive().unwrap();
+        kg.checkpoint_passive().unwrap();
+        // Data is still readable afterwards.
+        assert!(kg.get_entity("a").unwrap().is_some());
     }
 }

@@ -12,9 +12,111 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::errors::{MCSError, Result};
+use crate::ivf::{IvfFlatIndex, Metric as IvfMetric};
 use crate::kg::push_json_str;
 
 pub type EntityId = i64;
+
+/// Unifies the two ANN backends behind one small surface so [`VectorStore`] does
+/// not branch on the index kind at every call site. Distances follow usearch's
+/// convention (smaller = closer) for both backends.
+enum AnnIndex {
+    Hnsw(Arc<Index>),
+    Ivf(Box<IvfFlatIndex>),
+}
+
+impl AnnIndex {
+    /// Current allocated capacity (HNSW) or live count (IVF; it grows on demand).
+    fn capacity(&self) -> usize {
+        match self {
+            AnnIndex::Hnsw(i) => i.capacity(),
+            AnnIndex::Ivf(i) => i.len(),
+        }
+    }
+
+    /// Ensure room for `target` vectors. No-op for IVF (a growable `Vec`).
+    fn reserve(&self, target: usize) -> Result<()> {
+        if let AnnIndex::Hnsw(i) = self {
+            i.reserve_capacity_and_threads(target, 1)
+                .map_err(|e| MCSError::MemoryError(format!("usearch reserve: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Add `id`/`vector` to the index (caller has already removed any prior entry).
+    fn add(&self, id: u64, vector: &[f32]) -> Result<()> {
+        match self {
+            AnnIndex::Hnsw(i) => i
+                .add(id, vector)
+                .map_err(|e| MCSError::MemoryError(format!("usearch add: {e}"))),
+            AnnIndex::Ivf(i) => i
+                .upsert(id, vector)
+                .map(|_| ())
+                .map_err(MCSError::MemoryError),
+        }
+    }
+
+    /// Remove `id`; returns whether it existed.
+    fn remove(&self, id: u64) -> Result<bool> {
+        match self {
+            AnnIndex::Hnsw(i) => i
+                .remove(id)
+                .map(|n| n > 0)
+                .map_err(|e| MCSError::MemoryError(format!("usearch remove: {e}"))),
+            AnnIndex::Ivf(i) => Ok(i.remove(id)),
+        }
+    }
+
+    /// Nearest `top_k` ids with distances (ascending). `nprobe` applies to IVF only.
+    fn search(&self, query: &[f32], top_k: usize, nprobe: Option<usize>) -> Result<Vec<(u64, f32)>> {
+        match self {
+            AnnIndex::Hnsw(i) => {
+                let m = i
+                    .search(query, top_k)
+                    .map_err(|e| MCSError::MemoryError(format!("usearch search: {e}")))?;
+                let cap = m.keys.len().min(m.distances.len());
+                Ok((0..cap).map(|j| (m.keys[j], m.distances[j])).collect())
+            }
+            AnnIndex::Ivf(i) => i.search(query, top_k, nprobe).map_err(MCSError::MemoryError),
+        }
+    }
+
+    /// (Re)train the IVF centroids. No-op for HNSW.
+    fn train(&self) -> Result<()> {
+        if let AnnIndex::Ivf(i) = self {
+            i.train().map_err(MCSError::MemoryError)?;
+        }
+        Ok(())
+    }
+
+    const fn kind(&self) -> IndexKind {
+        match self {
+            AnnIndex::Hnsw(_) => IndexKind::Hnsw,
+            AnnIndex::Ivf(_) => IndexKind::Ivf,
+        }
+    }
+
+    fn memory_bytes(&self) -> usize {
+        match self {
+            AnnIndex::Hnsw(i) => i.memory_usage(),
+            AnnIndex::Ivf(i) => i.memory_bytes(),
+        }
+    }
+
+    /// (graph_bytes, vectors_bytes). IVF has no graph, so its graph component is 0.
+    fn memory_breakdown(&self) -> (usize, usize) {
+        match self {
+            AnnIndex::Hnsw(i) => {
+                let s = i.memory_stats();
+                (
+                    s.graph_allocated + s.graph_reserved,
+                    s.vectors_allocated + s.vectors_reserved,
+                )
+            }
+            AnnIndex::Ivf(i) => (0, i.memory_bytes()),
+        }
+    }
+}
 
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -22,16 +124,30 @@ struct BlobHeader {
     dims: u32,
 }
 
-/// Tunable parameters for the usearch HNSW index. Built from CLI flags in the
-/// `mcp-memory-vec` binary; [`VectorConfig::new`] supplies the defaults used by
-/// tests and any caller that only cares about the embedding dimension.
+/// The ANN index backend a [`VectorStore`] uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IndexKind {
+    /// usearch HNSW: best recall/latency, higher memory and build cost.
+    #[default]
+    Hnsw,
+    /// IVF-Flat: k-means partitioned exact-within-cell search. Cheaper to build
+    /// and lighter in memory; suits large, batch-ingested, periodically-rebuilt
+    /// corpora. Exact (brute-force) until trained.
+    Ivf,
+}
+
+/// Tunable parameters for the vector index. Built from CLI flags;
+/// [`VectorConfig::new`] supplies the defaults used by tests and any caller that
+/// only cares about the embedding dimension.
 #[derive(Clone, Copy, Debug)]
 pub struct VectorConfig {
     /// Embedding dimension. All upserted/queried vectors must match this.
     pub dims: u32,
+    /// Which ANN backend to use.
+    pub index_kind: IndexKind,
     /// Distance metric used by the index.
     pub metric: MetricKind,
-    /// On-disk/in-index scalar representation (enables quantization).
+    /// On-disk/in-index scalar representation (enables quantization). HNSW only.
     pub quantization: ScalarKind,
     /// HNSW graph degree (`M`). Higher = better recall, more memory.
     pub connectivity: usize,
@@ -39,6 +155,10 @@ pub struct VectorConfig {
     pub expansion_add: usize,
     /// HNSW `efSearch`. Higher = better recall, slower queries.
     pub expansion_search: usize,
+    /// IVF number of Voronoi cells (centroids). IVF only.
+    pub ivf_nlist: usize,
+    /// IVF default cells probed per query. IVF only.
+    pub ivf_nprobe: usize,
 }
 
 impl VectorConfig {
@@ -46,11 +166,14 @@ impl VectorConfig {
     pub const fn new(dims: u32) -> Self {
         Self {
             dims,
+            index_kind: IndexKind::Hnsw,
             metric: MetricKind::Cos,
             quantization: ScalarKind::F32,
             connectivity: 16,
             expansion_add: 200,
             expansion_search: 50,
+            ivf_nlist: 256,
+            ivf_nprobe: 8,
         }
     }
 }
@@ -62,11 +185,13 @@ pub struct VectorStore {
     pub(crate) graph: Arc<RwLock<StableGraph<EntityId, (), Directed, u32>>>,
     pub(crate) node_map: Arc<DashMap<EntityId, NodeIndex<u32>>>,
 
-    pub index: Arc<Index>,
+    index: AnnIndex,
     pub(crate) db: Mutex<Connection>,
 
     pub dims: u32,
     pub count: AtomicUsize,
+    /// Default cells probed per IVF query (ignored by HNSW).
+    ivf_nprobe: usize,
 
     pub db_path: std::path::PathBuf,
 }
@@ -139,18 +264,28 @@ impl VectorStore {
         )
         .map_err(sqlite_err)?;
 
-        let index_opts = IndexOptions {
-            dimensions: dims as usize,
-            metric: cfg.metric,
-            quantization: cfg.quantization,
-            connectivity: cfg.connectivity,
-            expansion_add: cfg.expansion_add,
-            expansion_search: cfg.expansion_search,
-            multi: false,
+        let index = match cfg.index_kind {
+            IndexKind::Hnsw => {
+                let index_opts = IndexOptions {
+                    dimensions: dims as usize,
+                    metric: cfg.metric,
+                    quantization: cfg.quantization,
+                    connectivity: cfg.connectivity,
+                    expansion_add: cfg.expansion_add,
+                    expansion_search: cfg.expansion_search,
+                    multi: false,
+                };
+                let index = Index::new(&index_opts)
+                    .map_err(|e| MCSError::MemoryError(format!("usearch init: {e}")))?;
+                AnnIndex::Hnsw(Arc::new(index))
+            }
+            IndexKind::Ivf => AnnIndex::Ivf(Box::new(IvfFlatIndex::new(
+                dims as usize,
+                IvfMetric::from_usearch(cfg.metric),
+                cfg.ivf_nlist,
+                cfg.ivf_nprobe,
+            ))),
         };
-        let index = Index::new(&index_opts)
-            .map_err(|e| MCSError::MemoryError(format!("usearch init: {e}")))?;
-        let index = Arc::new(index);
 
         let name_to_id = Arc::new(DashMap::new());
         let id_to_name = Arc::new(DashMap::new());
@@ -167,6 +302,7 @@ impl VectorStore {
             db,
             dims,
             count: AtomicUsize::new(0),
+            ivf_nprobe: cfg.ivf_nprobe,
             db_path: db_path.to_path_buf(),
         };
         store.load_existing()?;
@@ -187,9 +323,7 @@ impl VectorStore {
             return Ok(());
         }
 
-        self.index
-            .reserve_capacity_and_threads(count, 1)
-            .map_err(|e| MCSError::MemoryError(format!("usearch reserve: {e}")))?;
+        self.index.reserve(count)?;
 
         let mut stmt = conn
             .prepare("SELECT entity_id, dims, blob, model FROM vector_embedding")
@@ -208,15 +342,15 @@ impl VectorStore {
         for row in rows {
             let (id, _row_dims, blob, _model) = row.map_err(sqlite_err)?;
             let emb = parse_embedding_blob(&blob)?;
-            self.index
-                .add(id as u64, emb)
-                .map_err(|e| MCSError::MemoryError(format!("usearch add: {e}")))?;
+            self.index.add(id as u64, emb)?;
             self.count.fetch_add(1, Ordering::Relaxed);
         }
 
-        if count > 0 {
-            self.load_names_from_entity_table(&conn)?;
-        }
+        // Train the IVF backend over the freshly-loaded set so a reopened,
+        // populated database gets sub-linear search immediately (HNSW: no-op).
+        self.index.train()?;
+
+        self.load_names_from_entity_table(&conn)?;
         Ok(())
     }
 
@@ -287,17 +421,16 @@ impl VectorStore {
             })?;
         let entity_id = entity.0;
 
-        let total = self.count.load(Ordering::Relaxed);
-        self.index
-            .reserve_capacity_and_threads(total.saturating_add(1), 1)
-            .map_err(|e| MCSError::MemoryError(format!("usearch reserve: {e}")))?;
-        let existed = self
-            .index
-            .remove(entity_id as u64)
-            .unwrap_or(0) > 0;
-        self.index
-            .add(entity_id as u64, embedding)
-            .map_err(|e| MCSError::MemoryError(format!("usearch add: {e}")))?;
+        // Grow the index capacity in chunks rather than one slot per upsert, so
+        // a bulk load doesn't trigger a reallocation on every insert.
+        let needed = self.count.load(Ordering::Relaxed).saturating_add(1);
+        if needed > self.index.capacity() {
+            const CHUNK: usize = 1024;
+            let target = needed.div_ceil(CHUNK).saturating_mul(CHUNK);
+            self.index.reserve(target)?;
+        }
+        let existed = self.index.remove(entity_id as u64).unwrap_or(false);
+        self.index.add(entity_id as u64, embedding)?;
 
         self.name_to_id
             .insert(entity_name.to_string(), entity_id);
@@ -330,9 +463,7 @@ impl VectorStore {
             }
         };
 
-        self.index
-            .remove(entity_id as u64)
-            .map_err(|e| MCSError::MemoryError(format!("usearch remove: {e}")))?;
+        self.index.remove(entity_id as u64)?;
 
         self.name_to_id.remove(entity_name);
         self.id_to_name.remove(&entity_id);
@@ -364,19 +495,11 @@ impl VectorStore {
             return Ok(Vec::new());
         }
         let top_k = top_k.clamp(1, 100);
-        let matches = self
-            .index
-            .search(query, top_k)
-            .map_err(|e| MCSError::MemoryError(format!("usearch search: {e}")))?;
-
-        let cap = matches.keys.len().min(matches.distances.len());
-        let mut results = Vec::with_capacity(cap);
-        for i in 0..cap {
-            let id = matches.keys[i] as EntityId;
-            let dist = matches.distances[i];
-            results.push((id, dist));
-        }
-        Ok(results)
+        let matches = self.index.search(query, top_k, Some(self.ivf_nprobe))?;
+        Ok(matches
+            .into_iter()
+            .map(|(id, dist)| (id as EntityId, dist))
+            .collect())
     }
 
     pub fn search_entities_json(
@@ -568,6 +691,141 @@ impl VectorStore {
         self.dims
     }
 
+    /// Approximate resident RAM used by the ANN index, in bytes.
+    pub fn index_memory_bytes(&self) -> usize {
+        self.index.memory_bytes()
+    }
+
+    /// Breakdown of index RAM into (graph_bytes, vectors_bytes). IVF has no graph
+    /// component, so its `graph_bytes` is 0.
+    pub fn index_memory_breakdown(&self) -> (usize, usize) {
+        self.index.memory_breakdown()
+    }
+
+    /// Current allocated capacity of the index (number of vectors it can hold
+    /// before the next reservation).
+    pub fn index_capacity(&self) -> usize {
+        self.index.capacity()
+    }
+
+    /// The active ANN backend.
+    pub const fn index_kind(&self) -> IndexKind {
+        self.index.kind()
+    }
+
+    /// Rebuild the ANN index structure: retrains the IVF centroids over the
+    /// current vectors (no-op for HNSW). Call after large batch ingestion to keep
+    /// IVF recall high.
+    pub fn reindex(&self) -> Result<()> {
+        self.index.train()
+    }
+
+    /// Resolve a live entity id by name (cache first, then the KG table).
+    pub fn entity_id_of(&self, name: &str) -> Result<Option<EntityId>> {
+        let conn = self.db.lock();
+        Ok(self.get_entity_id_and_name(&conn, name)?.map(|(id, _)| id))
+    }
+
+    /// Fetch the stored embedding for an entity id, if any.
+    pub fn get_embedding_by_id(&self, id: EntityId) -> Result<Option<Vec<f32>>> {
+        let conn = self.db.lock();
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT blob FROM vector_embedding WHERE entity_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .ok();
+        match blob {
+            Some(b) => Ok(Some(parse_embedding_blob(&b)?.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch `(entity_id, embedding, model)` for an entity by name.
+    pub fn get_embedding_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<(EntityId, Vec<f32>, String)>> {
+        let id = match self.entity_id_of(name)? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let conn = self.db.lock();
+        let row: Option<(Vec<u8>, String)> = conn
+            .query_row(
+                "SELECT blob, model FROM vector_embedding WHERE entity_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        match row {
+            Some((blob, model)) => Ok(Some((id, parse_embedding_blob(&blob)?.to_vec(), model))),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve an entity id to `(name, entityType)`, preferring the in-memory name
+    /// cache and reading the type from the KG.
+    pub fn resolve_name_type(&self, id: EntityId) -> (String, String) {
+        let conn = self.db.lock();
+        let name = self
+            .id_to_name
+            .get(&id)
+            .map(|r| r.value().clone())
+            .or_else(|| {
+                conn.query_row(
+                    "SELECT name FROM entity WHERE id = ?1 AND flags = 0",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let etype: String = conn
+            .query_row(
+                "SELECT t.name FROM entity e JOIN type_dict t ON t.id = e.type_id WHERE e.id = ?1 AND e.flags = 0",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        (name, etype)
+    }
+
+    /// k-NN that returns resolved `(id, name, entityType, distance)`, optionally
+    /// filtered by `entity_type` and excluding `exclude` ids. Over-fetches to
+    /// compensate for filtered-out rows.
+    pub fn search_resolved(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        entity_type: Option<&str>,
+        exclude: &std::collections::HashSet<EntityId>,
+    ) -> Result<Vec<(EntityId, String, String, f32)>> {
+        let fetch = (top_k.saturating_mul(3) + exclude.len()).clamp(top_k, 100);
+        let raw = self.search_embeddings(query, fetch)?;
+        let mut out = Vec::with_capacity(top_k);
+        for (id, dist) in raw {
+            if exclude.contains(&id) {
+                continue;
+            }
+            let (name, etype) = self.resolve_name_type(id);
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(ft) = entity_type
+                && etype != ft
+            {
+                continue;
+            }
+            out.push((id, name, etype, dist));
+            if out.len() >= top_k {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn name_to_id(&self) -> &DashMap<String, EntityId> {
         &self.name_to_id
     }
@@ -586,7 +844,7 @@ fn write_f32(buf: &mut String, val: f32) {
 mod tests {
     use super::*;
     use crate::kg::GraphHandle;
-    use crate::config::Durability;
+    use crate::config::{Durability, SqliteTuning};
     use crate::types::Entity;
     use std::num::NonZeroUsize;
 
@@ -600,8 +858,25 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let lru = NonZeroUsize::new(10000).unwrap();
-        let kg = GraphHandle::new(&db_path, Durability::Async, 268435456, lru, 4).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
         let vs = VectorStore::new(&db_path, dims).unwrap();
+        TestEnv {
+            kg,
+            vs,
+            _dir: dir,
+        }
+    }
+
+    fn setup_ivf(dims: u32) -> TestEnv {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let mut cfg = VectorConfig::new(dims);
+        cfg.index_kind = IndexKind::Ivf;
+        cfg.ivf_nlist = 4;
+        cfg.ivf_nprobe = 4;
+        let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
         TestEnv {
             kg,
             vs,
@@ -758,6 +1033,39 @@ mod tests {
     }
 
     #[test]
+    fn test_vector_index_capacity_grows_in_chunks() {
+        let env = setup(4);
+        // Empty store reserves nothing.
+        assert_eq!(env.vs.count(), 0);
+
+        // First insert reserves at least a full 1024 chunk up front (usearch may
+        // over-allocate beyond that, but it must not reserve just one slot).
+        create_test_entity(&env.kg, "e0", "t");
+        env.vs.upsert_embedding("e0", &make_embedding(4, 0.0), "").unwrap();
+        let cap_after_first = env.vs.index_capacity();
+        assert!(cap_after_first >= 1024, "capacity {cap_after_first} < 1024");
+
+        // Inserts within the same chunk do not reallocate.
+        for i in 1..50 {
+            let name = format!("e{i}");
+            create_test_entity(&env.kg, &name, "t");
+            env.vs.upsert_embedding(&name, &make_embedding(4, i as f32 * 0.01), "").unwrap();
+        }
+        assert_eq!(env.vs.count(), 50);
+        assert_eq!(env.vs.index_capacity(), cap_after_first, "capacity changed mid-chunk");
+
+        // Overwriting an existing entity never grows capacity.
+        env.vs.upsert_embedding("e0", &make_embedding(4, 0.5), "").unwrap();
+        assert_eq!(env.vs.count(), 50);
+        assert_eq!(env.vs.index_capacity(), cap_after_first);
+
+        // Memory accounting is exposed and non-zero once vectors are present.
+        assert!(env.vs.index_memory_bytes() > 0);
+        let (graph_bytes, vec_bytes) = env.vs.index_memory_breakdown();
+        assert!(graph_bytes + vec_bytes > 0);
+    }
+
+    #[test]
     fn test_vector_empty_store_search() {
         let env = setup(4);
         let json = env.vs.search_entities_json(&make_embedding(4, 1.0), 10, None).unwrap();
@@ -770,7 +1078,7 @@ mod tests {
         let db_path = dir.path().join("persist.db");
         let lru = NonZeroUsize::new(10000).unwrap();
 
-        let kg = GraphHandle::new(&db_path, Durability::Async, 268435456, lru, 4).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
         kg.create_entities(&[Entity {
             name: "alice".into(),
             entity_type: "person".into(),
@@ -784,7 +1092,7 @@ mod tests {
         drop(vs1);
         drop(kg);
 
-        let kg2 = GraphHandle::new(&db_path, Durability::Async, 268435456, lru, 4).unwrap();
+        let kg2 = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
         let vs2 = VectorStore::new(&db_path, 4).unwrap();
         assert_eq!(vs2.count(), 1);
 
@@ -831,5 +1139,108 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    // ── IVF backend (via VectorStore) ─────────────────────────────────────
+
+    #[test]
+    fn test_ivf_store_upsert_search_delete() {
+        let env = setup_ivf(4);
+        assert_eq!(env.vs.index_kind(), IndexKind::Ivf);
+        create_test_entity(&env.kg, "alice", "person");
+        create_test_entity(&env.kg, "bob", "person");
+        env.vs.upsert_embedding("alice", &make_embedding(4, 1.0), "m").unwrap();
+        env.vs.upsert_embedding("bob", &make_embedding(4, 0.1), "m").unwrap();
+        assert_eq!(env.vs.count(), 2);
+
+        let results = env.vs.search_embeddings(&make_embedding(4, 1.0), 10).unwrap();
+        assert_eq!(results.len(), 2);
+        // alice (all 1.0) is the closest match to the all-ones query.
+        let top_name = env.vs.id_to_name.get(&results[0].0).map(|r| r.value().clone());
+        assert_eq!(top_name.as_deref(), Some("alice"));
+
+        assert!(env.vs.delete_embedding("alice").unwrap());
+        assert_eq!(env.vs.count(), 1);
+        let results = env.vs.search_embeddings(&make_embedding(4, 1.0), 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_ivf_persistence_and_reindex() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("ivf.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let mut cfg = VectorConfig::new(4);
+        cfg.index_kind = IndexKind::Ivf;
+        cfg.ivf_nlist = 3;
+        cfg.ivf_nprobe = 3;
+
+        {
+            let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
+            for i in 0..12 {
+                let name = format!("e{i}");
+                create_test_entity(&kg, &name, "t");
+                vs.upsert_embedding(&name, &make_embedding(4, i as f32 * 0.1), "").unwrap();
+            }
+            vs.reindex().unwrap();
+            assert_eq!(vs.count(), 12);
+        }
+
+        // Reopen: embeddings reload and the IVF index retrains on load.
+        let vs2 = VectorStore::with_config(&db_path, &cfg).unwrap();
+        assert_eq!(vs2.count(), 12);
+        let results = vs2.search_embeddings(&make_embedding(4, 0.0), 3).unwrap();
+        assert!(!results.is_empty());
+        // The exact match (e0 == all-zeros) should be the nearest.
+        let top = vs2.id_to_name.get(&results[0].0).map(|r| r.value().clone());
+        assert_eq!(top.as_deref(), Some("e0"));
+    }
+
+    // ── New retrieval helpers (backend-agnostic) ──────────────────────────
+
+    #[test]
+    fn test_get_embedding_helpers() {
+        let env = setup(4);
+        create_test_entity(&env.kg, "alice", "person");
+        let emb = vec![0.1, 0.2, 0.3, 0.4];
+        env.vs.upsert_embedding("alice", &emb, "model-x").unwrap();
+
+        let id = env.vs.entity_id_of("alice").unwrap().unwrap();
+        let by_id = env.vs.get_embedding_by_id(id).unwrap().unwrap();
+        assert_eq!(by_id, emb);
+
+        let (got_id, got_emb, model) = env.vs.get_embedding_by_name("alice").unwrap().unwrap();
+        assert_eq!(got_id, id);
+        assert_eq!(got_emb, emb);
+        assert_eq!(model, "model-x");
+
+        assert!(env.vs.get_embedding_by_name("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_search_resolved_excludes_and_filters() {
+        let env = setup(4);
+        create_test_entity(&env.kg, "a", "doc");
+        create_test_entity(&env.kg, "b", "doc");
+        create_test_entity(&env.kg, "c", "note");
+        env.vs.upsert_embedding("a", &make_embedding(4, 1.0), "").unwrap();
+        env.vs.upsert_embedding("b", &make_embedding(4, 0.9), "").unwrap();
+        env.vs.upsert_embedding("c", &make_embedding(4, 0.95), "").unwrap();
+
+        let id_a = env.vs.entity_id_of("a").unwrap().unwrap();
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(id_a);
+
+        // Exclude "a"; without a type filter we expect b and c.
+        let rows = env.vs.search_resolved(&make_embedding(4, 1.0), 10, None, &exclude).unwrap();
+        let names: Vec<&str> = rows.iter().map(|(_, n, _, _)| n.as_str()).collect();
+        assert!(!names.contains(&"a"));
+        assert!(names.contains(&"b") && names.contains(&"c"));
+
+        // Now filter to type "doc": only "b" remains (a excluded, c is a note).
+        let rows = env.vs.search_resolved(&make_embedding(4, 1.0), 10, Some("doc"), &exclude).unwrap();
+        let names: Vec<&str> = rows.iter().map(|(_, n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
     }
 }

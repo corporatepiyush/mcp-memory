@@ -418,3 +418,32 @@ fn e2e_search_edge_cases() {
     let d = c.tool_text("describe_entity", serde_json::json!({"name": "Alice"}));
     assert!(d.contains("Alice"), "describe: {d}");
 }
+
+#[test]
+fn e2e_vectors_disabled_by_default() {
+    let mut c = spawn_server();
+
+    // tools/list must not advertise the vector tools on a plain KG server.
+    c.send(r#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#);
+    let list = c.recv();
+    assert!(
+        list.contains("create_entities"),
+        "base tools present: {list}"
+    );
+    assert!(
+        !list.contains("vector_upsert_embedding") && !list.contains("hybrid_search"),
+        "vector tools must be hidden when --vectors is off: {list}"
+    );
+
+    // Calling a vector tool must fail (vectors disabled) rather than succeed.
+    let resp = c.call_tool(
+        "vector_search_entities",
+        serde_json::json!({"embedding": [1.0, 1.0, 1.0, 1.0], "topK": 3}),
+    );
+    let is_protocol_error = resp.get("error").is_some();
+    let is_tool_error = resp["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(
+        is_protocol_error || is_tool_error,
+        "vector tool must error when disabled: {resp}"
+    );
+}

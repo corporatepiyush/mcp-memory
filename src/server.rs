@@ -15,6 +15,8 @@ use crate::errors::{MCSError, Result};
 use crate::kg::GraphHandle;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::tools;
+use crate::vector_actions;
+use crate::vector_store::{VectorConfig, VectorStore};
 
 /// Outcome of processing a request: either a pre-escaped JSON Value (small
 /// payloads) or a pre-serialized JSON *string* of the `result` field (avoids
@@ -90,35 +92,9 @@ fn parse_error(msg: String) -> JsonRpcResponse {
     JsonRpcResponse::error(None, mcp_error.error_code(), mcp_error.to_string())
 }
 
-/// Process one parsed JSON-RPC message. `None` means "no reply" — the message
-/// was a notification (no `id`), per JSON-RPC.
-pub fn process_value(value: Value, kg: &GraphHandle) -> Option<Value> {
-    let req: JsonRpcRequest = match serde_json::from_value(value) {
-        Ok(r) => r,
-        Err(e) => return Some(to_value(parse_error(e.to_string()))),
-    };
-    req.id.as_ref()?;
-    
-    match process_request(&req, kg) {
-        Ok(HandlerResult::Value(result)) => {
-            Some(to_value(JsonRpcResponse::success(req.id, result)))
-        }
-        Ok(HandlerResult::RawResult(_)) => {
-            // RawResult cannot pass through Value — dispatch_line and
-            // dispatch_http_body handle it via separate code paths.
-            unreachable!("RawResult must be handled at the dispatch level, not via process_value");
-        }
-        Err(e) => Some(to_value(JsonRpcResponse::error(
-            req.id,
-            e.error_code(),
-            e.to_string(),
-        ))),
-    }
-}
-
 /// Dispatch one framed line (stdio / tcp). Returns the serialized response, or
-/// `None` for a notification.
-pub fn dispatch_line(line: &str, kg: &GraphHandle) -> Option<String> {
+/// `None` for a notification. `vs` is `Some` only when vector support is enabled.
+pub fn dispatch_line(line: &str, kg: &GraphHandle, vs: Option<&VectorStore>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Some(serde_json::to_string(&parse_error("Empty request".into())).unwrap());
@@ -132,7 +108,7 @@ pub fn dispatch_line(line: &str, kg: &GraphHandle) -> Option<String> {
         Err(e) => return Some(serde_json::to_string(&parse_error(e.to_string())).unwrap()),
     };
     req.id.as_ref()?;
-    match process_request(&req, kg) {
+    match process_request(&req, kg, vs) {
         Ok(HandlerResult::Value(result)) => {
             let resp = JsonRpcResponse::success(req.id, result);
             Some(serde_json::to_string(&resp).unwrap())
@@ -160,6 +136,7 @@ pub fn dispatch_line(line: &str, kg: &GraphHandle) -> Option<String> {
 pub fn dispatch_http_body(
     body: &str,
     kg: &GraphHandle,
+    vs: Option<&VectorStore>,
 ) -> std::result::Result<Option<Value>, String> {
     let value: Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
     match value {
@@ -167,23 +144,24 @@ pub fn dispatch_http_body(
             // Batches are rare and never huge — keep Value path for simplicity.
             let responses: Vec<Value> = items
                 .into_iter()
-                .filter_map(|v| process_value_http(v, kg))
+                .filter_map(|v| process_value_http(v, kg, vs))
                 .collect();
             Ok((!responses.is_empty()).then_some(Value::Array(responses)))
         }
-        other => Ok(process_value_http(other, kg)),
+        other => Ok(process_value_http(other, kg, vs)),
     }
 }
 
-/// HTTP variant of process_value that handles RawResult by converting to Value
-/// (acceptable since HTTP payloads are typically much smaller in this context).
-fn process_value_http(value: Value, kg: &GraphHandle) -> Option<Value> {
+/// Process one JSON-RPC message for the HTTP transport, converting any
+/// `RawResult` back into a `Value` (acceptable since HTTP payloads are typically
+/// much smaller in this context). `None` means the message was a notification.
+fn process_value_http(value: Value, kg: &GraphHandle, vs: Option<&VectorStore>) -> Option<Value> {
     let req: JsonRpcRequest = match serde_json::from_value(value) {
         Ok(r) => r,
         Err(e) => return Some(to_value(parse_error(e.to_string()))),
     };
     req.id.as_ref()?;
-    match process_request(&req, kg) {
+    match process_request(&req, kg, vs) {
         Ok(HandlerResult::Value(result)) => {
             Some(to_value(JsonRpcResponse::success(req.id, result)))
         }
@@ -210,10 +188,16 @@ fn to_value(resp: JsonRpcResponse) -> Value {
 pub struct MCPServer {
     config: Arc<Config>,
     kg: Arc<GraphHandle>,
+    /// `Some` when vector support is enabled (`--vectors`); drives the extra
+    /// `vector_*` / `hybrid_search` tools. `None` for a pure knowledge-graph server.
+    vs: Option<Arc<VectorStore>>,
 }
 
 impl MCPServer {
-    pub fn new(config: Config) -> Result<Self> {
+    /// Build a server. The vector subsystem (usearch index + petgraph mirror) is
+    /// only constructed when `config.vectors_enabled` is set; `vec_config` is
+    /// ignored otherwise.
+    pub fn new(config: Config, vec_config: VectorConfig) -> Result<Self> {
         let path = Path::new(&config.memory_file_path);
         let lru_cache = NonZeroUsize::new(config.lru_cache_size).unwrap_or_else(|| {
             NonZeroUsize::new(10000).expect("10000 > 0")
@@ -221,15 +205,29 @@ impl MCPServer {
         let kg = GraphHandle::new(
             path,
             config.durability,
-            config.mmap_size,
+            config.sqlite_tuning(),
             lru_cache,
             config.read_pool_size,
         )?;
 
+        let vs = if config.vectors_enabled {
+            Some(Arc::new(VectorStore::with_config(path, &vec_config)?))
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             kg: Arc::new(kg),
+            vs,
         })
+    }
+
+    /// Convenience constructor for a pure knowledge-graph server (no vectors).
+    pub fn new_kg(config: Config) -> Result<Self> {
+        let mut config = config;
+        config.vectors_enabled = false;
+        Self::new(config, VectorConfig::new(0))
     }
 
     /// Expose the shared graph handle (used to drive the HTTP transport).
@@ -237,13 +235,19 @@ impl MCPServer {
         Arc::clone(&self.kg)
     }
 
+    /// The shared vector store, if vector support is enabled.
+    pub fn vector_store(&self) -> Option<Arc<VectorStore>> {
+        self.vs.clone()
+    }
+
     /// stdio transport: newline-delimited JSON-RPC over stdin/stdout.
     pub async fn run_stdio(&self) -> Result<()> {
         spawn_maintenance(self.kg.clone());
+        spawn_wal_flush(self.kg.clone(), self.config.wal_flush_ms);
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
-        serve_line_conn(&mut reader, &mut stdout, Arc::clone(&self.kg)).await
+        serve_line_conn(&mut reader, &mut stdout, Arc::clone(&self.kg), self.vs.clone()).await
     }
 
     /// TCP transport: each accepted connection speaks newline-delimited
@@ -251,17 +255,20 @@ impl MCPServer {
     /// [`MAX_TCP_CONNECTIONS`]) and share the one graph behind its mutex.
     pub async fn run_tcp(&self, addr: &str) -> Result<()> {
         spawn_maintenance(self.kg.clone());
+        spawn_wal_flush(self.kg.clone(), self.config.wal_flush_ms);
         let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
         let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
         let auth_token = self.config.auth_token.clone();
         info!(
-            "Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS}, auth {})",
-            if auth_token.is_some() { "on" } else { "off" }
+            "Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS}, auth {}, vectors {})",
+            if auth_token.is_some() { "on" } else { "off" },
+            if self.vs.is_some() { "on" } else { "off" }
         );
         loop {
             let permit = Arc::clone(&semaphore).acquire_owned().await;
             let (socket, peer) = listener.accept().await.map_err(MCSError::IoError)?;
             let kg = Arc::clone(&self.kg);
+            let vs = self.vs.clone();
             let auth_token = auth_token.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection lifetime
@@ -283,7 +290,7 @@ impl MCPServer {
                         }
                     }
                 }
-                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, kg).await {
+                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, kg, vs).await {
                     error!("TCP connection {peer} error: {e}");
                 }
             });
@@ -293,15 +300,41 @@ impl MCPServer {
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
     pub async fn run_http(&self, addr: &str) -> Result<()> {
         spawn_maintenance(self.kg.clone());
+        spawn_wal_flush(self.kg.clone(), self.config.wal_flush_ms);
         crate::http::run(
             addr,
             self.graph(),
+            self.vs.clone(),
             self.config.auth_token.clone(),
             self.config.tls_cert.clone(),
             self.config.tls_key.clone(),
         )
         .await
     }
+}
+
+/// Spawn a background task that fsyncs committed WAL frames every
+/// `interval_ms` milliseconds via a non-blocking passive checkpoint, bounding
+/// the durability window in async mode. A zero interval disables the task.
+fn spawn_wal_flush(kg: Arc<GraphHandle>, interval_ms: u64) {
+    if interval_ms == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            let kg = kg.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = kg.checkpoint_passive() {
+                    tracing::warn!("WAL flush error: {e}");
+                }
+            })
+            .await
+            .ok();
+        }
+    });
 }
 
 /// Spawn a background task that runs periodic database maintenance every
@@ -349,7 +382,12 @@ where
 /// Notifications produce no output. Returns when the peer closes the stream.
 /// The dispatch path (graph lock + optional fsync) is offloaded to
 /// [`tokio::task::spawn_blocking`] to keep the async reactor responsive (C3).
-async fn serve_line_conn<R, W>(reader: &mut R, writer: &mut W, kg: Arc<GraphHandle>) -> Result<()>
+async fn serve_line_conn<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    kg: Arc<GraphHandle>,
+    vs: Option<Arc<VectorStore>>,
+) -> Result<()>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -363,13 +401,15 @@ where
             Ok(LineRead::Line) => {
                 let line_copy = line.clone();
                 let kg_clone = Arc::clone(&kg);
-                let resp =
-                    tokio::task::spawn_blocking(move || dispatch_line(&line_copy, &kg_clone))
-                        .await
-                        .map_err(|join_err| {
-                            error!("dispatch task panicked: {join_err}");
-                            MCSError::IoError(std::io::Error::other("dispatch task panicked"))
-                        })?;
+                let vs_clone = vs.clone();
+                let resp = tokio::task::spawn_blocking(move || {
+                    dispatch_line(&line_copy, &kg_clone, vs_clone.as_deref())
+                })
+                .await
+                .map_err(|join_err| {
+                    error!("dispatch task panicked: {join_err}");
+                    MCSError::IoError(std::io::Error::other("dispatch task panicked"))
+                })?;
                 if let Some(resp) = resp {
                     out.clear();
                     out.extend_from_slice(resp.as_bytes());
@@ -397,11 +437,15 @@ where
     Ok(())
 }
 
-fn process_request(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResult> {
+fn process_request(
+    req: &JsonRpcRequest,
+    kg: &GraphHandle,
+    vs: Option<&VectorStore>,
+) -> Result<HandlerResult> {
     match req.method.as_str() {
-        "initialize" => Ok(HandlerResult::Value(handle_initialize(req))),
-        "tools/list" => Ok(HandlerResult::Value(handle_tools_list())),
-        "tools/call" => handle_tools_call(req, kg),
+        "initialize" => Ok(HandlerResult::Value(handle_initialize(req, vs.is_some()))),
+        "tools/list" => Ok(HandlerResult::Value(handle_tools_list(vs.is_some()))),
+        "tools/call" => handle_tools_call(req, kg, vs),
         "ping" => Ok(HandlerResult::Value(Value::Null)),
         method if method.starts_with("notifications/") => {
             tracing::trace!("Received notification: {method}");
@@ -425,7 +469,12 @@ attach facts, and `search_nodes`/`open_nodes`/`read_graph` to retrieve. Prefer `
 idempotent writes and `merge_entities` to collapse duplicates. Tool failures are returned with \
 `isError: true` rather than as protocol errors — read the message and retry.";
 
-fn handle_initialize(req: &JsonRpcRequest) -> Value {
+/// Extra guidance appended to [`SERVER_INSTRUCTIONS`] when vector support is on.
+const VECTOR_INSTRUCTIONS: &str = " Vector search is enabled: use `vector_upsert_embedding` to \
+attach embeddings to entities, `vector_search_entities` for semantic search, and `hybrid_search` to \
+combine text + vector relevance.";
+
+fn handle_initialize(req: &JsonRpcRequest, vectors_enabled: bool) -> Value {
     // Version negotiation: echo a supported requested revision, else offer latest.
     let protocol_version = req
         .params
@@ -434,6 +483,12 @@ fn handle_initialize(req: &JsonRpcRequest) -> Value {
         .and_then(Value::as_str)
         .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
         .unwrap_or(LATEST_PROTOCOL_VERSION);
+
+    let instructions = if vectors_enabled {
+        format!("{SERVER_INSTRUCTIONS}{VECTOR_INSTRUCTIONS}")
+    } else {
+        SERVER_INSTRUCTIONS.to_string()
+    };
 
     json!({
         "protocolVersion": protocol_version,
@@ -444,7 +499,7 @@ fn handle_initialize(req: &JsonRpcRequest) -> Value {
             "name": "mcp-memory",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": SERVER_INSTRUCTIONS
+        "instructions": instructions
     })
 }
 
@@ -472,20 +527,63 @@ pub fn token_matches(presented: &str, expected: &str) -> bool {
     presented.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
-fn handle_tools_list() -> Value {
-    static CACHED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    if let Some(cached) = CACHED.get() {
-        return cached.clone();
-    }
-    let tools_json = include_str!("../tools.json");
-    let tools: Vec<Value> = serde_json::from_str(tools_json)
-        .expect("tools.json is valid JSON compiled at build time");
-    let result = json!({ "tools": tools });
-    let _ = CACHED.set(result.clone());
-    result
+/// The base knowledge-graph tools, parsed from `tools.json` at build time.
+fn base_tools() -> &'static Vec<Value> {
+    static BASE: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        serde_json::from_str(include_str!("../tools.json"))
+            .expect("tools.json is valid JSON compiled at build time")
+    })
 }
 
-fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerResult> {
+/// `tools/list` response. The vector tools are appended only when vector support
+/// is enabled, so a pure-KG server never advertises tools it cannot serve.
+fn handle_tools_list(vectors_enabled: bool) -> Value {
+    static KG_ONLY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    static WITH_VECTORS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+
+    if vectors_enabled {
+        WITH_VECTORS
+            .get_or_init(|| {
+                let mut all = base_tools().clone();
+                let vec_tools: Vec<Value> =
+                    serde_json::from_str(include_str!("../vector_tools.json"))
+                        .expect("vector_tools.json is valid JSON compiled at build time");
+                all.extend(vec_tools);
+                json!({ "tools": all })
+            })
+            .clone()
+    } else {
+        KG_ONLY
+            .get_or_init(|| json!({ "tools": base_tools().clone() }))
+            .clone()
+    }
+}
+
+/// `true` for the vector-specific tool names (`vector_*` plus `hybrid_search`).
+fn is_vector_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "vector_upsert_embedding"
+            | "vector_search_entities"
+            | "vector_delete_embedding"
+            | "hybrid_search"
+            | "vector_refresh_graph_cache"
+            | "vector_store_stats"
+            | "vector_batch_upsert"
+            | "vector_get_embedding"
+            | "vector_search_by_entity"
+            | "vector_recommend"
+            | "vector_mmr_search"
+            | "vector_reindex"
+    )
+}
+
+fn handle_tools_call(
+    req: &JsonRpcRequest,
+    kg: &GraphHandle,
+    vs: Option<&VectorStore>,
+) -> Result<HandlerResult> {
     let tool_name = req
         .params
         .as_ref()
@@ -493,6 +591,67 @@ fn handle_tools_call(req: &JsonRpcRequest, kg: &GraphHandle) -> Result<HandlerRe
         .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
 
     let tool_args = req.params.as_ref().and_then(|p| p.get("arguments"));
+
+    if is_vector_tool_name(tool_name) {
+        let Some(vs) = vs else {
+            return Err(MCSError::MethodNotFound(format!(
+                "{tool_name} (vector support disabled; start the server with --vectors)"
+            )));
+        };
+        let result = match tool_name {
+            "vector_upsert_embedding" => {
+                vector_actions::handle_vector_upsert_embedding(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "vector_search_entities" => {
+                vector_actions::handle_vector_search_entities(vs, kg, tool_args)
+                    .map(HandlerResult::RawResult)
+            }
+            "vector_delete_embedding" => {
+                vector_actions::handle_vector_delete_embedding(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "hybrid_search" => {
+                vector_actions::handle_hybrid_search(vs, kg, tool_args).map(HandlerResult::RawResult)
+            }
+            "vector_refresh_graph_cache" => {
+                vector_actions::handle_refresh_graph_cache(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "vector_store_stats" => {
+                vector_actions::handle_vector_store_stats(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "vector_batch_upsert" => {
+                vector_actions::handle_vector_batch_upsert(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "vector_get_embedding" => {
+                vector_actions::handle_vector_get_embedding(vs, kg, tool_args)
+                    .map(HandlerResult::Value)
+            }
+            "vector_search_by_entity" => {
+                vector_actions::handle_vector_search_by_entity(vs, kg, tool_args)
+                    .map(HandlerResult::RawResult)
+            }
+            "vector_recommend" => {
+                vector_actions::handle_vector_recommend(vs, kg, tool_args)
+                    .map(HandlerResult::RawResult)
+            }
+            "vector_mmr_search" => {
+                vector_actions::handle_vector_mmr_search(vs, kg, tool_args)
+                    .map(HandlerResult::RawResult)
+            }
+            "vector_reindex" => {
+                vector_actions::handle_vector_reindex(vs, kg, tool_args).map(HandlerResult::Value)
+            }
+            other => Err(MCSError::MethodNotFound(other.to_string())),
+        };
+        return Ok(result.unwrap_or_else(|e| {
+            error!("Tool '{tool_name}' error: {e}");
+            HandlerResult::Value(tool_error(&e.to_string()))
+        }));
+    }
 
     if !tools::tool_exists(tool_name) {
         return Err(MCSError::MethodNotFound(tool_name.to_string()));

@@ -29,12 +29,14 @@ use tracing::{error, info};
 use crate::errors::{MCSError, Result};
 use crate::kg::GraphHandle;
 use crate::server;
+use crate::vector_store::VectorStore;
 
-/// Shared state for the HTTP handlers: the graph plus an optional bearer token
-/// required on every request when present.
+/// Shared state for the HTTP handlers: the graph, the optional vector store, and
+/// an optional bearer token required on every request when present.
 #[derive(Clone)]
 pub struct HttpState {
     kg: Arc<GraphHandle>,
+    vs: Option<Arc<VectorStore>>,
     auth_token: Option<Arc<str>>,
 }
 
@@ -56,12 +58,13 @@ pub fn router(state: HttpState) -> Router {
 pub async fn run(
     addr: &str,
     kg: Arc<GraphHandle>,
+    vs: Option<Arc<VectorStore>>,
     auth_token: Option<Arc<str>>,
     tls_cert: Option<std::path::PathBuf>,
     tls_key: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let auth = if auth_token.is_some() { "on" } else { "off" };
-    let state = HttpState { kg, auth_token };
+    let state = HttpState { kg, vs, auth_token };
 
     if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
         let tls = crate::tls::server_config(&cert, &key)
@@ -122,9 +125,13 @@ async fn post_handler(State(state): State<HttpState>, headers: HeaderMap, body: 
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     let kg = state.kg;
+    let vs = state.vs;
     // The dispatch path locks the graph and may perform a blocking fsync, so
     // run it off the async worker pool (keeps the HTTP reactor responsive).
-    let result = tokio::task::spawn_blocking(move || server::dispatch_http_body(&body, &kg)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        server::dispatch_http_body(&body, &kg, vs.as_deref())
+    })
+    .await;
 
     let outcome = match result {
         Ok(inner) => inner,

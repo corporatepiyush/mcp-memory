@@ -4,18 +4,23 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gi
 LLM agents a persistent **knowledge graph memory** — entities, relations, and
 observations stored in an embedded SQLite database with FTS5 full-text search.
 
-The crate ships **two binaries**:
+It is **one unified server** with an opt-in vector subsystem:
 
-| Binary | What it adds | Tools |
+| Invocation | What you get | Tools |
 |---|---|---|
 | `mcp-memory` | The knowledge-graph server | 26 |
-| `mcp-memory-vec` | Everything in `mcp-memory` **plus** vector embeddings and semantic / hybrid search (usearch HNSW) | 32 |
+| `mcp-memory --vectors` | Everything above **plus** vector embeddings and semantic / hybrid / MMR search (usearch HNSW **or** IVF-Flat) | 38 |
+| `mcp-memory-vec` | Backward-compatible alias for `mcp-memory --vectors` | 38 |
 
-Both speak MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth and TLS).
+> **v4 note:** the former separate `mcp-memory-vec` server has been merged into
+> `mcp-memory`. Vectors are now enabled with the `--vectors` flag; `mcp-memory-vec`
+> remains as a thin alias that turns the flag on, so existing configs keep working.
+
+It speaks MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth and TLS).
 
 ```
                     ┌────────────────────────────────────────────────┐
-                    │         mcp-memory / mcp-memory-vec            │
+                    │      mcp-memory  (+ --vectors / -vec alias)     │
                     │                                                │
      ┌───────┐      │  ┌──────────┐   ┌─────────────────────────┐   │
      │Claude │──────│─>│  stdio / │──>│ GraphHandle             │   │
@@ -23,15 +28,15 @@ Both speak MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth an
      └───────┘      │  │  HTTP    │   │  ├ FxHashMap name→ID     │   │
                     │  └────┬─────┘   │  └ FTS5 full-text index  │   │
                     │       │         └───────────┬─────────────┘   │
-                    │       │   (vec binary only) │                 │
+                    │       │     (--vectors only) │                 │
                     │       v         ┌───────────┴─────────────┐   │
                     │  ┌─────────┐    │ VectorStore             │   │
-                    │  │ dispatch│───>│  ├ usearch HNSW index    │   │
+                    │  │ dispatch│───>│  ├ ANN: HNSW *or* IVF    │   │
                     │  └─────────┘    │  └ petgraph adjacency    │   │
                     │       │         └───────────┬─────────────┘   │
                     │       v                     v                  │
                     │  ┌──────────────────────────────────────────┐ │
-                    │  │ SQLite (WAL, 16 KB pages)                 │ │
+                    │  │ SQLite (WAL, 4 KB pages, auto_vacuum)     │ │
                     │  │ entity, observation, relation, *_fts,     │ │
                     │  │ type_dict, vector_embedding               │ │
                     │  └──────────────────────────────────────────┘ │
@@ -53,18 +58,21 @@ This installs both `mcp-memory` and `mcp-memory-vec`.
 mcp-memory --transport stdio
 
 # Knowledge-graph + vector search
+mcp-memory --vectors --transport stdio --embedding-dims 384
+
+# Equivalent backward-compatible alias
 mcp-memory-vec --transport stdio --embedding-dims 384
 ```
 
 The database path is resolved in order:
 
 1. `--memory-file` / `-f` flag
-2. `MEMORY_FILE_PATH` environment variable (`mcp-memory` only)
+2. `MEMORY_FILE_PATH` environment variable
 3. Default: `memory.mcpmem` in the working directory
 
-Both binaries open the **same** SQLite file, so you can populate the graph with
-`mcp-memory` and later serve it with `mcp-memory-vec` (or run a single
-`mcp-memory-vec` for everything).
+The same SQLite file works with or without `--vectors`, so you can populate the
+graph plain and later serve it with vectors enabled. With `--vectors` off, the
+vector tools are neither advertised in `tools/list` nor served.
 
 ### Transports
 
@@ -86,19 +94,18 @@ Both binaries open the **same** SQLite file, so you can populate the graph with
 }
 ```
 
-Swap `"command"` for `"mcp-memory-vec"` (and add `"args": ["--embedding-dims", "384"]`)
-to enable vector search.
+Add `"args": ["--vectors", "--embedding-dims", "384"]` to enable vector search
+(or use `"command": "mcp-memory-vec"`).
 
 ### Authentication
 
 The `tcp` and `http` transports accept an optional bearer token (stdio is never
-authenticated, on either binary). Set it with `--auth-token` or `--auth-token-file`
-(trimmed; an empty file is rejected). `mcp-memory` additionally falls back to the
-`MCP_MEMORY_AUTH_TOKEN` environment variable.
+authenticated). Set it with `--auth-token` or `--auth-token-file` (trimmed; an
+empty file is rejected), or the `MCP_MEMORY_AUTH_TOKEN` environment variable.
 
 ```sh
-mcp-memory      --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
-mcp-memory-vec  --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
+mcp-memory --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
+mcp-memory --vectors --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
 ```
 
 On HTTP the token is sent as `Authorization: Bearer <token>`; on TCP it is the
@@ -109,50 +116,78 @@ address **without** a token exposes the entire graph to the network.
 
 The `http` transport can be served over TLS (rustls, `ring` provider). Provide a
 PEM certificate chain and private key via `--tls-cert` / `--tls-key`; both must be
-supplied together or startup is refused. `mcp-memory` also accepts the
-`MCP_TLS_CERT` / `MCP_TLS_KEY` environment variables. When neither is set the
-transport stays plaintext (the default).
+supplied together or startup is refused. The `MCP_TLS_CERT` / `MCP_TLS_KEY`
+environment variables are accepted as fallbacks. When neither is set the transport
+stays plaintext (the default).
 
 ```sh
-mcp-memory-vec --transport http --bind 0.0.0.0:8080 \
+mcp-memory --transport http --bind 0.0.0.0:8080 \
   --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
-## Vector search (`mcp-memory-vec`)
+## Vector search (`--vectors`)
 
-`mcp-memory-vec` layers a vector store on top of the knowledge graph. Each
-embedding is attached to an **existing** entity (by name), indexed in an in-memory
-[usearch](https://github.com/unum-cloud/usearch) HNSW index, and persisted as a
-blob in the `vector_embedding` SQLite table. On startup the index is rebuilt from
-those blobs.
+With `--vectors`, the server layers a vector store on top of the knowledge graph.
+Each embedding is attached to an **existing** entity (by name), indexed in an
+in-memory ANN index, and persisted as a blob in the `vector_embedding` SQLite
+table. On startup the index is rebuilt from those blobs.
 
 - **Bring your own embeddings.** The server stores and searches vectors; it does
   not call an embedding model. Compute embeddings client-side (e.g. with an
   embedding API) and pass them in. All vectors must match `--embedding-dims`.
 - **Semantic search** — `vector_search_entities` returns the nearest entities by
   cosine similarity (configurable), optionally filtered by entity type.
+- **More-like-this & recommendations** — `vector_search_by_entity` finds entities
+  similar to a given entity's own embedding; `vector_recommend` builds a query from
+  positive (minus negative) example entities.
+- **MMR diversification** — `vector_mmr_search` returns results that balance
+  relevance against novelty (Maximal Marginal Relevance), a common RAG
+  context-selection step that suppresses near-duplicate hits.
+- **Batch ingestion** — `vector_batch_upsert` upserts up to 1,024 embeddings per
+  call, reporting per-item failures instead of aborting.
 - **Hybrid search** — `hybrid_search` runs vector search and FTS5 text search in
   parallel and fuses the two rankings with Reciprocal Rank Fusion (RRF, constant
   60), then optionally boosts results by graph centrality from an in-memory
   petgraph adjacency cache.
 
+### Index backends: HNSW vs IVF-Flat
+
+Two ANN backends are available via `--vec-index`:
+
+| Backend | When to use | Notes |
+|---|---|---|
+| `hnsw` *(default)* | Best recall/latency for most workloads | [usearch](https://github.com/unum-cloud/usearch) graph index; supports `f16`/`bf16`/`i8` quantization |
+| `ivf` | Large, batch-ingested, periodically-rebuilt corpora | k-means partitioned (IVF-Flat); cheaper to build, lighter memory. **Exact (brute-force) until trained**, so results are always correct |
+
+The IVF index trains automatically when a populated database is opened. After a
+large batch ingestion into a fresh database, call `vector_reindex` to (re)run
+k-means and keep recall high (no-op for HNSW).
+
 ### Vector configuration
 
-The HNSW index is tunable from the command line:
+The index is tunable from the command line (all require `--vectors`):
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--embedding-dims` | `384` | Vector dimension; all embeddings must match |
+| `--vec-index` | `hnsw` | ANN backend: `hnsw` or `ivf` |
 | `--vec-metric` | `cos` | Distance metric: `cos`, `ip` (dot product), or `l2sq` |
-| `--vec-quantization` | `f32` | Scalar storage: `f32`, `f16`, or `i8` (lower = less memory) |
+| `--vec-quantization` | `f32` | HNSW scalar storage: `f32`, `f16`, `bf16`, or `i8` (lower = less memory) |
 | `--vec-connectivity` | `16` | HNSW graph degree `M` (higher = better recall, more memory) |
 | `--vec-expansion-add` | `200` | HNSW `efConstruction` (higher = better index quality, slower inserts) |
 | `--vec-expansion-search` | `50` | HNSW `efSearch` (higher = better recall, slower queries) |
+| `--ivf-nlist` | `256` | IVF number of Voronoi cells / centroids |
+| `--ivf-nprobe` | `8` | IVF cells probed per query (higher = better recall, slower) |
 
 ```sh
-mcp-memory-vec --transport http --bind 0.0.0.0:8080 \
+# HNSW with half-precision storage
+mcp-memory --vectors --transport http --bind 0.0.0.0:8080 \
   --embedding-dims 768 --vec-metric cos --vec-quantization f16 \
   --vec-connectivity 32 --vec-expansion-search 128
+
+# IVF-Flat for a large corpus
+mcp-memory --vectors --embedding-dims 768 \
+  --vec-index ivf --ivf-nlist 1024 --ivf-nprobe 16
 ```
 
 The petgraph adjacency cache used for the hybrid-search centrality boost is built
@@ -168,7 +203,7 @@ Implements the [Model Context Protocol](https://modelcontextprotocol.io) revisio
 | Transports | stdio, TCP, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
 | Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
 | `initialize` | version negotiation + `instructions` |
-| `tools/list`, `tools/call` | 26 tools (`mcp-memory`) / 32 tools (`mcp-memory-vec`) |
+| `tools/list`, `tools/call` | 26 tools (KG only) / 38 tools (with `--vectors`) |
 | `CallToolResult` | `content[]` + `isError` |
 | Auth | optional bearer token on TCP/HTTP (constant-time) |
 | Capabilities advertised | `tools` only |
@@ -187,7 +222,7 @@ Entity(name, entityType, observations[])   ──relationType──▶   Entity(
 - **Relation** — a directed edge `(from, to, relationType)`. Traversal is
   undirected (BFS/DFS follow both directions).
 - **Observation** — an unstructured fact attached to an entity.
-- **Embedding** *(vec binary)* — a fixed-dimension `f32` vector attached to an
+- **Embedding** *(`--vectors`)* — a fixed-dimension `f32` vector attached to an
   entity, plus an optional model identifier.
 
 Search uses FTS5 full-text indexing with `unicode61 remove_diacritics 2`
@@ -209,11 +244,14 @@ A single SQLite database in WAL mode:
 | `obs_fts` | `content_rowid` | External-content FTS5 over `observation.body` |
 | `type_dict` | name | Interned entity/relation types with live counts (loaded into RAM) |
 | `graph_stat` | key (singleton) | `WITHOUT ROWID` counters: entities, relations, observations, sequences |
-| `vector_embedding` | `entity_id` | *(vec binary)* `dims`, `blob` (f32 vector), `model`, `created_us` |
+| `vector_embedding` | `entity_id` | *(`--vectors`)* `dims`, `blob` (f32 vector), `model`, `created_us` |
 
-Key pragmas: `page_size=16384`, `journal_mode=WAL`, `synchronous=NORMAL`,
-`cache_size=-50000` (~50 MB), `mmap_size=256 MB`, `temp_store=MEMORY`,
-`busy_timeout=5000`.
+Key pragmas (defaults, all tunable via flags): `page_size=4096`,
+`journal_mode=WAL`, `auto_vacuum=INCREMENTAL`, `synchronous=NORMAL`,
+`cache_size=-50000` (~50 MB, `--cache-size-mb`), `mmap_size=256 MB`
+(`--mmap-size`), `temp_store=MEMORY`, `busy_timeout=5000` (`--busy-timeout-ms`).
+A background `wal_checkpoint(PASSIVE)` runs every `--wal-flush-ms` (default 250 ms)
+to bound the async durability window.
 
 ### In-memory caches
 
@@ -222,8 +260,8 @@ Key pragmas: `page_size=16384`, `journal_mode=WAL`, `synchronous=NORMAL`,
 | Entity LRU (10,000 entries) | Avoids deserializing hot entities; stores `EntityMeta{id, type_id, obs_count, out_deg, in_deg}` |
 | Name-hash map | O(1) name-to-ID resolution via 64-bit hash |
 | Prepared-statement cache | Reuses compiled SQLite queries |
-| usearch HNSW index *(vec)* | In-memory ANN index, rebuilt from `vector_embedding` on startup |
-| petgraph adjacency *(vec)* | Directed graph cache for the hybrid-search centrality boost |
+| ANN index *(`--vectors`)* | In-memory HNSW or IVF-Flat index, rebuilt from `vector_embedding` on startup |
+| petgraph adjacency *(`--vectors`)* | Directed graph cache for the hybrid-search centrality boost |
 
 ### Write batching
 
@@ -242,8 +280,8 @@ from O(N) to O(1) per `create_entities` / `create_relations` call:
 | `async` (default) | Flush to kernel page cache, background sync | Up to ~1 s on power failure |
 | `sync` | fsync before every write | Zero |
 
-Set on `mcp-memory` via `MCP_MEMORY_DURABILITY=sync`. (`mcp-memory-vec` runs in
-`async` mode.)
+Set via the `MCP_MEMORY_DURABILITY=sync` environment variable (applies whether or
+not `--vectors` is on).
 
 ### Background maintenance
 
@@ -286,7 +324,7 @@ your own target.
 
 ## Tools
 
-### Knowledge-graph tools (both binaries)
+### Knowledge-graph tools (always available)
 
 **Write:** `create_entities`, `create_relations`, `add_observations`,
 `delete_entities`, `delete_observations`, `delete_relations`, `upsert_entities`,
@@ -297,19 +335,25 @@ your own target.
 `describe_entity`, `degree`, `find_path`, `find_all_paths`, `extract_subgraph`,
 `get_neighbors`, `list_entity_types`, `list_relation_types`, `export_graph`.
 
-### Vector tools (`mcp-memory-vec` only)
+### Vector tools (`--vectors` only)
 
 - `vector_upsert_embedding` — attach/replace an embedding on an existing entity
+- `vector_batch_upsert` — bulk-upsert up to 1,024 embeddings; per-item error reporting
+- `vector_get_embedding` — fetch the stored embedding (and model) for an entity
 - `vector_search_entities` — top-K nearest entities by vector similarity (optional type filter)
-- `vector_delete_embedding` — remove an entity's embedding (entity is kept)
+- `vector_search_by_entity` — "more like this": nearest to an entity's own embedding
+- `vector_recommend` — example-based recommendation from positive/negative entities
+- `vector_mmr_search` — diversified retrieval via Maximal Marginal Relevance (`lambda`)
 - `hybrid_search` — vector + FTS5 fused by RRF, optional graph-centrality boost
+- `vector_delete_embedding` — remove an entity's embedding (entity is kept)
+- `vector_reindex` — retrain the IVF index over current vectors (no-op for HNSW)
 - `vector_refresh_graph_cache` — rebuild the petgraph adjacency cache from relations
-- `vector_store_stats` — embedding count, dimension, index/graph sizes
+- `vector_store_stats` — embedding count, dimension, backend kind, index/graph sizes
 
 ## Architecture
 
 ```
-main.rs / vec_main.rs
+main.rs / vec_main.rs → MCPServer { kg, vs: Option<VectorStore> }
   ├── run_stdio()  — newline-delimited JSON-RPC over stdio
   ├── run_tcp()    — same framing, concurrent connections
   └── run_http()   — MCP Streamable HTTP (axum, POST/GET /mcp)
@@ -329,7 +373,9 @@ All transports share the transport-agnostic dispatch core
 - `GraphHandle` uses `parking_lot::Mutex` for the writer connection and caches; a
   read-only connection pool serves concurrent reads under WAL.
 - The `VectorStore` uses `DashMap` for name↔ID maps and an `RwLock` over the
-  petgraph cache; the usearch index is internally synchronized.
+  petgraph cache; the HNSW index is internally synchronized, the IVF index behind
+  its own `RwLock`. Vector tools are gated behind `--vectors`; a pure-KG server
+  carries no vector state.
 - Heavy dispatch (graph lock + optional fsync) is offloaded to
   `tokio::task::spawn_blocking` to keep the reactor responsive.
 - TCP connections are capped at 128 concurrent.
@@ -345,8 +391,9 @@ All transports share the transport-agnostic dispatch core
 | Max search limit | 1,000 |
 | Max neighbor depth | 16 |
 | Max `find_all_paths` depth / results | 10 / 100 |
-| Max embedding dimensions *(vec)* | 4,096 |
-| Max `topK` *(vec)* | 100 |
+| Max embedding dimensions *(`--vectors`)* | 4,096 |
+| Max `topK` *(`--vectors`)* | 100 |
+| Max items per `vector_batch_upsert` | 1,024 |
 
 ## Development
 
@@ -358,17 +405,27 @@ cargo run --release --bin bench  # standalone benchmark
 ```
 
 The test suite covers protocol handling, all tool handlers, CRUD/search/path
-persistence, concurrency, fuzzy invariant checks, and — for the vector server —
-end-to-end stdio tool flows, input validation, the tunable index config, and HTTP
-bearer-token authentication.
+persistence, concurrency, fuzzy invariant checks, and — for the vector subsystem —
+the IVF-Flat index (training, probe search, upsert/remove, metrics), both ANN
+backends end-to-end, the modern retrieval tools (batch upsert, more-like-this,
+recommend, MMR), vector gating when `--vectors` is off, input validation, the
+tunable index config, and HTTP bearer-token authentication.
 
 ## Versioning & compatibility
 
-Follows [Semantic Versioning](https://semver.org). The current line is **3.x**,
+Follows [Semantic Versioning](https://semver.org). The current line is **4.x**,
 targeting MCP revision `2025-11-25`.
+
+**4.0 breaking changes:** the separate `mcp-memory-vec` *server* is gone — vectors
+are now an opt-in subsystem of `mcp-memory` behind `--vectors`. The
+`mcp-memory-vec` binary remains as a thin alias (`= mcp-memory --vectors`), so
+existing configs and the shared on-disk format are unaffected. New fresh databases
+default to 4 KB SQLite pages (was 16 KB) and `auto_vacuum=INCREMENTAL`; existing
+databases keep their original page size.
 
 | mcp-memory | MCP revision (default) | Negotiates |
 |---|---|---|
+| 4.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
 | 3.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
 | 2.x | `2025-11-25` | `2025-06-18`, `2025-03-26`, `2024-11-05` |
 | ≤ 1.x | `2024-11-05` | — |

@@ -23,8 +23,12 @@ async fn inner_main() -> Result<()> {
 
     let config = Arc::new(config::Config::from_args(&args)?);
     info!("Memory file: {}", config.memory_file_path);
+    info!(
+        "Vector search: {}",
+        if config.vectors_enabled { "enabled" } else { "disabled" }
+    );
 
-    let mcp_server = server::MCPServer::new((*config).clone())?;
+    let mcp_server = server::MCPServer::new((*config).clone(), args.vector_config())?;
     info!("Server initialized successfully");
 
     match args.transport {

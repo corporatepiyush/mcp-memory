@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use mcp_memory::config::Durability;
+use mcp_memory::config::{Durability, SqliteTuning};
 use mcp_memory::kg::{Direction, GraphHandle};
 use mcp_memory::types::{Entity, Relation};
 
@@ -13,7 +13,7 @@ fn main() {
         let _ = std::fs::remove_file(&p);
     }
 
-    let kg = GraphHandle::new(path, Durability::Async, 268435456, NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
+    let kg = GraphHandle::new(path, Durability::Async, SqliteTuning::default(), NonZeroUsize::new(10000).unwrap(), 4).expect("create KG");
 
     // ── Seed ──────────────────────────────────────────────────────────
     const N: usize = 1000;
