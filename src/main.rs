@@ -27,6 +27,10 @@ async fn inner_main() -> Result<()> {
         "Vector search: {}",
         if config.vectors_enabled { "enabled" } else { "disabled" }
     );
+    info!(
+        "Code index: {}",
+        if config.code_enabled { "enabled" } else { "disabled" }
+    );
 
     let mcp_server = server::MCPServer::new((*config).clone(), args.vector_config())?;
     info!("Server initialized successfully");

@@ -9,6 +9,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info};
 
+#[cfg(feature = "code")]
+use crate::actions::code as code_actions;
 use crate::actions::memory;
 use crate::config::Config;
 use crate::errors::{MCSError, Result};
@@ -215,6 +217,9 @@ impl MCPServer {
         } else {
             None
         };
+
+        #[cfg(feature = "code")]
+        CODE_ENABLED.store(config.code_enabled, std::sync::atomic::Ordering::Relaxed);
 
         Ok(Self {
             config: Arc::new(config),
@@ -536,28 +541,37 @@ fn base_tools() -> &'static Vec<Value> {
     })
 }
 
-/// `tools/list` response. The vector tools are appended only when vector support
-/// is enabled, so a pure-KG server never advertises tools it cannot serve.
-fn handle_tools_list(vectors_enabled: bool) -> Value {
-    static KG_ONLY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    static WITH_VECTORS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+/// The vector tools, parsed from `vector_tools.json` at build time.
+fn vector_tools() -> &'static Vec<Value> {
+    static VEC: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+    VEC.get_or_init(|| {
+        serde_json::from_str(include_str!("../vector_tools.json"))
+            .expect("vector_tools.json is valid JSON compiled at build time")
+    })
+}
 
+/// The code-indexing tools, parsed from `code_tools.json` at build time.
+#[cfg(feature = "code")]
+fn code_tools() -> &'static Vec<Value> {
+    static CODE: std::sync::OnceLock<Vec<Value>> = std::sync::OnceLock::new();
+    CODE.get_or_init(|| {
+        serde_json::from_str(include_str!("../code_tools.json"))
+            .expect("code_tools.json is valid JSON compiled at build time")
+    })
+}
+
+/// `tools/list` response. Vector and code tools are appended only when their
+/// subsystems are enabled, so the server never advertises tools it cannot serve.
+fn handle_tools_list(vectors_enabled: bool) -> Value {
+    let mut all = base_tools().clone();
     if vectors_enabled {
-        WITH_VECTORS
-            .get_or_init(|| {
-                let mut all = base_tools().clone();
-                let vec_tools: Vec<Value> =
-                    serde_json::from_str(include_str!("../vector_tools.json"))
-                        .expect("vector_tools.json is valid JSON compiled at build time");
-                all.extend(vec_tools);
-                json!({ "tools": all })
-            })
-            .clone()
-    } else {
-        KG_ONLY
-            .get_or_init(|| json!({ "tools": base_tools().clone() }))
-            .clone()
+        all.extend(vector_tools().iter().cloned());
     }
+    #[cfg(feature = "code")]
+    if code_enabled() {
+        all.extend(code_tools().iter().cloned());
+    }
+    json!({ "tools": all })
 }
 
 /// `true` for the vector-specific tool names (`vector_*` plus `hybrid_search`).
@@ -576,6 +590,30 @@ fn is_vector_tool_name(name: &str) -> bool {
             | "vector_recommend"
             | "vector_mmr_search"
             | "vector_reindex"
+    )
+}
+
+/// Process-wide flag for the code-indexing subsystem, set once at server
+/// startup from `config.code_enabled`. Code tools carry no per-request state
+/// (unlike the vector store), so a global flag avoids threading a bool through
+/// every dispatch signature.
+#[cfg(feature = "code")]
+static CODE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "code")]
+fn code_enabled() -> bool {
+    CODE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "code"))]
+const fn code_enabled() -> bool {
+    false
+}
+
+/// `true` for the tree-sitter code tool names.
+fn is_code_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "code_index" | "code_outline" | "code_search" | "code_get_symbol"
     )
 }
 
@@ -651,6 +689,40 @@ fn handle_tools_call(
             error!("Tool '{tool_name}' error: {e}");
             HandlerResult::Value(tool_error(&e.to_string()))
         }));
+    }
+
+    if is_code_tool_name(tool_name) {
+        if !code_enabled() {
+            return Err(MCSError::MethodNotFound(format!(
+                "{tool_name} (code indexing disabled; start the server with --code)"
+            )));
+        }
+        #[cfg(feature = "code")]
+        {
+            let result = match tool_name {
+                "code_index" => {
+                    code_actions::handle_code_index(kg, tool_args).map(HandlerResult::Value)
+                }
+                "code_outline" => {
+                    code_actions::handle_code_outline(kg, tool_args).map(HandlerResult::Value)
+                }
+                "code_search" => {
+                    code_actions::handle_code_search(kg, tool_args).map(HandlerResult::Value)
+                }
+                "code_get_symbol" => {
+                    code_actions::handle_code_get_symbol(kg, tool_args).map(HandlerResult::Value)
+                }
+                other => Err(MCSError::MethodNotFound(other.to_string())),
+            };
+            return Ok(result.unwrap_or_else(|e| {
+                error!("Tool '{tool_name}' error: {e}");
+                HandlerResult::Value(tool_error(&e.to_string()))
+            }));
+        }
+        #[cfg(not(feature = "code"))]
+        return Err(MCSError::MethodNotFound(format!(
+            "{tool_name} (built without the 'code' feature)"
+        )));
     }
 
     if !tools::tool_exists(tool_name) {

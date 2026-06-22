@@ -125,6 +125,49 @@ mcp-memory --transport http --bind 0.0.0.0:8080 \
   --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
+## Code indexing (`--code`)
+
+With `--code`, the server can parse a source tree with **tree-sitter** and store
+its symbols as ordinary graph entities, turning the memory server into a
+persistent, semantically-searchable **code map** for terminal coding agents
+(Claude Code, opencode, codex, …). Because symbols are plain entities, every
+existing tool — `search_nodes`, `extract_subgraph`, `get_neighbors`, `find_path`,
+and (with `--vectors`) `hybrid_search` — works on code for free.
+
+- **What it stores.** Functions, classes, methods, modules, and constants become
+  entities named `relpath::symbol` with type `code:<kind>`. Metadata (file, line
+  range, signature, first doc line, language) lives in observations. Edges:
+  `defines` (file→symbol) and `calls`/`references` (caller→callee). Bodies are
+  **not** stored — only signatures and line ranges, so an agent reads the exact
+  lines when it needs the code (fewer tokens than grep-then-read-whole-file).
+- **Incremental.** Each file's content hash is stored; `code_index` re-parses
+  only changed files. Re-run after edits to keep the map fresh — a stale symbol
+  map is worse than `grep`.
+- **Unambiguous edges only.** Tree-sitter gives syntax, not resolved semantics,
+  so a `calls` edge is created only when the callee name resolves to exactly one
+  definition. Ambiguous references are dropped rather than recorded as false
+  edges. Call edges are most complete after indexing the whole repo root at once.
+- **Languages.** Rust, Python, JavaScript, TypeScript/TSX, Go, Java. The walk
+  honors `.gitignore` and skips `target`/`node_modules`/`dist`/`build` and
+  oversized files.
+
+Four tools (exposed only with `--code`):
+
+| Tool | Purpose |
+| --- | --- |
+| `code_index` | Parse a file/dir into the graph (incremental; `force` to re-parse all). |
+| `code_outline` | List the symbols defined in one file (kind, lines, signature). |
+| `code_search` | FTS over code symbols → compact location rows (filter by `kind`/`lang`). |
+| `code_get_symbol` | A symbol's metadata plus its callers and callees. |
+
+```bash
+mcp-memory --code --transport stdio
+# then, over MCP:  code_index {"path": "src"}
+```
+
+The `code` Cargo feature is **on by default**; `cargo build --no-default-features`
+produces a lean pure-memory binary with no tree-sitter grammars compiled in.
+
 ## Vector search (`--vectors`)
 
 With `--vectors`, the server layers a vector store on top of the knowledge graph.

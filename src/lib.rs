@@ -1,4 +1,6 @@
 pub mod actions;
+#[cfg(feature = "code")]
+pub mod code;
 pub mod config;
 pub mod errors;
 pub mod http;
@@ -127,8 +129,8 @@ pub struct Args {
     #[arg(long = "auth-token-file")]
     pub auth_token_file: Option<String>,
 
-    /// SQLite mmap size in bytes (default: 256 MiB).
-    #[arg(long = "mmap-size", default_value_t = 268435456)]
+    /// SQLite mmap size in bytes (default: 64 MiB).
+    #[arg(long = "mmap-size", default_value_t = 67108864)]
     pub mmap_size: i64,
 
     /// SQLite page size in bytes; power of two (default: 4096, matches the Linux
@@ -136,8 +138,8 @@ pub struct Args {
     #[arg(long = "page-size", default_value_t = 4096)]
     pub page_size: i64,
 
-    /// SQLite page cache size in MiB (default: 50).
-    #[arg(long = "cache-size-mb", default_value_t = 50)]
+    /// SQLite page cache size in MiB (default: 32).
+    #[arg(long = "cache-size-mb", default_value_t = 32)]
     pub cache_size_mb: i64,
 
     /// SQLite busy timeout in milliseconds (default: 5000).
@@ -145,8 +147,8 @@ pub struct Args {
     pub busy_timeout_ms: u64,
 
     /// Interval in milliseconds for a background `wal_checkpoint(PASSIVE)` that
-    /// bounds the durability window in async mode (default: 250). 0 disables it.
-    #[arg(long = "wal-flush-ms", default_value_t = 250)]
+    /// bounds the durability window in async mode (default: 500). 0 disables it.
+    #[arg(long = "wal-flush-ms", default_value_t = 500)]
     pub wal_flush_ms: u64,
 
     /// Entity-metadata LRU cache capacity (0 falls back to 10000).
@@ -158,7 +160,7 @@ pub struct Args {
     /// writer; a larger pool raises read concurrency at the cost of a little
     /// memory (each connection carries its own page cache). `0` (default)
     /// auto-scales to the CPU count, clamped to [1, 32].
-    #[arg(long = "read-pool-size", default_value_t = 0)]
+    #[arg(long = "read-pool-size", default_value_t = 4)]
     pub read_pool_size: usize,
 
     /// Path to a PEM certificate chain to serve the `http` transport over TLS
@@ -178,6 +180,14 @@ pub struct Args {
     /// only take effect when this is set.
     #[arg(long = "vectors", default_value_t = false)]
     pub vectors: bool,
+
+    /// Enable tree-sitter code-symbol indexing: exposes the `code_index`,
+    /// `code_outline`, `code_search`, and `code_get_symbol` tools, which parse
+    /// source files and store functions/classes/methods (and their
+    /// call/define edges) in the graph. On by default (when built with the `code`
+    /// feature, which is on by default).
+    #[arg(long = "code", default_value_t = true)]
+    pub code: bool,
 
     /// Embedding dimension for vector search (default: 384). Requires --vectors.
     #[arg(long = "embedding-dims", default_value_t = 384)]

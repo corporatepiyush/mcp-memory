@@ -1,0 +1,476 @@
+//! MCP tool handlers for the tree-sitter code knowledge graph.
+//!
+//! These map parsed code symbols (see [`crate::code`]) onto the existing
+//! entity/relation graph so the regular search/traversal tools work on code,
+//! and expose four code-focused tools: `code_index`, `code_outline`,
+//! `code_search`, `code_get_symbol`.
+//!
+//! Symbols are stored as entities named `relpath::symbol` with type
+//! `code:<kind>`; metadata (file, line range, signature, doc) lives in
+//! observations. Edges: `defines` (file→symbol), `calls`/`references`
+//! (caller→callee, resolved only when the callee name is unambiguous).
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+
+use crate::code::{self, Def};
+use crate::errors::{MCSError, Result};
+use crate::kg::GraphHandle;
+use crate::types::{Entity, Relation};
+
+/// Cap on files processed in a single `code_index` call.
+const MAX_INDEX_FILES: usize = 50_000;
+/// Cap on symbols recorded per file (guards pathological/generated files).
+const MAX_SYMBOLS_PER_FILE: usize = 5_000;
+/// Batch size for graph writes (keeps each write transaction bounded).
+const WRITE_BATCH: usize = 1_000;
+/// Default / max result rows for `code_search`.
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+const MAX_SEARCH_LIMIT: usize = 200;
+/// Cap on callers/callees returned by `code_get_symbol`.
+const MAX_EDGES_RETURNED: usize = 200;
+
+macro_rules! text_content {
+    ($text:expr) => {
+        json!({ "content": [{ "type": "text", "text": $text }] })
+    };
+}
+
+fn to_json(v: &impl serde::Serialize) -> Result<Value> {
+    let text = serde_json::to_string(v).map_err(MCSError::JsonError)?;
+    Ok(text_content!(text))
+}
+
+/// Repo-relative, forward-slash path used as the `code:file` entity name.
+fn rel_path(p: &Path, base: &Path) -> String {
+    let r = if p.is_absolute() {
+        p.strip_prefix(base).unwrap_or(p)
+    } else {
+        p
+    };
+    r.to_string_lossy().replace('\\', "/")
+}
+
+/// Read a single-valued `key: value` observation off an entity.
+fn obs_val<'a>(entity: &'a Entity, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}: ");
+    entity
+        .observations
+        .iter()
+        .find_map(|o| o.strip_prefix(&prefix))
+}
+
+/// Strip the `code:` prefix from an entity type for display.
+fn kind_of(entity: &Entity) -> &str {
+    entity.entity_type.strip_prefix("code:").unwrap_or(&entity.entity_type)
+}
+
+fn is_code_entity(entity: &Entity) -> bool {
+    entity.entity_type.starts_with("code:")
+}
+
+/// Compact, location-focused view of a code symbol entity.
+fn symbol_row(entity: &Entity) -> Value {
+    json!({
+        "name": entity.name,
+        "kind": kind_of(entity),
+        "file": obs_val(entity, "file"),
+        "lines": obs_val(entity, "lines"),
+        "lang": obs_val(entity, "lang"),
+        "signature": obs_val(entity, "signature"),
+        "doc": obs_val(entity, "doc"),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// code_index
+// ---------------------------------------------------------------------------
+
+/// Parsed symbols for one file, with qualified names already assigned.
+struct FileWork {
+    rel: String,
+    lang: &'static str,
+    hash: String,
+    /// Whether a `code:file` entity already existed (drives purge-skip).
+    existed: bool,
+    named: Vec<(Def, String)>,
+    refs: Vec<code::Ref>,
+}
+
+/// Outcome of processing a single path during the parallel parse phase.
+enum Outcome {
+    Indexed(Box<FileWork>),
+    Skipped,
+    Failed,
+    Unsupported,
+}
+
+/// Read + hash + (incrementally) parse one file. CPU-bound and independent per
+/// file, so this runs on the parse thread pool. Reads use the graph's
+/// concurrent read pool; no writes happen here.
+fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool) -> Outcome {
+    let Some(lang) = code::detect(path) else {
+        return Outcome::Unsupported;
+    };
+    let rel = rel_path(path, base);
+    let Ok(bytes) = std::fs::read(path) else {
+        return Outcome::Failed;
+    };
+    let hash = code::hash_bytes(&bytes);
+
+    let existing = kg.get_entity(&rel).ok().flatten();
+    let existed = existing.is_some();
+    // Incremental: skip unchanged files (matching stored hash).
+    if !force
+        && let Some(e) = &existing
+        && obs_val(e, "hash") == Some(hash.as_str())
+    {
+        return Outcome::Skipped;
+    }
+
+    let parsed = code::parse_source(lang, &bytes);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut named: Vec<(Def, String)> = Vec::with_capacity(parsed.defs.len());
+    for d in parsed.defs.into_iter().take(MAX_SYMBOLS_PER_FILE) {
+        let mut q = format!("{rel}::{}", d.name);
+        if !seen.insert(q.clone()) {
+            q = format!("{q}::L{}", d.line_start);
+            seen.insert(q.clone());
+        }
+        named.push((d, q));
+    }
+
+    Outcome::Indexed(Box::new(FileWork {
+        rel,
+        lang: lang.name(),
+        hash,
+        existed,
+        named,
+        refs: parsed.refs,
+    }))
+}
+
+pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'path' parameter".into()))?;
+    let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let root = Path::new(path);
+    if !root.exists() {
+        return Err(MCSError::InvalidParams(format!("Path not found: {path}")));
+    }
+    let base = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+
+    let mut files = code::walk(root, code::MAX_FILE_BYTES);
+    files.truncate(MAX_INDEX_FILES);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Parse phase (parallel): read + hash + parse each file across the CPU
+    // cores. Files are independent and parsing is the dominant cost; reads use
+    // the concurrent read pool. The single-writer graph mutations stay serial
+    // in the merge phase below.
+    let n = files.len();
+    let n_threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(4)
+        .min(n.max(1));
+    let next = AtomicUsize::new(0);
+    let buckets: Vec<Vec<Outcome>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        local.push(parse_one(kg, &files[i], &base, force));
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // Merge phase (serial): tally outcomes and build the global symbol index
+    // (bare name -> qualified names) used to resolve unambiguous call edges.
+    let mut work: Vec<FileWork> = Vec::new();
+    let mut def_index: HashMap<String, Vec<String>> = HashMap::new();
+    let mut files_indexed = 0usize;
+    let mut files_skipped = 0usize;
+    let mut files_failed = 0usize;
+    for outcome in buckets.into_iter().flatten() {
+        match outcome {
+            Outcome::Indexed(fw) => {
+                for (d, q) in &fw.named {
+                    def_index.entry(d.name.clone()).or_default().push(q.clone());
+                }
+                work.push(*fw);
+                files_indexed += 1;
+            }
+            Outcome::Skipped => files_skipped += 1,
+            Outcome::Failed => files_failed += 1,
+            Outcome::Unsupported => {}
+        }
+    }
+
+    // Write phase (serial, single writer). Streamed in `WRITE_BATCH` chunks so
+    // the transient entity/relation buffers stay bounded regardless of repo
+    // size; the parsed `work` is the only large allocation. Entities are written
+    // in full *before* any relation, since relations resolve their endpoints by
+    // name and would silently drop against a not-yet-written entity.
+
+    // Pass 1: purge changed files and write all entities.
+    let mut ebuf: Vec<Entity> = Vec::with_capacity(WRITE_BATCH);
+    let mut symbols = 0usize;
+    for fw in &work {
+        if fw.existed {
+            kg.code_purge_file(&fw.rel)?;
+        }
+        ebuf.push(Entity {
+            name: fw.rel.clone(),
+            entity_type: "code:file".into(),
+            observations: vec![
+                format!("lang: {}", fw.lang),
+                format!("hash: {}", fw.hash),
+                format!("symbols: {}", fw.named.len()),
+                format!("indexed_at: {now}"),
+            ],
+        });
+        for (d, q) in &fw.named {
+            let mut obs = vec![
+                format!("kind: {}", d.kind),
+                format!("lang: {}", fw.lang),
+                format!("file: {}", fw.rel),
+                format!("lines: {}-{}", d.line_start, d.line_end),
+                format!("signature: {}", d.signature),
+            ];
+            if let Some(doc) = &d.doc {
+                obs.push(format!("doc: {doc}"));
+            }
+            ebuf.push(Entity {
+                name: q.clone(),
+                entity_type: format!("code:{}", d.kind),
+                observations: obs,
+            });
+            symbols += 1;
+        }
+        if ebuf.len() >= WRITE_BATCH {
+            kg.upsert_entities(&ebuf)?;
+            ebuf.clear();
+        }
+    }
+    if !ebuf.is_empty() {
+        kg.upsert_entities(&ebuf)?;
+    }
+
+    // Pass 2: write `defines` edges and unambiguously-resolved call edges.
+    let mut rbuf: Vec<Relation> = Vec::with_capacity(WRITE_BATCH);
+    let mut rel_seen: HashSet<(String, String, &'static str)> = HashSet::new();
+    let mut relation_count = 0usize;
+    for fw in &work {
+        for (_, q) in &fw.named {
+            rbuf.push(Relation {
+                from: fw.rel.clone(),
+                to: q.clone(),
+                relation_type: "defines".into(),
+            });
+            relation_count += 1;
+        }
+        for r in &fw.refs {
+            let Some(targets) = def_index.get(&r.name) else { continue };
+            if targets.len() != 1 {
+                continue; // ambiguous or unresolved — drop (no false edges)
+            }
+            let callee = &targets[0];
+            let caller = enclosing(&fw.named, r.line).unwrap_or(&fw.rel).to_string();
+            if &caller == callee {
+                continue;
+            }
+            let rtype: &'static str = if r.kind == "call" { "calls" } else { "references" };
+            if !rel_seen.insert((caller.clone(), callee.clone(), rtype)) {
+                continue;
+            }
+            rbuf.push(Relation {
+                from: caller,
+                to: callee.clone(),
+                relation_type: rtype.into(),
+            });
+            relation_count += 1;
+        }
+        if rbuf.len() >= WRITE_BATCH {
+            kg.create_relations(&rbuf)?;
+            rbuf.clear();
+        }
+    }
+    if !rbuf.is_empty() {
+        kg.create_relations(&rbuf)?;
+    }
+
+    to_json(&json!({
+        "files_indexed": files_indexed,
+        "files_skipped": files_skipped,
+        "files_failed": files_failed,
+        "symbols": symbols,
+        "relations": relation_count,
+    }))
+}
+
+/// Smallest-span definition whose line range encloses `line`, if any.
+fn enclosing(named: &[(Def, String)], line: usize) -> Option<&str> {
+    named
+        .iter()
+        .filter(|(d, _)| d.line_start <= line && line <= d.line_end)
+        .min_by_key(|(d, _)| d.line_end - d.line_start)
+        .map(|(_, q)| q.as_str())
+}
+
+// ---------------------------------------------------------------------------
+// code_outline
+// ---------------------------------------------------------------------------
+
+pub fn handle_code_outline(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let file = params
+        .get("file")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'file' parameter".into()))?;
+    let file = file.replace('\\', "/");
+
+    let defines = kg.search_relations(Some(&file), None, Some("defines"));
+    let names: Vec<String> = defines.into_iter().map(|r| r.to).collect();
+    if names.is_empty() {
+        return to_json(&json!({
+            "file": file,
+            "symbols": [],
+            "note": "no symbols indexed for this file; run code_index first",
+        }));
+    }
+    let mut rows: Vec<Value> = kg
+        .batch_get_entities(&names)
+        .into_iter()
+        .flatten()
+        .map(|e| symbol_row(&e))
+        .collect();
+    // Order by starting line for a readable outline.
+    rows.sort_by_key(|r| {
+        r.get("lines")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('-').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+
+    to_json(&json!({ "file": file, "symbols": rows }))
+}
+
+// ---------------------------------------------------------------------------
+// code_search
+// ---------------------------------------------------------------------------
+
+pub fn handle_code_search(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let query = params
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'query' parameter".into()))?;
+    let kind = params.get("kind").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let lang = params.get("lang").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT);
+
+    // Over-fetch then narrow to code entities (search has a single-type filter).
+    let raw = kg.search_nodes_filtered(query, None, 0, limit.saturating_mul(5).min(1000));
+    let rows: Vec<Value> = raw
+        .into_iter()
+        .filter(is_code_entity)
+        .filter(|e| e.entity_type != "code:file")
+        .filter(|e| kind.is_none_or(|k| kind_of(e) == k))
+        .filter(|e| lang.is_none_or(|l| obs_val(e, "lang") == Some(l)))
+        .take(limit)
+        .map(|e| symbol_row(&e))
+        .collect();
+
+    to_json(&json!({ "results": rows }))
+}
+
+// ---------------------------------------------------------------------------
+// code_get_symbol
+// ---------------------------------------------------------------------------
+
+pub fn handle_code_get_symbol(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
+
+    // Resolve: exact qualified name first, else fuzzy by bare name.
+    let mut matches: Vec<Entity> = Vec::new();
+    if let Ok(Some(e)) = kg.get_entity(name)
+        && is_code_entity(&e)
+    {
+        matches.push(e);
+    }
+    if matches.is_empty() {
+        let suffix = format!("::{name}");
+        matches = kg
+            .search_nodes_filtered(name, None, 0, 200)
+            .into_iter()
+            .filter(is_code_entity)
+            .filter(|e| e.name == name || e.name.ends_with(&suffix))
+            .take(10)
+            .collect();
+    }
+    if matches.is_empty() {
+        return Err(MCSError::InvalidParams(format!(
+            "No code symbol matching '{name}' (run code_index first?)"
+        )));
+    }
+
+    let edge_types = ["calls", "references"];
+    let results: Vec<Value> = matches
+        .iter()
+        .map(|e| {
+            let mut callers: Vec<String> = Vec::new();
+            let mut callees: Vec<String> = Vec::new();
+            for t in edge_types {
+                for r in kg.search_relations(None, Some(&e.name), Some(t)) {
+                    callers.push(r.from);
+                }
+                for r in kg.search_relations(Some(&e.name), None, Some(t)) {
+                    callees.push(r.to);
+                }
+            }
+            callers.truncate(MAX_EDGES_RETURNED);
+            callees.truncate(MAX_EDGES_RETURNED);
+            let mut row = symbol_row(e);
+            row["callers"] = json!(callers);
+            row["callees"] = json!(callees);
+            row
+        })
+        .collect();
+
+    if results.len() == 1 {
+        to_json(&results.into_iter().next().unwrap())
+    } else {
+        to_json(&json!({ "matches": results }))
+    }
+}

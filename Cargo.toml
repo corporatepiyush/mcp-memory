@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "4.0.2"
+version = "4.2.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations in SQLite with FTS5 search, plus optional vector/semantic + hybrid search (usearch HNSW or IVF-Flat) with batch upsert, more-like-this, recommendations, and MMR diversification"
@@ -36,6 +36,37 @@ dashmap = "6"
 petgraph = "0.7"
 usearch = "2"
 zerocopy = { version = "0.8", features = ["derive"] }
+
+# --- Code-symbol indexing (feature = "code") ---------------------------------
+# Tree-sitter parsing + the `tags` extractor drive the code knowledge graph.
+# All optional and gated behind the default-on `code` feature so
+# `--no-default-features` yields a lean pure-memory build with no C grammars.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-tags = { version = "0.26", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+ignore = { version = "0.4", optional = true }
+blake3 = { version = "1", optional = true }
+
+[features]
+default = ["code"]
+# Tree-sitter code-symbol indexing: the `code_*` MCP tools + indexer.
+code = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-tags",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:ignore",
+    "dep:blake3",
+]
 
 [dev-dependencies]
 tempfile = "3"

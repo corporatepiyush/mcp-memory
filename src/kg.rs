@@ -881,6 +881,20 @@ impl GraphHandle {
         Ok(())
     }
 
+    /// Remove a `code:file` entity and every symbol it `defines`, so the file
+    /// can be re-indexed cleanly. Relations touching the removed entities are
+    /// cascaded by [`Self::delete_entities`]. Returns the number of entities
+    /// removed (file + symbols).
+    #[cfg(feature = "code")]
+    pub fn code_purge_file(&self, rel_path: &str) -> Result<usize> {
+        let defines = self.search_relations(Some(rel_path), None, Some("defines"));
+        let mut names: Vec<String> = defines.into_iter().map(|r| r.to).collect();
+        names.push(rel_path.to_string());
+        let n = names.len();
+        self.delete_entities(&names)?;
+        Ok(n)
+    }
+
     pub fn create_relations(&self, relations: &[Relation]) -> Result<Vec<Relation>> {
         let conn = self.writer.lock();
         let tx = TxGuard::begin(&conn)?;

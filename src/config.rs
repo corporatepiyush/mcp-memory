@@ -98,6 +98,9 @@ pub struct Config {
     /// Enable the vector / semantic-search subsystem (`vector_*` + `hybrid_search`
     /// tools backed by a usearch HNSW index). Off by default.
     pub vectors_enabled: bool,
+    /// Enable the tree-sitter code-symbol subsystem (`code_*` tools). Off by
+    /// default. Only effective when built with the `code` feature.
+    pub code_enabled: bool,
 }
 
 /// Resolve the read-only connection-pool size. `0` means "auto": scale to the
@@ -204,6 +207,7 @@ impl Config {
             tls_cert,
             tls_key,
             vectors_enabled: args.vectors,
+            code_enabled: args.code,
         })
     }
 }
@@ -226,6 +230,7 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             vectors_enabled: false,
+            code_enabled: false,
         }
     }
 }

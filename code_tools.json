@@ -1,0 +1,102 @@
+[
+  {
+    "name": "code_index",
+    "description": "Parse source files with tree-sitter and store their symbols (functions, classes, methods, modules, constants) as entities in the knowledge graph, plus 'defines' (file→symbol) and 'calls'/'references' (caller→callee) edges. Indexing is incremental: files whose content hash is unchanged since the last run are skipped. Run this once per repository and again after edits to keep the code map fresh (a stale map is worse than grep). Symbols are named 'relpath::symbol' with type 'code:<kind>'; bodies are NOT stored — only signature + line range, so you read the exact lines when you need the code. Supports Rust, Python, JavaScript, TypeScript/TSX, Go, Java. Honors .gitignore and skips target/node_modules/dist/build and oversized files. Call edges are most complete after indexing the whole repository root in one call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File or directory to index (relative to the server's working directory, or absolute). Use the repository root to build a complete call graph."
+        },
+        "force": {
+          "type": "boolean",
+          "description": "Re-parse every file even if its hash is unchanged (default false)."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "code_outline",
+    "description": "List the symbols defined in a single file (the file's outline / map), each with kind, line range, and signature, ordered by line. Cheap way to understand a file's structure without reading it. The file must have been indexed with code_index first; pass the same repo-relative path used during indexing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Repo-relative path of an indexed file, e.g. 'src/kg.rs'."
+        }
+      },
+      "required": [
+        "file"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "code_search",
+    "description": "Full-text search over indexed code symbols by name (and signature/doc text), returning compact location rows (name, kind, file, line range, signature) instead of file contents — read the returned line range when you need the body. Optionally filter by symbol kind (function/method/class/module/constant) or language.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search terms matched against symbol names, signatures, and docs (FTS5 syntax)."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Optional filter: function | method | class | module | constant."
+        },
+        "lang": {
+          "type": "string",
+          "description": "Optional language filter: rust | python | javascript | typescript | tsx | go | java."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max results (default 20, max 200)."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "code_get_symbol",
+    "description": "Get full metadata for a code symbol — kind, file, line range, signature, doc — plus its callers (who calls/references it) and callees (what it calls). Accepts a fully-qualified name ('src/kg.rs::create_entities') or a bare symbol name (matches by suffix). Note: call edges are name-resolved and only created when a name is unambiguous, so they are a high-signal hint, not an exhaustive resolved call graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Qualified ('relpath::symbol') or bare symbol name."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  }
+]
