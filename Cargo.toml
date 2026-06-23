@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "4.2.0"
+version = "4.3.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations in SQLite with FTS5 search, plus optional vector/semantic + hybrid search (usearch HNSW or IVF-Flat) with batch upsert, more-like-this, recommendations, and MMR diversification"
@@ -49,6 +49,11 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+
 ignore = { version = "0.4", optional = true }
 blake3 = { version = "1", optional = true }
 
@@ -64,6 +69,10 @@ code = [
     "dep:tree-sitter-typescript",
     "dep:tree-sitter-go",
     "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-php",
     "dep:ignore",
     "dep:blake3",
 ]

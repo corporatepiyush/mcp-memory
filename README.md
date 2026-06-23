@@ -147,9 +147,10 @@ and (with `--vectors`) `hybrid_search` — works on code for free.
   so a `calls` edge is created only when the callee name resolves to exactly one
   definition. Ambiguous references are dropped rather than recorded as false
   edges. Call edges are most complete after indexing the whole repo root at once.
-- **Languages.** Rust, Python, JavaScript, TypeScript/TSX, Go, Java. The walk
-  honors `.gitignore` and skips `target`/`node_modules`/`dist`/`build` and
-  oversized files.
+- **Languages.** Rust, Python, JavaScript, TypeScript/TSX, Go, Java,
+  **C**, **C++**, **Ruby**, **PHP**. Header files (`.h`, `.hpp`, `.hh`, `.hxx`)
+  are indexed alongside source files. The walk honors `.gitignore` and skips
+  `target`/`node_modules`/`dist`/`build` and oversized files.
 
 Four tools (exposed only with `--code`):
 

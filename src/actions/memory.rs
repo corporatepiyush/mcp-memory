@@ -350,7 +350,7 @@ pub fn handle_search_relations(kg: &GraphHandle, args: Option<&Value>) -> Result
     let to = params.get("to").and_then(|v| v.as_str());
     let rtype = params.get("relationType").and_then(|v| v.as_str());
 
-    let mut results = kg.search_relations(from, to, rtype);
+    let mut results = kg.search_relations(from, to, rtype, Some(MAX_RELATION_SEARCH_RESULTS));
     results.truncate(MAX_RELATION_SEARCH_RESULTS);
     let text = serde_json::to_string(&results).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))

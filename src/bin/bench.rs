@@ -201,11 +201,11 @@ fn main() {
     });
 
     measure!("search_relations (from)", 20, {
-        kg.search_relations(Some("entity_0"), None, None)
+        kg.search_relations(Some("entity_0"), None, None, None)
     });
 
     measure!("search_relations (from+type)", 20, {
-        kg.search_relations(Some("entity_0"), None, Some("edge"))
+        kg.search_relations(Some("entity_0"), None, Some("edge"), None)
     });
 
     // Cleanup

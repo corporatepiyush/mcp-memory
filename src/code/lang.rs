@@ -21,6 +21,10 @@ pub enum Lang {
     Tsx,
     Go,
     Java,
+    C,
+    Cpp,
+    Ruby,
+    Php,
 }
 
 impl Lang {
@@ -34,6 +38,10 @@ impl Lang {
             Lang::Tsx => "tsx",
             Lang::Go => "go",
             Lang::Java => "java",
+            Lang::C => "c",
+            Lang::Cpp => "cpp",
+            Lang::Ruby => "ruby",
+            Lang::Php => "php",
         }
     }
 
@@ -46,6 +54,10 @@ impl Lang {
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Lang::Go => tree_sitter_go::LANGUAGE.into(),
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
+            Lang::C => tree_sitter_c::LANGUAGE.into(),
+            Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         }
     }
 
@@ -57,10 +69,14 @@ impl Lang {
             Lang::TypeScript | Lang::Tsx => tree_sitter_typescript::TAGS_QUERY,
             Lang::Go => tree_sitter_go::TAGS_QUERY,
             Lang::Java => tree_sitter_java::TAGS_QUERY,
+            Lang::C => tree_sitter_c::TAGS_QUERY,
+            Lang::Cpp => tree_sitter_cpp::TAGS_QUERY,
+            Lang::Ruby => tree_sitter_ruby::TAGS_QUERY,
+            Lang::Php => tree_sitter_php::TAGS_QUERY,
         }
     }
 
-    const fn all() -> [Lang; 7] {
+    pub(crate) const fn all() -> [Lang; 11] {
         [
             Lang::Rust,
             Lang::Python,
@@ -69,6 +85,10 @@ impl Lang {
             Lang::Tsx,
             Lang::Go,
             Lang::Java,
+            Lang::C,
+            Lang::Cpp,
+            Lang::Ruby,
+            Lang::Php,
         ]
     }
 }
@@ -84,6 +104,10 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "tsx" => Lang::Tsx,
         "go" => Lang::Go,
         "java" => Lang::Java,
+        "c" | "h" => Lang::C,
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Lang::Cpp,
+        "rb" => Lang::Ruby,
+        "php" | "phtml" | "php3" | "php4" | "php5" => Lang::Php,
         _ => return None,
     })
 }

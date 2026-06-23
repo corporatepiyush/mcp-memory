@@ -13,6 +13,11 @@ use crate::config::{Durability, SqliteTuning};
 use crate::errors::{MCSError, Result};
 use crate::types::{Entity, Relation};
 
+/// Cap on entities/relations collected in a single traversal (DoS guard).
+/// Prevents a dense graph at high depth from allocating unbounded memory.
+const MAX_TRAVERSAL_ENTITIES: usize = 500_000;
+const MAX_TRAVERSAL_RELS: usize = 2_000_000;
+
 fn sqlite_err(e: rusqlite::Error) -> MCSError {
     MCSError::IoError(std::io::Error::other(e))
 }
@@ -887,7 +892,7 @@ impl GraphHandle {
     /// removed (file + symbols).
     #[cfg(feature = "code")]
     pub fn code_purge_file(&self, rel_path: &str) -> Result<usize> {
-        let defines = self.search_relations(Some(rel_path), None, Some("defines"));
+        let defines = self.search_relations(Some(rel_path), None, Some("defines"), Some(crate::code::MAX_SYMBOLS_PER_FILE));
         let mut names: Vec<String> = defines.into_iter().map(|r| r.to).collect();
         names.push(rel_path.to_string());
         let n = names.len();
@@ -1745,6 +1750,7 @@ impl GraphHandle {
         from: Option<&str>,
         to: Option<&str>,
         rtype: Option<&str>,
+        limit: Option<usize>,
     ) -> Vec<Relation> {
         let conn = self.readers.get();
         let mut results = Vec::new();
@@ -1900,6 +1906,9 @@ impl GraphHandle {
                         for row in rows.flatten() { results.push(row); }
                     }
             }
+        }
+        if let Some(lim) = limit {
+            results.truncate(lim);
         }
         results
     }
@@ -2096,6 +2105,11 @@ impl GraphHandle {
                         }
                     }
                 }
+            }
+            if all_entity_ids.len() > MAX_TRAVERSAL_ENTITIES
+                || all_rel_pairs.len() > MAX_TRAVERSAL_RELS
+            {
+                break;
             }
             frontier = next_frontier;
             current_depth += 1;
@@ -2510,6 +2524,13 @@ impl GraphHandle {
                             }
                         }
                 }
+            }
+
+            // DoS guard: stop traversal if we've collected too many entities
+            // or relations. The response will be partial, which is preferable
+            // to an OOM crash on densely connected graphs.
+            if all_ids.len() > MAX_TRAVERSAL_ENTITIES || all_rels.len() > MAX_TRAVERSAL_RELS {
+                break;
             }
 
             frontier = next_frontier;
@@ -3560,7 +3581,7 @@ mod tests {
         seed_line(&kg, 3); // edges of type "edge"
         // A filter for a relation type that does not exist must return nothing,
         // not every relation — and must not create a phantom type row.
-        let r = kg.search_relations(None, None, Some("does_not_exist"));
+        let r = kg.search_relations(None, None, Some("does_not_exist"), None);
         assert!(r.is_empty());
         // The phantom type must not have been inserted by the read.
         let types = kg.relation_type_counts();
@@ -3571,7 +3592,7 @@ mod tests {
     fn test_search_relations_missing_from_returns_empty() {
         let kg = new_kg_with_pool(2);
         seed_line(&kg, 3);
-        let r = kg.search_relations(Some("ghost"), None, None);
+        let r = kg.search_relations(Some("ghost"), None, None, None);
         assert!(r.is_empty(), "missing 'from' must not match every relation");
     }
 
@@ -3579,7 +3600,7 @@ mod tests {
     fn test_search_relations_existing_filters_still_work() {
         let kg = new_kg_with_pool(2);
         seed_line(&kg, 3);
-        let r = kg.search_relations(Some("n0"), None, Some("edge"));
+        let r = kg.search_relations(Some("n0"), None, Some("edge"), None);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].from, "n0");
         assert_eq!(r[0].to, "n1");

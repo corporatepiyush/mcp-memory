@@ -17,22 +17,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::code::{self, Def};
+use crate::code::{self, Def, MAX_SYMBOLS_PER_FILE};
 use crate::errors::{MCSError, Result};
 use crate::kg::GraphHandle;
 use crate::types::{Entity, Relation};
 
 /// Cap on files processed in a single `code_index` call.
-const MAX_INDEX_FILES: usize = 50_000;
-/// Cap on symbols recorded per file (guards pathological/generated files).
-const MAX_SYMBOLS_PER_FILE: usize = 5_000;
+const MAX_INDEX_FILES: usize = 100_000;
+/// Total symbols across all files (prevents OOM on huge repos).
+const MAX_TOTAL_SYMBOLS: usize = 5_000_000;
 /// Batch size for graph writes (keeps each write transaction bounded).
 const WRITE_BATCH: usize = 1_000;
 /// Default / max result rows for `code_search`.
 const DEFAULT_SEARCH_LIMIT: usize = 20;
-const MAX_SEARCH_LIMIT: usize = 200;
+const MAX_SEARCH_LIMIT: usize = 500;
 /// Cap on callers/callees returned by `code_get_symbol`.
-const MAX_EDGES_RETURNED: usize = 200;
+const MAX_EDGES_RETURNED: usize = 500;
 
 macro_rules! text_content {
     ($text:expr) => {
@@ -112,7 +112,8 @@ enum Outcome {
 /// Read + hash + (incrementally) parse one file. CPU-bound and independent per
 /// file, so this runs on the parse thread pool. Reads use the graph's
 /// concurrent read pool; no writes happen here.
-fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool) -> Outcome {
+fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool,
+             total_symbols: &AtomicUsize) -> Outcome {
     let Some(lang) = code::detect(path) else {
         return Outcome::Unsupported;
     };
@@ -142,6 +143,15 @@ fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool) -> Outcome
             seen.insert(q.clone());
         }
         named.push((d, q));
+    }
+
+    // Accumulate towards the total symbol cap.
+    let prev = total_symbols.fetch_add(named.len(), Ordering::Relaxed);
+    if prev + named.len() > MAX_TOTAL_SYMBOLS {
+        // Undo — we overshot. Non-atomic for correctness: the caller's cap check
+        // stops new files from being accepted; any surplus is simply ignored in
+        // the merge phase below.
+        return Outcome::Skipped;
     }
 
     Outcome::Indexed(Box::new(FileWork {
@@ -186,6 +196,7 @@ pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
         .unwrap_or(4)
         .min(n.max(1));
     let next = AtomicUsize::new(0);
+    let total_symbols = AtomicUsize::new(0);
     let buckets: Vec<Vec<Outcome>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..n_threads)
             .map(|_| {
@@ -196,7 +207,11 @@ pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
                         if i >= n {
                             break;
                         }
-                        local.push(parse_one(kg, &files[i], &base, force));
+                        // Pre-check total symbol cap to avoid unnecessary work.
+                        if total_symbols.load(Ordering::Relaxed) >= MAX_TOTAL_SYMBOLS {
+                            continue;
+                        }
+                        local.push(parse_one(kg, &files[i], &base, force, &total_symbols));
                     }
                     local
                 })
@@ -350,7 +365,7 @@ pub fn handle_code_outline(kg: &GraphHandle, args: Option<&Value>) -> Result<Val
         .ok_or_else(|| MCSError::InvalidParams("Missing 'file' parameter".into()))?;
     let file = file.replace('\\', "/");
 
-    let defines = kg.search_relations(Some(&file), None, Some("defines"));
+    let defines = kg.search_relations(Some(&file), None, Some("defines"), Some(MAX_SYMBOLS_PER_FILE));
     let names: Vec<String> = defines.into_iter().map(|r| r.to).collect();
     if names.is_empty() {
         return to_json(&json!({
@@ -452,10 +467,10 @@ pub fn handle_code_get_symbol(kg: &GraphHandle, args: Option<&Value>) -> Result<
             let mut callers: Vec<String> = Vec::new();
             let mut callees: Vec<String> = Vec::new();
             for t in edge_types {
-                for r in kg.search_relations(None, Some(&e.name), Some(t)) {
+                for r in kg.search_relations(None, Some(&e.name), Some(t), Some(MAX_EDGES_RETURNED)) {
                     callers.push(r.from);
                 }
-                for r in kg.search_relations(Some(&e.name), None, Some(t)) {
+                for r in kg.search_relations(Some(&e.name), None, Some(t), Some(MAX_EDGES_RETURNED)) {
                     callees.push(r.to);
                 }
             }
