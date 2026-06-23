@@ -258,6 +258,8 @@ impl Drop for Client {
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", self.db_path, ext));
         }
+        // Per-project code databases live in `<db_path>.code/`.
+        let _ = std::fs::remove_dir_all(format!("{}.code", self.db_path));
         let _ = std::fs::remove_dir_all(&self.src_dir);
     }
 }
@@ -342,12 +344,12 @@ fn code_index_then_search_get_outline() {
     let dir = c.src_dir.to_string_lossy().to_string();
 
     // Index the fixture tree.
-    let idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
     assert_eq!(idx["files_indexed"], 6, "indexed all 6 files: {idx}");
     assert!(idx["symbols"].as_u64().unwrap() >= 5, "expected >=5 symbols: {idx}");
 
     // Search finds a symbol with location + signature.
-    let res = c.call_json("code_search", serde_json::json!({ "query": "alpha" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "alpha", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     let alpha = rows
         .iter()
@@ -357,7 +359,7 @@ fn code_index_then_search_get_outline() {
     assert!(alpha["signature"].as_str().unwrap().contains("fn alpha"));
 
     // get_symbol: beta is called by alpha (caller edge resolved).
-    let beta = c.call_json("code_get_symbol", serde_json::json!({ "name": "beta" }));
+    let beta = c.call_json("code_get_symbol", serde_json::json!({ "name": "beta", "project": "test" }));
     let callers = beta["callers"].as_array().unwrap();
     assert!(
         callers.iter().any(|c| c.as_str().unwrap().ends_with("::alpha")),
@@ -367,7 +369,7 @@ fn code_index_then_search_get_outline() {
     // Outline the rust fixture lists its defs with real line ranges.
     let outline = c.call_json(
         "code_outline",
-        serde_json::json!({ "file": file_name(&c, "lib.rs") }),
+        serde_json::json!({ "file": file_name(&c, "lib.rs"), "project": "test" }),
     );
     let names: Vec<&str> = outline["symbols"]
         .as_array()
@@ -396,16 +398,16 @@ fn code_index_is_incremental() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();
 
-    let first = c.call_json("code_index", serde_json::json!({ "path": dir.clone() }));
+    let first = c.call_json("code_index", serde_json::json!({ "path": dir.clone(), "project": "test" }));
     assert_eq!(first["files_indexed"], 6);
 
     // Nothing changed → everything skipped on the second run.
-    let second = c.call_json("code_index", serde_json::json!({ "path": dir.clone() }));
+    let second = c.call_json("code_index", serde_json::json!({ "path": dir.clone(), "project": "test" }));
     assert_eq!(second["files_indexed"], 0, "no re-index expected: {second}");
     assert_eq!(second["files_skipped"], 6, "all 6 skipped: {second}");
 
     // force re-parses regardless of hash.
-    let forced = c.call_json("code_index", serde_json::json!({ "path": dir, "force": true }));
+    let forced = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test", "force": true }));
     assert_eq!(forced["files_indexed"], 6, "force reindexes: {forced}");
 }
 
@@ -465,10 +467,10 @@ fn code_index_c_language_e2e() {
     let dir = c.src_dir.to_string_lossy().to_string();
 
     // Index and search for a C symbol.
-    let idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
     assert!(idx["files_indexed"].as_u64().unwrap() >= 1);
 
-    let res = c.call_json("code_search", serde_json::json!({ "query": "add", "lang": "c" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "add", "lang": "c", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     let add = rows.iter().find(|r| r["name"].as_str().unwrap().ends_with("::add"));
     assert!(add.is_some(), "C add function should be found: {res}");
@@ -477,7 +479,7 @@ fn code_index_c_language_e2e() {
     // Outline the C file.
     let outline = c.call_json(
         "code_outline",
-        serde_json::json!({ "file": file_name(&c, "math.c") }),
+        serde_json::json!({ "file": file_name(&c, "math.c"), "project": "test" }),
     );
     let names: Vec<&str> = outline["symbols"]
         .as_array()
@@ -497,11 +499,11 @@ fn code_index_cpp_language_e2e() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();
 
-    let idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
     assert!(idx["files_indexed"].as_u64().unwrap() >= 1);
 
     // Search for C++ class and methods.
-    let res = c.call_json("code_search", serde_json::json!({ "query": "Calculator", "lang": "cpp" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "Calculator", "lang": "cpp", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     let calc = rows.iter().find(|r| r["name"].as_str().unwrap().ends_with("::Calculator"));
     assert!(calc.is_some(), "Calculator class should be found: {res}");
@@ -509,7 +511,7 @@ fn code_index_cpp_language_e2e() {
 
     let outline = c.call_json(
         "code_outline",
-        serde_json::json!({ "file": file_name(&c, "calc.cpp") }),
+        serde_json::json!({ "file": file_name(&c, "calc.cpp"), "project": "test" }),
     );
     let names: Vec<&str> = outline["symbols"]
         .as_array()
@@ -530,17 +532,17 @@ fn code_index_ruby_language_e2e() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();
 
-    let idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
     assert!(idx["files_indexed"].as_u64().unwrap() >= 1);
 
-    let res = c.call_json("code_search", serde_json::json!({ "query": "add", "lang": "ruby" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "add", "lang": "ruby", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     let add = rows.iter().find(|r| r["name"].as_str().unwrap().ends_with("::add"));
     assert!(add.is_some(), "Ruby add method should be found: {res}");
 
     let outline = c.call_json(
         "code_outline",
-        serde_json::json!({ "file": file_name(&c, "greeter.rb") }),
+        serde_json::json!({ "file": file_name(&c, "greeter.rb"), "project": "test" }),
     );
     let names: Vec<&str> = outline["symbols"]
         .as_array()
@@ -561,17 +563,17 @@ fn code_index_php_language_e2e() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();
 
-    let idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
     assert!(idx["files_indexed"].as_u64().unwrap() >= 1);
 
-    let res = c.call_json("code_search", serde_json::json!({ "query": "UserService", "lang": "php" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "UserService", "lang": "php", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     let svc = rows.iter().find(|r| r["name"].as_str().unwrap().ends_with("::UserService"));
     assert!(svc.is_some(), "UserService class should be found: {res}");
 
     let outline = c.call_json(
         "code_outline",
-        serde_json::json!({ "file": file_name(&c, "service.php") }),
+        serde_json::json!({ "file": file_name(&c, "service.php"), "project": "test" }),
     );
     let names: Vec<&str> = outline["symbols"]
         .as_array()
@@ -592,17 +594,17 @@ fn code_index_filter_by_kind_and_lang() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();
 
-    let _idx = c.call_json("code_index", serde_json::json!({ "path": dir }));
+    let _idx = c.call_json("code_index", serde_json::json!({ "path": dir, "project": "test" }));
 
     // Search only for classes.
-    let res = c.call_json("code_search", serde_json::json!({ "query": "a", "kind": "class" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "a", "kind": "class", "project": "test" }));
     let rows = res["results"].as_array().unwrap();
     for row in rows {
         assert_eq!(row["kind"], "class", "filtered results should only be classes: {res}");
     }
 
     // Search only for functions in C.
-    let res = c.call_json("code_search", serde_json::json!({ "query": "a", "kind": "function", "lang": "c" }));
+    let res = c.call_json("code_search", serde_json::json!({ "query": "a", "kind": "function", "lang": "c", "project": "test" }));
     for row in res["results"].as_array().unwrap() {
         assert_eq!(row["kind"], "function", "should be function: {res}");
         assert_eq!(row["lang"].as_str(), Some("c"), "should be C: {res}");
@@ -650,4 +652,64 @@ fn code_index_get_symbol_across_languages() {
         assert!(result.get("file").is_some(), "get_symbol({name}) should have file: {result}");
         assert!(result.get("signature").is_some(), "get_symbol({name}) should have signature: {result}");
     }
+}
+
+/// `code_search` true when `query` resolves to a symbol whose name ends with
+/// `suffix`, polled for up to ~12s to let the debounced watcher catch up.
+fn poll_search(c: &mut Client, project: &str, query: &str, suffix: &str, want: bool) -> bool {
+    use std::time::Duration;
+    for _ in 0..24 {
+        std::thread::sleep(Duration::from_millis(500));
+        let res = c.call_json(
+            "code_search",
+            serde_json::json!({ "query": query, "project": project }),
+        );
+        let found = res["results"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .any(|r| r["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
+            })
+            .unwrap_or(false);
+        if found == want {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn code_watch_reindexes_on_change_and_delete() {
+    let mut c = setup();
+    let dir = c.src_dir.to_string_lossy().to_string();
+
+    // Start watching; the initial index runs synchronously before returning.
+    let w = c.call_json("code_watch", serde_json::json!({ "path": dir, "project": "watch" }));
+    assert_eq!(w["status"], "watching", "watch should start: {w}");
+
+    // helper_sort (from service.php) is indexed up front.
+    assert!(
+        poll_search(&mut c, "watch", "helper_sort", "::helper_sort", true),
+        "initial index should contain helper_sort"
+    );
+
+    // Edit a file to add a brand-new symbol → the debounced watcher re-indexes
+    // the batch and the symbol becomes searchable.
+    let new_fn = "\npub fn gamma_unique_xyz(n: i32) -> i32 { n + 7 }\n";
+    std::fs::write(
+        c.src_dir.join("lib.rs"),
+        format!("{RUST_SRC}{new_fn}"),
+    )
+    .unwrap();
+    assert!(
+        poll_search(&mut c, "watch", "gamma_unique_xyz", "::gamma_unique_xyz", true),
+        "watcher should pick up the added symbol"
+    );
+
+    // Delete a file → its symbols are purged from the index.
+    std::fs::remove_file(c.src_dir.join("service.php")).unwrap();
+    assert!(
+        poll_search(&mut c, "watch", "helper_sort", "::helper_sort", false),
+        "watcher should purge symbols of the deleted file"
+    );
 }

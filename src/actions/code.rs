@@ -1,14 +1,20 @@
 //! MCP tool handlers for the tree-sitter code knowledge graph.
 //!
-//! These map parsed code symbols (see [`crate::code`]) onto the existing
-//! entity/relation graph so the regular search/traversal tools work on code,
-//! and expose four code-focused tools: `code_index`, `code_outline`,
+//! These map parsed code symbols (see [`crate::code`]) onto a knowledge graph
+//! so the regular search/traversal primitives work on code, and expose
+//! code-focused tools: `code_index`, `code_watch`, `code_outline`,
 //! `code_search`, `code_get_symbol`.
 //!
-//! Symbols are stored as entities named `relpath::symbol` with type
+//! Symbols are stored as entities named `{relpath}::{symbol}` with type
 //! `code:<kind>`; metadata (file, line range, signature, doc) lives in
 //! observations. Edges: `defines` (file→symbol), `calls`/`references`
 //! (caller→callee, resolved only when the callee name is unambiguous).
+//!
+//! Multiple independent projects are supported by **physical partitioning**:
+//! each `code_index`/`code_watch` call takes an optional `project` identifier
+//! (default `"default"`) that selects a dedicated SQLite database, opened via
+//! [`crate::code_registry`]. Projects therefore never collide and are fully
+//! isolated from the main memory graph and from the knowledge-graph tools.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -43,6 +49,18 @@ macro_rules! text_content {
 fn to_json(v: &impl serde::Serialize) -> Result<Value> {
     let text = serde_json::to_string(v).map_err(MCSError::JsonError)?;
     Ok(text_content!(text))
+}
+
+/// Read + validate the optional `project` argument, defaulting to
+/// [`crate::code_registry::DEFAULT_PROJECT`]. Each project maps to its own DB.
+fn project_of(params: &Value) -> Result<String> {
+    let p = params
+        .get("project")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::code_registry::DEFAULT_PROJECT);
+    crate::code_registry::validate_project(p)?;
+    Ok(p.to_string())
 }
 
 /// Repo-relative, forward-slash path used as the `code:file` entity name.
@@ -112,8 +130,8 @@ enum Outcome {
 /// Read + hash + (incrementally) parse one file. CPU-bound and independent per
 /// file, so this runs on the parse thread pool. Reads use the graph's
 /// concurrent read pool; no writes happen here.
-fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool,
-             total_symbols: &AtomicUsize) -> Outcome {
+fn parse_one(kg: &GraphHandle, path: &Path, base: &Path,
+             force: bool, total_symbols: &AtomicUsize) -> Outcome {
     let Some(lang) = code::detect(path) else {
         return Outcome::Unsupported;
     };
@@ -123,6 +141,8 @@ fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool,
     };
     let hash = code::hash_bytes(&bytes);
 
+    // Project isolation is physical (one DB per project), so the file entity is
+    // just the repo-relative path — no project prefix needed.
     let existing = kg.get_entity(&rel).ok().flatten();
     let existed = existing.is_some();
     // Incremental: skip unchanged files (matching stored hash).
@@ -164,21 +184,70 @@ fn parse_one(kg: &GraphHandle, path: &Path, base: &Path, force: bool,
     }))
 }
 
-pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+pub fn handle_code_index(args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let path = params
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'path' parameter".into()))?;
+    let project = project_of(params)?;
+    let kg = crate::code_registry::resolve(&project)?;
+    let kg = kg.as_ref();
     let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let root = Path::new(path);
     if !root.exists() {
         return Err(MCSError::InvalidParams(format!("Path not found: {path}")));
     }
-    let base = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    // Canonicalize so entity names are stable regardless of how the path is
+    // spelled (symlinks, `.`, `..`) — critical for matching the symlink-resolved
+    // paths the watcher receives from the OS. Falls back to the raw path.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let base = canonical_base();
+    let files = code::walk(&root, code::MAX_FILE_BYTES);
+    index_paths(kg, files, &base, force)
+}
 
-    let mut files = code::walk(root, code::MAX_FILE_BYTES);
+/// The canonicalized current working directory, used as the base for
+/// repo-relative entity names. Shared by the indexer and the watcher so both
+/// derive identical names.
+pub(crate) fn canonical_base() -> std::path::PathBuf {
+    std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Repo-relative entity name for a path under `base` (matches [`parse_one`]).
+/// Exposed for the watcher to purge symbols of deleted files.
+pub(crate) fn file_entity_name(path: &Path, base: &Path) -> String {
+    rel_path(path, base)
+}
+
+/// Map a caller-supplied file path to its stored entity name. Relative paths
+/// are assumed already repo-relative; absolute paths are canonicalized and
+/// based the same way [`handle_code_index`] stores them.
+fn lookup_file_name(file: &str) -> String {
+    let p = Path::new(file);
+    if p.is_absolute() {
+        let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        rel_path(&c, &canonical_base())
+    } else {
+        file.to_string()
+    }
+}
+
+/// Parse + write a known set of `files` into `kg`. Shared by the `code_index`
+/// tool (after walking a path) and the watcher (a debounced batch of changed
+/// files). `base` anchors repo-relative entity names; the same `base` must be
+/// used across calls for a project so re-indexing updates rather than
+/// duplicates. Batching a whole change set through one call keeps the parse
+/// pool and write transactions amortized instead of per-file.
+pub(crate) fn index_paths(
+    kg: &GraphHandle,
+    mut files: Vec<std::path::PathBuf>,
+    base: &Path,
+    force: bool,
+) -> Result<Value> {
     files.truncate(MAX_INDEX_FILES);
 
     let now = SystemTime::now()
@@ -211,7 +280,7 @@ pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
                         if total_symbols.load(Ordering::Relaxed) >= MAX_TOTAL_SYMBOLS {
                             continue;
                         }
-                        local.push(parse_one(kg, &files[i], &base, force, &total_symbols));
+                        local.push(parse_one(kg, &files[i], base, force, &total_symbols));
                     }
                     local
                 })
@@ -297,9 +366,10 @@ pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
     let mut rel_seen: HashSet<(String, String, &'static str)> = HashSet::new();
     let mut relation_count = 0usize;
     for fw in &work {
+        let file_entity = &fw.rel;
         for (_, q) in &fw.named {
             rbuf.push(Relation {
-                from: fw.rel.clone(),
+                from: file_entity.clone(),
                 to: q.clone(),
                 relation_type: "defines".into(),
             });
@@ -311,7 +381,9 @@ pub fn handle_code_index(kg: &GraphHandle, args: Option<&Value>) -> Result<Value
                 continue; // ambiguous or unresolved — drop (no false edges)
             }
             let callee = &targets[0];
-            let caller = enclosing(&fw.named, r.line).unwrap_or(&fw.rel).to_string();
+            let caller = enclosing(&fw.named, r.line)
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| file_entity.clone());
             if &caller == callee {
                 continue;
             }
@@ -357,15 +429,22 @@ fn enclosing(named: &[(Def, String)], line: usize) -> Option<&str> {
 // code_outline
 // ---------------------------------------------------------------------------
 
-pub fn handle_code_outline(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+pub fn handle_code_outline(args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let file = params
         .get("file")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'file' parameter".into()))?;
     let file = file.replace('\\', "/");
+    let project = project_of(params)?;
+    let kg = crate::code_registry::resolve(&project)?;
+    let kg = kg.as_ref();
 
-    let defines = kg.search_relations(Some(&file), None, Some("defines"), Some(MAX_SYMBOLS_PER_FILE));
+    // Map the caller's path to the stored entity name. A relative path is
+    // already repo-relative (matches the stored name); an absolute path is
+    // canonicalized + based exactly as the indexer does.
+    let lookup = lookup_file_name(&file);
+    let defines = kg.search_relations(Some(&lookup), None, Some("defines"), Some(MAX_SYMBOLS_PER_FILE));
     let names: Vec<String> = defines.into_iter().map(|r| r.to).collect();
     if names.is_empty() {
         return to_json(&json!({
@@ -396,7 +475,7 @@ pub fn handle_code_outline(kg: &GraphHandle, args: Option<&Value>) -> Result<Val
 // code_search
 // ---------------------------------------------------------------------------
 
-pub fn handle_code_search(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+pub fn handle_code_search(args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let query = params
         .get("query")
@@ -404,6 +483,9 @@ pub fn handle_code_search(kg: &GraphHandle, args: Option<&Value>) -> Result<Valu
         .ok_or_else(|| MCSError::InvalidParams("Missing 'query' parameter".into()))?;
     let kind = params.get("kind").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
     let lang = params.get("lang").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let project = project_of(params)?;
+    let kg = crate::code_registry::resolve(&project)?;
+    let kg = kg.as_ref();
     let limit = params
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -411,11 +493,11 @@ pub fn handle_code_search(kg: &GraphHandle, args: Option<&Value>) -> Result<Valu
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
 
-    // Over-fetch then narrow to code entities (search has a single-type filter).
+    // Over-fetch then drop file entities / apply kind+lang filters (search has a
+    // single-type filter). Project scoping is implicit in the per-project DB.
     let raw = kg.search_nodes_filtered(query, None, 0, limit.saturating_mul(5).min(1000));
     let rows: Vec<Value> = raw
         .into_iter()
-        .filter(is_code_entity)
         .filter(|e| e.entity_type != "code:file")
         .filter(|e| kind.is_none_or(|k| kind_of(e) == k))
         .filter(|e| lang.is_none_or(|l| obs_val(e, "lang") == Some(l)))
@@ -430,14 +512,18 @@ pub fn handle_code_search(kg: &GraphHandle, args: Option<&Value>) -> Result<Valu
 // code_get_symbol
 // ---------------------------------------------------------------------------
 
-pub fn handle_code_get_symbol(kg: &GraphHandle, args: Option<&Value>) -> Result<Value> {
+pub fn handle_code_get_symbol(args: Option<&Value>) -> Result<Value> {
     let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MCSError::InvalidParams("Missing 'name' parameter".into()))?;
+    let project = project_of(params)?;
+    let kg = crate::code_registry::resolve(&project)?;
+    let kg = kg.as_ref();
 
-    // Resolve: exact qualified name first, else fuzzy by bare name.
+    // Resolve within the project DB: exact (fully-qualified) name first, else
+    // fuzzy by bare name suffix.
     let mut matches: Vec<Entity> = Vec::new();
     if let Ok(Some(e)) = kg.get_entity(name)
         && is_code_entity(&e)
@@ -450,7 +536,7 @@ pub fn handle_code_get_symbol(kg: &GraphHandle, args: Option<&Value>) -> Result<
             .search_nodes_filtered(name, None, 0, 200)
             .into_iter()
             .filter(is_code_entity)
-            .filter(|e| e.name == name || e.name.ends_with(&suffix))
+            .filter(|e| e.name.ends_with(&suffix))
             .take(10)
             .collect();
     }
@@ -488,4 +574,49 @@ pub fn handle_code_get_symbol(kg: &GraphHandle, args: Option<&Value>) -> Result<
     } else {
         to_json(&json!({ "matches": results }))
     }
+}
+
+/// Start watching a project directory for file changes and re-index on
+/// modification. Spawns a background thread that monitors the directory
+/// tree with a debounced file-watcher. The initial index runs synchronously
+/// before returning.
+///
+/// The background thread holds the project's `Arc<GraphHandle>` (resolved from
+/// [`crate::code_registry`]) for its lifetime, pinning the canonical instance
+/// so re-index calls share one entity cache.
+pub fn handle_code_watch(args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MCSError::InvalidParams("Missing 'path' parameter".into()))?;
+    let project = project_of(params)?;
+    let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let root = std::path::PathBuf::from(path);
+    if !root.exists() {
+        return Err(MCSError::InvalidParams(format!("Path not found: {path}")));
+    }
+    // Watch the canonicalized root so OS events carry the same (symlink-resolved)
+    // paths the indexer stored, keeping incremental updates and deletes aligned.
+    let root = root.canonicalize().unwrap_or(root);
+    let watch_path = root.to_string_lossy().to_string();
+
+    // Initial index immediately (also opens/warms the project DB).
+    let index_args = json!({
+        "path": &watch_path,
+        "project": project,
+        "force": force,
+    });
+    let _ = handle_code_index(Some(&index_args))?;
+
+    // Pin the canonical handle and spawn the background watcher.
+    let kg_arc = crate::code_registry::resolve(&project)?;
+    crate::watcher::spawn_watcher(kg_arc, watch_path.clone(), &project);
+
+    to_json(&json!({
+        "status": "watching",
+        "project": project,
+        "path": watch_path,
+    }))
 }

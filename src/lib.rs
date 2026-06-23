@@ -1,6 +1,8 @@
 pub mod actions;
 #[cfg(feature = "code")]
 pub mod code;
+#[cfg(feature = "code")]
+pub mod code_registry;
 pub mod config;
 pub mod errors;
 pub mod http;
@@ -11,6 +13,7 @@ pub mod server;
 pub mod tls;
 pub mod tools;
 pub mod types;
+pub mod watcher;
 pub mod vector_actions;
 pub mod vector_store;
 

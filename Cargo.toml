@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "4.3.0"
+version = "4.4.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server for knowledge graph memory — entities, relations, and observations in SQLite with FTS5 search, plus optional vector/semantic + hybrid search (usearch HNSW or IVF-Flat) with batch upsert, more-like-this, recommendations, and MMR diversification"
@@ -56,6 +56,7 @@ tree-sitter-php = { version = "0.24", optional = true }
 
 ignore = { version = "0.4", optional = true }
 blake3 = { version = "1", optional = true }
+notify = { version = "8", optional = true }
 
 [features]
 default = ["code"]
@@ -75,6 +76,7 @@ code = [
     "dep:tree-sitter-php",
     "dep:ignore",
     "dep:blake3",
+    "dep:notify",
 ]
 
 [dev-dependencies]

@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::num::NonZeroUsize;
 use std::path::Path;
+#[cfg(feature = "code")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,13 +206,13 @@ impl MCPServer {
         let lru_cache = NonZeroUsize::new(config.lru_cache_size).unwrap_or_else(|| {
             NonZeroUsize::new(10000).expect("10000 > 0")
         });
-        let kg = GraphHandle::new(
+        let kg = Arc::new(GraphHandle::new(
             path,
             config.durability,
             config.sqlite_tuning(),
             lru_cache,
             config.read_pool_size,
-        )?;
+        )?);
 
         let vs = if config.vectors_enabled {
             Some(Arc::new(VectorStore::with_config(path, &vec_config)?))
@@ -219,11 +221,25 @@ impl MCPServer {
         };
 
         #[cfg(feature = "code")]
-        CODE_ENABLED.store(config.code_enabled, std::sync::atomic::Ordering::Relaxed);
+        {
+            CODE_ENABLED.store(config.code_enabled, std::sync::atomic::Ordering::Relaxed);
+            if config.code_enabled {
+                // Per-project code databases live in a sibling directory keyed to
+                // the main memory file, so distinct memory DBs never collide.
+                let base = PathBuf::from(format!("{}.code", config.memory_file_path));
+                crate::code_registry::init(
+                    base,
+                    config.durability,
+                    config.sqlite_tuning(),
+                    lru_cache,
+                    config.read_pool_size,
+                );
+            }
+        }
 
         Ok(Self {
             config: Arc::new(config),
-            kg: Arc::new(kg),
+            kg,
             vs,
         })
     }
@@ -613,7 +629,7 @@ const fn code_enabled() -> bool {
 fn is_code_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "code_index" | "code_outline" | "code_search" | "code_get_symbol"
+        "code_index" | "code_outline" | "code_search" | "code_get_symbol" | "code_watch"
     )
 }
 
@@ -701,16 +717,19 @@ fn handle_tools_call(
         {
             let result = match tool_name {
                 "code_index" => {
-                    code_actions::handle_code_index(kg, tool_args).map(HandlerResult::Value)
+                    code_actions::handle_code_index(tool_args).map(HandlerResult::Value)
                 }
                 "code_outline" => {
-                    code_actions::handle_code_outline(kg, tool_args).map(HandlerResult::Value)
+                    code_actions::handle_code_outline(tool_args).map(HandlerResult::Value)
                 }
                 "code_search" => {
-                    code_actions::handle_code_search(kg, tool_args).map(HandlerResult::Value)
+                    code_actions::handle_code_search(tool_args).map(HandlerResult::Value)
                 }
                 "code_get_symbol" => {
-                    code_actions::handle_code_get_symbol(kg, tool_args).map(HandlerResult::Value)
+                    code_actions::handle_code_get_symbol(tool_args).map(HandlerResult::Value)
+                }
+                "code_watch" => {
+                    code_actions::handle_code_watch(tool_args).map(HandlerResult::Value)
                 }
                 other => Err(MCSError::MethodNotFound(other.to_string())),
             };
