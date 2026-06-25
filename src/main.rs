@@ -23,14 +23,18 @@ async fn inner_main() -> Result<()> {
 
     let config = Arc::new(config::Config::from_args(&args)?);
     info!("Memory file: {}", config.memory_file_path);
-    info!(
-        "Vector search: {}",
-        if config.vectors_enabled { "enabled" } else { "disabled" }
-    );
-    info!(
-        "Code index: {}",
-        if config.code_enabled { "enabled" } else { "disabled" }
-    );
+
+    // Tool exposure: nothing is advertised unless a category was enabled.
+    if config.enabled_categories.is_empty() {
+        tracing::warn!(
+            "No tool categories enabled — the server will expose ZERO tools. \
+             Enable categories with --enable-<category> (e.g. --enable-graph-read \
+             --enable-graph-write) or expose everything with --enable-all."
+        );
+    } else {
+        let slugs: Vec<&str> = config.enabled_categories.iter().map(|c| c.slug()).collect();
+        info!("Tool categories enabled: {}", slugs.join(", "));
+    }
 
     let mcp_server = server::MCPServer::new((*config).clone(), args.vector_config())?;
     info!("Server initialized successfully");
@@ -39,10 +43,6 @@ async fn inner_main() -> Result<()> {
         mcp_memory::Transport::Stdio => {
             info!("Running in stdio mode");
             mcp_server.run_stdio().await?;
-        }
-        mcp_memory::Transport::Tcp => {
-            info!("Running in TCP mode on {}", config.bind_addr);
-            mcp_server.run_tcp(&config.bind_addr).await?;
         }
         mcp_memory::Transport::Http => {
             info!("Running in HTTP mode on {}", config.bind_addr);

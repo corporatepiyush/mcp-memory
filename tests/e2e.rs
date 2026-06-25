@@ -37,6 +37,8 @@ fn spawn_server() -> McpClient {
         .arg("stdio")
         .arg("--log-level")
         .arg("error")
+        .arg("--enable-graph-read")
+        .arg("--enable-graph-write")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

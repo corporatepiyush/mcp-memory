@@ -318,7 +318,7 @@ fn setup() -> Client {
     let bin = std::env::var("CARGO_BIN_EXE_MCP_MEMORY")
         .unwrap_or_else(|_| "target/debug/mcp-memory".into());
     let mut child = Command::new(&bin)
-        .args(["-f", &db_path, "--code", "--transport", "stdio", "--log-level", "error"])
+        .args(["-f", &db_path, "--enable-code", "--transport", "stdio", "--log-level", "error"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -412,8 +412,8 @@ fn code_index_is_incremental() {
 }
 
 #[test]
-fn code_tools_present_by_default() {
-    // Code tools are advertised by default (when code feature is on).
+fn code_tools_present_when_enabled() {
+    // Code tools are advertised once the `code` category is enabled.
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let db_path = format!("/tmp/code_e2e_default_{n}.db");
     for ext in ["", "-wal", "-shm"] {
@@ -422,7 +422,7 @@ fn code_tools_present_by_default() {
     let bin = std::env::var("CARGO_BIN_EXE_MCP_MEMORY")
         .unwrap_or_else(|_| "target/debug/mcp-memory".into());
     let mut child = Command::new(&bin)
-        .args(["-f", &db_path, "--transport", "stdio", "--log-level", "error"])
+        .args(["-f", &db_path, "--enable-code", "--transport", "stdio", "--log-level", "error"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1,4 +1,5 @@
 use crate::errors::{MCSError, Result};
+use crate::tools::ToolCategory;
 use crate::Transport;
 use std::sync::Arc;
 
@@ -96,11 +97,16 @@ pub struct Config {
     /// PEM private key matching `tls_cert`.
     pub tls_key: Option<std::path::PathBuf>,
     /// Enable the vector / semantic-search subsystem (`vector_*` + `hybrid_search`
-    /// tools backed by a usearch HNSW index). Off by default.
+    /// tools backed by a usearch HNSW index). Off by default. Derived from the
+    /// `vectors` category being enabled.
     pub vectors_enabled: bool,
     /// Enable the tree-sitter code-symbol subsystem (`code_*` tools). Off by
-    /// default. Only effective when built with the `code` feature.
+    /// default. Only effective when built with the `code` feature. Derived from
+    /// the `code` category being enabled.
     pub code_enabled: bool,
+    /// Tool categories exposed by this server. Empty (the default) means no
+    /// tools are advertised or callable until enabled with `--enable-*`.
+    pub enabled_categories: Vec<ToolCategory>,
 }
 
 /// Resolve the read-only connection-pool size. `0` means "auto": scale to the
@@ -191,6 +197,8 @@ impl Config {
             ));
         }
 
+        let enabled_categories = args.enabled_categories();
+
         Ok(Config {
             memory_file_path,
             transport: args.transport,
@@ -206,8 +214,9 @@ impl Config {
             read_pool_size: resolve_read_pool_size(args.read_pool_size),
             tls_cert,
             tls_key,
-            vectors_enabled: args.vectors,
-            code_enabled: args.code,
+            vectors_enabled: enabled_categories.contains(&ToolCategory::Vectors),
+            code_enabled: enabled_categories.contains(&ToolCategory::Code),
+            enabled_categories,
         })
     }
 }
@@ -231,6 +240,7 @@ impl Default for Config {
             tls_key: None,
             vectors_enabled: false,
             code_enabled: false,
+            enabled_categories: Vec::new(),
         }
     }
 }

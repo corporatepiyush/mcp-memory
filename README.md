@@ -4,23 +4,23 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gi
 LLM agents a persistent **knowledge graph memory** — entities, relations, and
 observations stored in an embedded SQLite database with FTS5 full-text search.
 
-It is **one unified server** with an opt-in vector subsystem:
+It is **one unified server** with opt-in tool categories.
 
-| Invocation | What you get | Tools |
-|---|---|---|
-| `mcp-memory` | The knowledge-graph server | 26 |
-| `mcp-memory --vectors` | Everything above **plus** vector embeddings and semantic / hybrid / MMR search (usearch HNSW **or** IVF-Flat) | 38 |
-| `mcp-memory-vec` | Backward-compatible alias for `mcp-memory --vectors` | 38 |
+> **Tools are opt-in (4.5.0+).** No tools are exposed by default. Enable them one
+> *category* at a time with `--enable-<category>` flags (or `--enable-all`). The
+> four categories are **`graph-read`**, **`graph-write`**, **`vectors`**, and
+> **`code`**. See [Tool Exposure](#tool-exposure-opt-in-by-category).
 
-> **v4 note:** the former separate `mcp-memory-vec` server has been merged into
-> `mcp-memory`. Vectors are now enabled with the `--vectors` flag; `mcp-memory-vec`
-> remains as a thin alias that turns the flag on, so existing configs keep working.
+> **TCP removed (4.5.0+).** The line-delimited TCP transport has been dropped;
+> use **stdio** (for MCP clients) or **HTTP**. The `--enable-vectors` /
+> `--enable-code` flags replace the former `--vectors` / `--code` flags.
+> `mcp-memory-vec` remains as a thin alias that turns everything on.
 
-It speaks MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth and TLS).
+It speaks MCP over **stdio and HTTP** (with optional bearer-token auth and TLS).
 
 ```
                     ┌────────────────────────────────────────────────┐
-                    │      mcp-memory  (+ --vectors / -vec alias)     │
+                    │      mcp-memory  (+ --enable-vectors / -vec alias)     │
                     │                                                │
      ┌───────┐      │  ┌──────────┐   ┌─────────────────────────┐   │
      │Claude │──────│─>│  stdio / │──>│ GraphHandle             │   │
@@ -28,7 +28,7 @@ It speaks MCP over **stdio, TCP, and HTTP** (with optional bearer-token auth and
      └───────┘      │  │  HTTP    │   │  ├ FxHashMap name→ID     │   │
                     │  └────┬─────┘   │  └ FTS5 full-text index  │   │
                     │       │         └───────────┬─────────────┘   │
-                    │       │     (--vectors only) │                 │
+                    │       │     (--enable-vectors only) │                 │
                     │       v         ┌───────────┴─────────────┐   │
                     │  ┌─────────┐    │ VectorStore             │   │
                     │  │ dispatch│───>│  ├ ANN: HNSW *or* IVF    │   │
@@ -54,15 +54,32 @@ This installs both `mcp-memory` and `mcp-memory-vec`.
 ## Quick start
 
 ```sh
-# Knowledge-graph server
-mcp-memory --transport stdio
+# Knowledge-graph server (read + write tools)
+mcp-memory --transport stdio --enable-graph-read --enable-graph-write
 
 # Knowledge-graph + vector search
-mcp-memory --vectors --transport stdio --embedding-dims 384
+mcp-memory --transport stdio --enable-graph-read --enable-graph-write \
+  --enable-vectors --embedding-dims 384
 
-# Equivalent backward-compatible alias
+# Everything on (KG + vectors + code) via the backward-compatible alias
 mcp-memory-vec --transport stdio --embedding-dims 384
+
+# Or enable every category explicitly
+mcp-memory --transport stdio --enable-all
 ```
+
+### Tool Exposure (opt-in by category)
+
+**No tools are exposed until you enable their category** — disabled tools are
+hidden from `tools/list` and rejected from `tools/call` as if they did not exist.
+
+| Flag | Category | Tools |
+|------|----------|-------|
+| `--enable-graph-read` | **graph-read** | read-only KG queries: `read_graph`, `search_nodes`, `open_nodes`, `get_entity`, `graph_stats`, `search_relations`, `find_path`/`find_all_paths`, `get_neighbors`, `describe_entity`, `list_entity_types`, `list_relation_types`, `export_graph`, `extract_subgraph`, `batch_get_entities`, `entity_exists`, `degree` |
+| `--enable-graph-write` | **graph-write** | KG mutations: `create_entities`, `create_relations`, `add_observations`, `delete_entities`, `delete_observations`, `delete_relations`, `upsert_entities`, `merge_entities`, `compact` |
+| `--enable-vectors` | **vectors** | `vector_*` + `hybrid_search` (usearch HNSW or IVF-Flat). Also builds the vector subsystem. |
+| `--enable-code` | **code** | `code_index`, `code_outline`, `code_search`, `code_get_symbol`, `code_watch` (requires the `code` build feature, on by default) |
+| `--enable-all` | *(all)* | Every category. Overrides the individual flags; this is what `mcp-memory-vec` sets. |
 
 The database path is resolved in order:
 
@@ -70,8 +87,8 @@ The database path is resolved in order:
 2. `MEMORY_FILE_PATH` environment variable
 3. Default: `memory.mcpmem` in the working directory
 
-The same SQLite file works with or without `--vectors`, so you can populate the
-graph plain and later serve it with vectors enabled. With `--vectors` off, the
+The same SQLite file works with or without `--enable-vectors`, so you can populate the
+graph plain and later serve it with vectors enabled. With `--enable-vectors` off, the
 vector tools are neither advertised in `tools/list` nor served.
 
 ### Transports
@@ -79,7 +96,6 @@ vector tools are neither advertised in `tools/list` nor served.
 | Transport | Flag | Description |
 |-----------|------|-------------|
 | stdio | `--transport stdio` | Newline-delimited JSON over stdin/stdout (default, for Claude Desktop / Claude Code) |
-| tcp | `--transport tcp --bind 0.0.0.0:8080` | Newline-delimited JSON over TCP, concurrent connections |
 | http | `--transport http --bind 0.0.0.0:8080` | MCP Streamable HTTP (POST/GET `/mcp`, SSE) |
 
 ### Claude Desktop / Claude Code config
@@ -94,23 +110,23 @@ vector tools are neither advertised in `tools/list` nor served.
 }
 ```
 
-Add `"args": ["--vectors", "--embedding-dims", "384"]` to enable vector search
+Add `"args": ["--enable-vectors", "--embedding-dims", "384"]` to enable vector search
 (or use `"command": "mcp-memory-vec"`).
 
 ### Authentication
 
-The `tcp` and `http` transports accept an optional bearer token (stdio is never
+The `http` transport accepts an optional bearer token (stdio is never
 authenticated). Set it with `--auth-token` or `--auth-token-file` (trimmed; an
 empty file is rejected), or the `MCP_MEMORY_AUTH_TOKEN` environment variable.
 
 ```sh
 mcp-memory --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
-mcp-memory --vectors --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
+mcp-memory --enable-vectors --transport http --bind 0.0.0.0:8080 --auth-token "s3cr3t"
 ```
 
-On HTTP the token is sent as `Authorization: Bearer <token>`; on TCP it is the
-first line of the connection. Comparison is constant-time. Binding a non-loopback
-address **without** a token exposes the entire graph to the network.
+On HTTP the token is sent as `Authorization: Bearer <token>`. Comparison is
+constant-time. Binding a non-loopback address **without** a token exposes the
+entire graph to the network.
 
 ### TLS (HTTPS)
 
@@ -125,14 +141,14 @@ mcp-memory --transport http --bind 0.0.0.0:8080 \
   --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
-## Code indexing (`--code`)
+## Code indexing (`--enable-code`)
 
-With `--code`, the server can parse a source tree with **tree-sitter** and store
+With `--enable-code`, the server can parse a source tree with **tree-sitter** and store
 its symbols as ordinary graph entities, turning the memory server into a
 persistent, semantically-searchable **code map** for terminal coding agents
 (Claude Code, opencode, codex, …). Because symbols are plain entities, every
 existing tool — `search_nodes`, `extract_subgraph`, `get_neighbors`, `find_path`,
-and (with `--vectors`) `hybrid_search` — works on code for free.
+and (with `--enable-vectors`) `hybrid_search` — works on code for free.
 
 - **What it stores.** Functions, classes, methods, modules, and constants become
   entities named `relpath::symbol` with type `code:<kind>`. Metadata (file, line
@@ -152,7 +168,7 @@ and (with `--vectors`) `hybrid_search` — works on code for free.
   are indexed alongside source files. The walk honors `.gitignore` and skips
   `target`/`node_modules`/`dist`/`build` and oversized files.
 
-Four tools (exposed only with `--code`):
+Four tools (exposed only with `--enable-code`):
 
 | Tool | Purpose |
 | --- | --- |
@@ -162,16 +178,16 @@ Four tools (exposed only with `--code`):
 | `code_get_symbol` | A symbol's metadata plus its callers and callees. |
 
 ```bash
-mcp-memory --code --transport stdio
+mcp-memory --enable-code --transport stdio
 # then, over MCP:  code_index {"path": "src"}
 ```
 
 The `code` Cargo feature is **on by default**; `cargo build --no-default-features`
 produces a lean pure-memory binary with no tree-sitter grammars compiled in.
 
-## Vector search (`--vectors`)
+## Vector search (`--enable-vectors`)
 
-With `--vectors`, the server layers a vector store on top of the knowledge graph.
+With `--enable-vectors`, the server layers a vector store on top of the knowledge graph.
 Each embedding is attached to an **existing** entity (by name), indexed in an
 in-memory ANN index, and persisted as a blob in the `vector_embedding` SQLite
 table. On startup the index is rebuilt from those blobs.
@@ -209,7 +225,7 @@ k-means and keep recall high (no-op for HNSW).
 
 ### Vector configuration
 
-The index is tunable from the command line (all require `--vectors`):
+The index is tunable from the command line (all require `--enable-vectors`):
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -225,12 +241,12 @@ The index is tunable from the command line (all require `--vectors`):
 
 ```sh
 # HNSW with half-precision storage
-mcp-memory --vectors --transport http --bind 0.0.0.0:8080 \
+mcp-memory --enable-vectors --transport http --bind 0.0.0.0:8080 \
   --embedding-dims 768 --vec-metric cos --vec-quantization f16 \
   --vec-connectivity 32 --vec-expansion-search 128
 
 # IVF-Flat for a large corpus
-mcp-memory --vectors --embedding-dims 768 \
+mcp-memory --enable-vectors --embedding-dims 768 \
   --vec-index ivf --ivf-nlist 1024 --ivf-nprobe 16
 ```
 
@@ -240,16 +256,16 @@ lazily; call `vector_refresh_graph_cache` after mutating relations to refresh it
 ## MCP compliance
 
 Implements the [Model Context Protocol](https://modelcontextprotocol.io) revision
-**`2025-11-25`** over JSON-RPC 2.0, via stdio, TCP, or HTTP.
+**`2025-11-25`** over JSON-RPC 2.0, via stdio or HTTP.
 
 | Area | Support |
 |---|---|
-| Transports | stdio, TCP, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
+| Transports | stdio, **Streamable HTTP** (POST/GET `/mcp`, SSE) |
 | Protocol version | `2025-11-25`, negotiates down to `2025-06-18` / `2025-03-26` / `2024-11-05` |
 | `initialize` | version negotiation + `instructions` |
-| `tools/list`, `tools/call` | 26 tools (KG only) / 38 tools (with `--vectors`) |
+| `tools/list`, `tools/call` | opt-in by category (`--enable-*`); up to 43 tools with `--enable-all` |
 | `CallToolResult` | `content[]` + `isError` |
-| Auth | optional bearer token on TCP/HTTP (constant-time) |
+| Auth | optional bearer token on HTTP (constant-time) |
 | Capabilities advertised | `tools` only |
 
 Tool failures are returned as `CallToolResult`s with `isError: true` (not as
@@ -266,7 +282,7 @@ Entity(name, entityType, observations[])   ──relationType──▶   Entity(
 - **Relation** — a directed edge `(from, to, relationType)`. Traversal is
   undirected (BFS/DFS follow both directions).
 - **Observation** — an unstructured fact attached to an entity.
-- **Embedding** *(`--vectors`)* — a fixed-dimension `f32` vector attached to an
+- **Embedding** *(`--enable-vectors`)* — a fixed-dimension `f32` vector attached to an
   entity, plus an optional model identifier.
 
 Search uses FTS5 full-text indexing with `unicode61 remove_diacritics 2`
@@ -288,7 +304,7 @@ A single SQLite database in WAL mode:
 | `obs_fts` | `content_rowid` | External-content FTS5 over `observation.body` |
 | `type_dict` | name | Interned entity/relation types with live counts (loaded into RAM) |
 | `graph_stat` | key (singleton) | `WITHOUT ROWID` counters: entities, relations, observations, sequences |
-| `vector_embedding` | `entity_id` | *(`--vectors`)* `dims`, `blob` (f32 vector), `model`, `created_us` |
+| `vector_embedding` | `entity_id` | *(`--enable-vectors`)* `dims`, `blob` (f32 vector), `model`, `created_us` |
 
 Key pragmas (defaults, all tunable via flags): `page_size=4096`,
 `journal_mode=WAL`, `auto_vacuum=INCREMENTAL`, `synchronous=NORMAL`,
@@ -304,8 +320,8 @@ to bound the async durability window.
 | Entity LRU (10,000 entries) | Avoids deserializing hot entities; stores `EntityMeta{id, type_id, obs_count, out_deg, in_deg}` |
 | Name-hash map | O(1) name-to-ID resolution via 64-bit hash |
 | Prepared-statement cache | Reuses compiled SQLite queries |
-| ANN index *(`--vectors`)* | In-memory HNSW or IVF-Flat index, rebuilt from `vector_embedding` on startup |
-| petgraph adjacency *(`--vectors`)* | Directed graph cache for the hybrid-search centrality boost |
+| ANN index *(`--enable-vectors`)* | In-memory HNSW or IVF-Flat index, rebuilt from `vector_embedding` on startup |
+| petgraph adjacency *(`--enable-vectors`)* | Directed graph cache for the hybrid-search centrality boost |
 
 ### Write batching
 
@@ -325,7 +341,7 @@ from O(N) to O(1) per `create_entities` / `create_relations` call:
 | `sync` | fsync before every write | Zero |
 
 Set via the `MCP_MEMORY_DURABILITY=sync` environment variable (applies whether or
-not `--vectors` is on).
+not `--enable-vectors` is on).
 
 ### Background maintenance
 
@@ -379,7 +395,7 @@ your own target.
 `describe_entity`, `degree`, `find_path`, `find_all_paths`, `extract_subgraph`,
 `get_neighbors`, `list_entity_types`, `list_relation_types`, `export_graph`.
 
-### Vector tools (`--vectors` only)
+### Vector tools (`--enable-vectors` only)
 
 - `vector_upsert_embedding` — attach/replace an embedding on an existing entity
 - `vector_batch_upsert` — bulk-upsert up to 1,024 embeddings; per-item error reporting
@@ -399,7 +415,6 @@ your own target.
 ```
 main.rs / vec_main.rs → MCPServer { kg, vs: Option<VectorStore> }
   ├── run_stdio()  — newline-delimited JSON-RPC over stdio
-  ├── run_tcp()    — same framing, concurrent connections
   └── run_http()   — MCP Streamable HTTP (axum, POST/GET /mcp)
         └── process_request()
               ├── "initialize"      → protocol version + capabilities
@@ -418,11 +433,10 @@ All transports share the transport-agnostic dispatch core
   read-only connection pool serves concurrent reads under WAL.
 - The `VectorStore` uses `DashMap` for name↔ID maps and an `RwLock` over the
   petgraph cache; the HNSW index is internally synchronized, the IVF index behind
-  its own `RwLock`. Vector tools are gated behind `--vectors`; a pure-KG server
+  its own `RwLock`. Vector tools are gated behind `--enable-vectors`; a pure-KG server
   carries no vector state.
 - Heavy dispatch (graph lock + optional fsync) is offloaded to
   `tokio::task::spawn_blocking` to keep the reactor responsive.
-- TCP connections are capped at 128 concurrent.
 
 ### Request size limits
 
@@ -435,8 +449,8 @@ All transports share the transport-agnostic dispatch core
 | Max search limit | 1,000 |
 | Max neighbor depth | 16 |
 | Max `find_all_paths` depth / results | 10 / 100 |
-| Max embedding dimensions *(`--vectors`)* | 4,096 |
-| Max `topK` *(`--vectors`)* | 100 |
+| Max embedding dimensions *(`--enable-vectors`)* | 4,096 |
+| Max `topK` *(`--enable-vectors`)* | 100 |
 | Max items per `vector_batch_upsert` | 1,024 |
 
 ## Development
@@ -452,7 +466,7 @@ The test suite covers protocol handling, all tool handlers, CRUD/search/path
 persistence, concurrency, fuzzy invariant checks, and — for the vector subsystem —
 the IVF-Flat index (training, probe search, upsert/remove, metrics), both ANN
 backends end-to-end, the modern retrieval tools (batch upsert, more-like-this,
-recommend, MMR), vector gating when `--vectors` is off, input validation, the
+recommend, MMR), vector gating when `--enable-vectors` is off, input validation, the
 tunable index config, and HTTP bearer-token authentication.
 
 ## License

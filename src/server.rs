@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::error;
 
 #[cfg(feature = "code")]
 use crate::actions::code as code_actions;
@@ -34,8 +32,25 @@ const BUFFER_CAPACITY: usize = 65536;
 const NEWLINE: &[u8] = b"\n";
 /// Maximum size of a single inbound JSON-RPC message (shared by all transports).
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum number of concurrent TCP connections (C4).
-const MAX_TCP_CONNECTIONS: usize = 128;
+
+/// Process-wide exposure flags for the knowledge-graph tool categories, set once
+/// at startup from `config.enabled_categories`. KG tools carry no per-request
+/// state, so a global flag avoids threading the enabled set through every
+/// dispatch signature (mirrors `CODE_ENABLED`). Vectors are gated by the
+/// presence of the `VectorStore`, code by `CODE_ENABLED`.
+static GRAPH_READ_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static GRAPH_WRITE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn graph_read_enabled() -> bool {
+    GRAPH_READ_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[inline]
+fn graph_write_enabled() -> bool {
+    GRAPH_WRITE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 enum LineRead {
     Line,
@@ -43,27 +58,35 @@ enum LineRead {
     TooLong,
 }
 
+/// Read one newline-terminated line, capping at `max` bytes. Both `buf` (the
+/// byte accumulator) and `out` (the decoded line) are caller-owned and reused
+/// across calls, so a long-lived connection performs no per-request line
+/// allocation — only the decode copy into `out`'s retained capacity.
 async fn read_line_capped<R>(
     reader: &mut R,
+    buf: &mut Vec<u8>,
     out: &mut String,
     max: usize,
 ) -> std::io::Result<LineRead>
 where
     R: AsyncBufReadExt + Unpin,
 {
+    buf.clear();
     out.clear();
-    let mut buf: Vec<u8> = Vec::new();
+    let finish = |buf: &[u8], out: &mut String| -> std::io::Result<LineRead> {
+        let s = std::str::from_utf8(buf).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-UTF-8 input")
+        })?;
+        out.push_str(s);
+        Ok(LineRead::Line)
+    };
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             if buf.is_empty() {
                 return Ok(LineRead::Eof);
             }
-            // Move `buf` into the String — no copy. `buf` is not used afterward.
-            *out = String::from_utf8(buf).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-UTF-8 input")
-            })?;
-            return Ok(LineRead::Line);
+            return finish(buf, out);
         }
         match available.iter().position(|&b| b == b'\n') {
             Some(i) => {
@@ -73,10 +96,7 @@ where
                 }
                 buf.extend_from_slice(&available[..=i]);
                 reader.consume(i + 1);
-                *out = String::from_utf8(buf).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-UTF-8 input")
-                })?;
-                return Ok(LineRead::Line);
+                return finish(buf, out);
             }
             None => {
                 let take = available.len();
@@ -220,6 +240,17 @@ impl MCPServer {
             None
         };
 
+        // Publish the knowledge-graph exposure flags for the dispatch path.
+        use crate::tools::ToolCategory;
+        GRAPH_READ_ENABLED.store(
+            config.enabled_categories.contains(&ToolCategory::GraphRead),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        GRAPH_WRITE_ENABLED.store(
+            config.enabled_categories.contains(&ToolCategory::GraphWrite),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         #[cfg(feature = "code")]
         {
             CODE_ENABLED.store(config.code_enabled, std::sync::atomic::Ordering::Relaxed);
@@ -269,53 +300,6 @@ impl MCPServer {
         let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
         let mut stdout = tokio::io::stdout();
         serve_line_conn(&mut reader, &mut stdout, Arc::clone(&self.kg), self.vs.clone()).await
-    }
-
-    /// TCP transport: each accepted connection speaks newline-delimited
-    /// JSON-RPC, exactly like stdio. Connections are served concurrently (up to
-    /// [`MAX_TCP_CONNECTIONS`]) and share the one graph behind its mutex.
-    pub async fn run_tcp(&self, addr: &str) -> Result<()> {
-        spawn_maintenance(self.kg.clone());
-        spawn_wal_flush(self.kg.clone(), self.config.wal_flush_ms);
-        let listener = TcpListener::bind(addr).await.map_err(MCSError::IoError)?;
-        let semaphore = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
-        let auth_token = self.config.auth_token.clone();
-        info!(
-            "Listening for TCP MCP connections on {addr} (max {MAX_TCP_CONNECTIONS}, auth {}, vectors {})",
-            if auth_token.is_some() { "on" } else { "off" },
-            if self.vs.is_some() { "on" } else { "off" }
-        );
-        loop {
-            let permit = Arc::clone(&semaphore).acquire_owned().await;
-            let (socket, peer) = listener.accept().await.map_err(MCSError::IoError)?;
-            let kg = Arc::clone(&self.kg);
-            let vs = self.vs.clone();
-            let auth_token = auth_token.clone();
-            tokio::spawn(async move {
-                let _permit = permit; // held for the connection lifetime
-                let (read_half, mut write_half) = socket.into_split();
-                let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, read_half);
-                // When a token is configured, the client must send it as the
-                // first line before any JSON-RPC traffic.
-                if let Some(ref expected) = auth_token {
-                    match authenticate_line_conn(&mut reader, expected).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let _ = write_half.write_all(AUTH_REQUIRED_LINE.as_bytes()).await;
-                            let _ = write_half.flush().await;
-                            return;
-                        }
-                        Err(e) => {
-                            error!("TCP auth error for {peer}: {e}");
-                            return;
-                        }
-                    }
-                }
-                if let Err(e) = serve_line_conn(&mut reader, &mut write_half, kg, vs).await {
-                    error!("TCP connection {peer} error: {e}");
-                }
-            });
-        }
     }
 
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
@@ -378,26 +362,6 @@ fn spawn_maintenance(kg: Arc<GraphHandle>) {
     });
 }
 
-/// JSON-RPC error line returned to a TCP client that fails authentication.
-const AUTH_REQUIRED_LINE: &str = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32001,\
-\"message\":\"Authentication required: send the bearer token as the first line\"},\"id\":null}\n";
-
-/// Read the first line of a connection and compare it (constant-time) to the
-/// expected bearer token. Returns `Ok(false)` on EOF / oversized first line.
-async fn authenticate_line_conn<R>(reader: &mut R, expected: &str) -> Result<bool>
-where
-    R: AsyncBufReadExt + Unpin,
-{
-    let mut line = String::new();
-    match read_line_capped(reader, &mut line, MAX_REQUEST_BYTES)
-        .await
-        .map_err(MCSError::IoError)?
-    {
-        LineRead::Line => Ok(token_matches(&line, expected)),
-        _ => Ok(false),
-    }
-}
-
 /// Drive one line-framed connection (stdio or a single TCP socket): read
 /// newline-delimited JSON-RPC requests, write newline-delimited responses.
 /// Notifications produce no output. Returns when the peer closes the stream.
@@ -414,10 +378,11 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut line = String::with_capacity(1024);
+    let mut read_buf = Vec::with_capacity(1024);
     let mut out = Vec::with_capacity(BUFFER_CAPACITY);
 
     loop {
-        match read_line_capped(reader, &mut line, MAX_REQUEST_BYTES).await {
+        match read_line_capped(reader, &mut read_buf, &mut line, MAX_REQUEST_BYTES).await {
             Ok(LineRead::Eof) => break,
             Ok(LineRead::Line) => {
                 let line_copy = line.clone();
@@ -576,10 +541,21 @@ fn code_tools() -> &'static Vec<Value> {
     })
 }
 
-/// `tools/list` response. Vector and code tools are appended only when their
-/// subsystems are enabled, so the server never advertises tools it cannot serve.
+/// `tools/list` response. Each tool is advertised only when its category is
+/// enabled, so the server never lists a tool it would reject. Knowledge-graph
+/// tools are gated by the graph-read / graph-write flags; vector and code tools
+/// by their subsystems being enabled.
 fn handle_tools_list(vectors_enabled: bool) -> Value {
-    let mut all = base_tools().clone();
+    let (read, write) = (graph_read_enabled(), graph_write_enabled());
+    let mut all: Vec<Value> = base_tools()
+        .iter()
+        .filter(|t| {
+            t.get("name").and_then(Value::as_str).is_some_and(|n| {
+                if tools::is_write_tool(n) { write } else { read }
+            })
+        })
+        .cloned()
+        .collect();
     if vectors_enabled {
         all.extend(vector_tools().iter().cloned());
     }
@@ -588,25 +564,6 @@ fn handle_tools_list(vectors_enabled: bool) -> Value {
         all.extend(code_tools().iter().cloned());
     }
     json!({ "tools": all })
-}
-
-/// `true` for the vector-specific tool names (`vector_*` plus `hybrid_search`).
-fn is_vector_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "vector_upsert_embedding"
-            | "vector_search_entities"
-            | "vector_delete_embedding"
-            | "hybrid_search"
-            | "vector_refresh_graph_cache"
-            | "vector_store_stats"
-            | "vector_batch_upsert"
-            | "vector_get_embedding"
-            | "vector_search_by_entity"
-            | "vector_recommend"
-            | "vector_mmr_search"
-            | "vector_reindex"
-    )
 }
 
 /// Process-wide flag for the code-indexing subsystem, set once at server
@@ -625,14 +582,6 @@ const fn code_enabled() -> bool {
     false
 }
 
-/// `true` for the tree-sitter code tool names.
-fn is_code_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "code_index" | "code_outline" | "code_search" | "code_get_symbol" | "code_watch"
-    )
-}
-
 fn handle_tools_call(
     req: &JsonRpcRequest,
     kg: &GraphHandle,
@@ -646,10 +595,10 @@ fn handle_tools_call(
 
     let tool_args = req.params.as_ref().and_then(|p| p.get("arguments"));
 
-    if is_vector_tool_name(tool_name) {
+    if tools::is_vector_tool_name(tool_name) {
         let Some(vs) = vs else {
             return Err(MCSError::MethodNotFound(format!(
-                "{tool_name} (vector support disabled; start the server with --vectors)"
+                "{tool_name} (vector support disabled; start the server with --enable-vectors)"
             )));
         };
         let result = match tool_name {
@@ -707,10 +656,10 @@ fn handle_tools_call(
         }));
     }
 
-    if is_code_tool_name(tool_name) {
+    if tools::is_code_tool_name(tool_name) {
         if !code_enabled() {
             return Err(MCSError::MethodNotFound(format!(
-                "{tool_name} (code indexing disabled; start the server with --code)"
+                "{tool_name} (code indexing disabled; start the server with --enable-code)"
             )));
         }
         #[cfg(feature = "code")]
@@ -744,7 +693,19 @@ fn handle_tools_call(
         )));
     }
 
-    if !tools::tool_exists(tool_name) {
+    // Knowledge-graph category gate: a KG tool is reachable only if it exists
+    // AND its category (graph-read for queries, graph-write for mutations) was
+    // enabled at startup. Disabled tools are hidden from tools/list, so a call
+    // to one is treated as an unknown method.
+    let Some(meta) = tools::ALL_TOOLS.iter().find(|t| t.name == tool_name) else {
+        return Err(MCSError::MethodNotFound(tool_name.to_string()));
+    };
+    let category_enabled = if meta.write {
+        graph_write_enabled()
+    } else {
+        graph_read_enabled()
+    };
+    if !category_enabled {
         return Err(MCSError::MethodNotFound(tool_name.to_string()));
     }
 

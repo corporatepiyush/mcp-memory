@@ -92,9 +92,6 @@ pub enum Transport {
     /// Newline-delimited JSON-RPC over stdin/stdout (default; for Claude
     /// Desktop / Claude Code and other process-spawning clients).
     Stdio,
-    /// Newline-delimited JSON-RPC over a TCP socket (one message per line),
-    /// accepting many concurrent connections.
-    Tcp,
     /// MCP Streamable HTTP: POST JSON-RPC to `/mcp` (responses as JSON or, when
     /// the client `Accept`s it, an SSE stream), plus `GET /mcp` for a standalone
     /// server→client SSE stream.
@@ -109,11 +106,11 @@ pub struct Args {
     #[arg(short = 'f', long = "memory-file")]
     pub memory_file: Option<String>,
 
-    /// Transport to listen on: stdio, tcp, or http
+    /// Transport to listen on: stdio or http
     #[arg(short = 't', long = "transport", value_enum, default_value_t = Transport::Stdio)]
     pub transport: Transport,
 
-    /// Address to bind for the `tcp` and `http` transports
+    /// Address to bind for the `http` transport
     #[arg(short = 'b', long = "bind", default_value = "127.0.0.1:8080")]
     pub bind: String,
 
@@ -121,9 +118,9 @@ pub struct Args {
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
 
-    /// Bearer token required on the `tcp` (first line) and `http`
-    /// (`Authorization` header) transports. Overrides `--auth-token-file` and
-    /// the `MCP_MEMORY_AUTH_TOKEN` env var. stdio is never authenticated.
+    /// Bearer token required on the `http` (`Authorization` header) transport.
+    /// Overrides `--auth-token-file` and the `MCP_MEMORY_AUTH_TOKEN` env var.
+    /// stdio is never authenticated.
     #[arg(long = "auth-token")]
     pub auth_token: Option<String>,
 
@@ -177,46 +174,59 @@ pub struct Args {
     #[arg(long = "tls-key")]
     pub tls_key: Option<String>,
 
-    /// Enable vector / semantic search: exposes the `vector_*` and
-    /// `hybrid_search` tools backed by a usearch HNSW index. Off by default
-    /// (a pure knowledge-graph server). The `--embedding-dims` / `--vec-*` flags
-    /// only take effect when this is set.
-    #[arg(long = "vectors", default_value_t = false)]
-    pub vectors: bool,
+    // ── Tool exposure ────────────────────────────────────────────────────
+    // No tools are exposed unless explicitly enabled. Each flag turns on one
+    // category (hidden from tools/list and rejected from tools/call when its
+    // category is disabled). Use --enable-all for every category at once.
+    /// Expose ALL tool categories (overrides the individual --enable-* flags).
+    #[arg(long = "enable-all", default_value_t = false)]
+    pub enable_all: bool,
 
-    /// Enable tree-sitter code-symbol indexing: exposes the `code_index`,
-    /// `code_outline`, `code_search`, and `code_get_symbol` tools, which parse
-    /// source files and store functions/classes/methods (and their
-    /// call/define edges) in the graph. On by default (when built with the `code`
-    /// feature, which is on by default).
-    #[arg(long = "code", default_value_t = true)]
-    pub code: bool,
+    /// Enable read-only knowledge-graph tools (queries, traversal, export).
+    #[arg(long = "enable-graph-read", default_value_t = false)]
+    pub enable_graph_read: bool,
 
-    /// Embedding dimension for vector search (default: 384). Requires --vectors.
+    /// Enable knowledge-graph mutation tools (create/delete/merge/compact/upsert).
+    #[arg(long = "enable-graph-write", default_value_t = false)]
+    pub enable_graph_write: bool,
+
+    /// Enable vector / semantic search: the `vector_*` and `hybrid_search` tools
+    /// backed by a usearch index. The `--embedding-dims` / `--vec-*` flags only
+    /// take effect when this is set.
+    #[arg(long = "enable-vectors", default_value_t = false)]
+    pub enable_vectors: bool,
+
+    /// Enable tree-sitter code-symbol indexing: the `code_*` tools that parse
+    /// source files and store symbols (and call/define edges) in the graph.
+    /// Only effective when built with the `code` feature (on by default).
+    #[arg(long = "enable-code", default_value_t = false)]
+    pub enable_code: bool,
+
+    /// Embedding dimension for vector search (default: 384). Requires --enable-vectors.
     #[arg(long = "embedding-dims", default_value_t = 384)]
     pub embedding_dims: u32,
 
-    /// Distance metric for the vector index. Requires --vectors.
+    /// Distance metric for the vector index. Requires --enable-vectors.
     #[arg(long = "vec-metric", value_enum, default_value_t = VecMetric::Cos)]
     pub vec_metric: VecMetric,
 
-    /// Scalar quantization for the vector index (lower = less memory). Requires --vectors.
+    /// Scalar quantization for the vector index (lower = less memory). Requires --enable-vectors.
     #[arg(long = "vec-quantization", value_enum, default_value_t = VecQuant::F32)]
     pub vec_quantization: VecQuant,
 
-    /// HNSW graph degree `M` (higher = better recall, more memory). Requires --vectors.
+    /// HNSW graph degree `M` (higher = better recall, more memory). Requires --enable-vectors.
     #[arg(long = "vec-connectivity", default_value_t = 16)]
     pub vec_connectivity: usize,
 
-    /// HNSW `efConstruction` (higher = better index quality, slower inserts). Requires --vectors.
+    /// HNSW `efConstruction` (higher = better index quality, slower inserts). Requires --enable-vectors.
     #[arg(long = "vec-expansion-add", default_value_t = 200)]
     pub vec_expansion_add: usize,
 
-    /// HNSW `efSearch` (higher = better recall, slower queries). Requires --vectors.
+    /// HNSW `efSearch` (higher = better recall, slower queries). Requires --enable-vectors.
     #[arg(long = "vec-expansion-search", default_value_t = 50)]
     pub vec_expansion_search: usize,
 
-    /// ANN index backend: `hnsw` (default) or `ivf` (IVF-Flat). Requires --vectors.
+    /// ANN index backend: `hnsw` (default) or `ivf` (IVF-Flat). Requires --enable-vectors.
     #[arg(long = "vec-index", value_enum, default_value_t = VecIndex::Hnsw)]
     pub vec_index: VecIndex,
 
@@ -231,8 +241,30 @@ pub struct Args {
 }
 
 impl Args {
+    /// Resolve the set of enabled tool categories from the `--enable-*` flags.
+    /// `--enable-all` turns on every category; otherwise only the categories
+    /// whose individual flag is set. With no flags, the result is empty and no
+    /// tools are exposed.
+    pub fn enabled_categories(&self) -> Vec<tools::ToolCategory> {
+        use tools::ToolCategory as C;
+        if self.enable_all {
+            return C::ALL.to_vec();
+        }
+        let mut cats = Vec::new();
+        let mut push = |on: bool, cat: C| {
+            if on {
+                cats.push(cat);
+            }
+        };
+        push(self.enable_graph_read, C::GraphRead);
+        push(self.enable_graph_write, C::GraphWrite);
+        push(self.enable_vectors, C::Vectors);
+        push(self.enable_code, C::Code);
+        cats
+    }
+
     /// Build the vector index configuration from the `--embedding-dims` /
-    /// `--vec-*` / `--ivf-*` flags. Only meaningful when `--vectors` is set.
+    /// `--vec-*` / `--ivf-*` flags. Only meaningful when `--enable-vectors` is set.
     pub fn vector_config(&self) -> VectorConfig {
         VectorConfig {
             dims: self.embedding_dims,

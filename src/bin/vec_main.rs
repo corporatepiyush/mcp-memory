@@ -18,8 +18,10 @@ use mcp_memory::{Args, Transport};
 
 fn main() -> ExitCode {
     let mut args = Args::parse();
-    // This binary is the vector-enabled entry point regardless of the flag.
-    args.vectors = true;
+    // Backward-compatible alias: this binary is the "everything on" entry point.
+    // It exposes the full knowledge-graph surface plus vector search (and code
+    // indexing when built with the `code` feature), regardless of flags.
+    args.enable_all = true;
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -53,7 +55,6 @@ fn main() -> ExitCode {
         let server = MCPServer::new(config, vec_config)?;
         match transport {
             Transport::Stdio => server.run_stdio().await,
-            Transport::Tcp => server.run_tcp(&bind).await,
             Transport::Http => server.run_http(&bind).await,
         }
     });
