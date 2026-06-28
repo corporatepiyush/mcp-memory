@@ -104,6 +104,9 @@ pub struct Config {
     /// default. Only effective when built with the `code` feature. Derived from
     /// the `code` category being enabled.
     pub code_enabled: bool,
+    /// Embedding dimension for the per-project code semantic-search HNSW index
+    /// (`code_embed` / `code_semantic_search`). Default 768.
+    pub code_embedding_dims: u32,
     /// Tool categories exposed by this server. Empty (the default) means no
     /// tools are advertised or callable until enabled with `--enable-*`.
     pub enabled_categories: Vec<ToolCategory>,
@@ -216,6 +219,7 @@ impl Config {
             tls_key,
             vectors_enabled: enabled_categories.contains(&ToolCategory::Vectors),
             code_enabled: enabled_categories.contains(&ToolCategory::Code),
+            code_embedding_dims: args.code_embedding_dims,
             enabled_categories,
         })
     }
@@ -240,6 +244,7 @@ impl Default for Config {
             tls_key: None,
             vectors_enabled: false,
             code_enabled: false,
+            code_embedding_dims: 768,
             enabled_categories: Vec::new(),
         }
     }

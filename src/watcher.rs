@@ -23,7 +23,7 @@ use crate::kg::GraphHandle;
 /// `kg_arc` is the project's handle; the thread holds it to pin the canonical
 /// instance open. The watcher debounces events for 2 seconds of quiet before
 /// triggering a re-index batch.
-pub fn spawn_watcher(kg_arc: Arc<GraphHandle>, path: String, project: &str) {
+pub fn spawn_watcher(kg_arc: Arc<GraphHandle>, path: String, project: &str, snippets: bool) {
     let _ = std::thread::Builder::new()
         .name(format!("watcher-{project}"))
         .spawn(move || {
@@ -93,6 +93,7 @@ pub fn spawn_watcher(kg_arc: Arc<GraphHandle>, path: String, project: &str) {
                                 to_index,
                                 &base,
                                 false,
+                                snippets,
                             );
                         }
                     }

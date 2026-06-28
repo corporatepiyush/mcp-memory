@@ -259,12 +259,15 @@ impl MCPServer {
                 // the main memory file, so distinct memory DBs never collide.
                 let base = PathBuf::from(format!("{}.code", config.memory_file_path));
                 crate::code_registry::init(
-                    base,
+                    base.clone(),
                     config.durability,
                     config.sqlite_tuning(),
                     lru_cache,
                     config.read_pool_size,
                 );
+                // Code semantic search shares the per-project code databases: an
+                // HNSW index is opened on the same files, keyed by symbol entity id.
+                crate::code_vec_registry::init(base, config.code_embedding_dims);
             }
         }
 
@@ -679,6 +682,12 @@ fn handle_tools_call(
                 }
                 "code_watch" => {
                     code_actions::handle_code_watch(tool_args).map(HandlerResult::Value)
+                }
+                "code_embed" => {
+                    code_actions::handle_code_embed(tool_args).map(HandlerResult::Value)
+                }
+                "code_semantic_search" => {
+                    code_actions::handle_code_semantic_search(tool_args).map(HandlerResult::Value)
                 }
                 other => Err(MCSError::MethodNotFound(other.to_string())),
             };

@@ -101,6 +101,7 @@ fn symbol_row(entity: &Entity) -> Value {
         "lang": obs_val(entity, "lang"),
         "signature": obs_val(entity, "signature"),
         "doc": obs_val(entity, "doc"),
+        "snippet": obs_val(entity, "snippet"),
     })
 }
 
@@ -131,7 +132,7 @@ enum Outcome {
 /// file, so this runs on the parse thread pool. Reads use the graph's
 /// concurrent read pool; no writes happen here.
 fn parse_one(kg: &GraphHandle, path: &Path, base: &Path,
-             force: bool, total_symbols: &AtomicUsize) -> Outcome {
+             force: bool, want_snippet: bool, total_symbols: &AtomicUsize) -> Outcome {
     let Some(lang) = code::detect(path) else {
         return Outcome::Unsupported;
     };
@@ -153,7 +154,7 @@ fn parse_one(kg: &GraphHandle, path: &Path, base: &Path,
         return Outcome::Skipped;
     }
 
-    let parsed = code::parse_source(lang, &bytes);
+    let parsed = code::parse_source_opts(lang, &bytes, want_snippet);
     let mut seen: HashSet<String> = HashSet::new();
     let mut named: Vec<(Def, String)> = Vec::with_capacity(parsed.defs.len());
     for d in parsed.defs.into_iter().take(MAX_SYMBOLS_PER_FILE) {
@@ -194,6 +195,7 @@ pub fn handle_code_index(args: Option<&Value>) -> Result<Value> {
     let kg = crate::code_registry::resolve(&project)?;
     let kg = kg.as_ref();
     let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let snippets = params.get("snippets").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let root = Path::new(path);
     if !root.exists() {
@@ -205,7 +207,7 @@ pub fn handle_code_index(args: Option<&Value>) -> Result<Value> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let base = canonical_base();
     let files = code::walk(&root, code::MAX_FILE_BYTES);
-    index_paths(kg, files, &base, force)
+    index_paths(kg, files, &base, force, snippets)
 }
 
 /// The canonicalized current working directory, used as the base for
@@ -247,6 +249,7 @@ pub(crate) fn index_paths(
     mut files: Vec<std::path::PathBuf>,
     base: &Path,
     force: bool,
+    snippets: bool,
 ) -> Result<Value> {
     files.truncate(MAX_INDEX_FILES);
 
@@ -280,7 +283,7 @@ pub(crate) fn index_paths(
                         if total_symbols.load(Ordering::Relaxed) >= MAX_TOTAL_SYMBOLS {
                             continue;
                         }
-                        local.push(parse_one(kg, &files[i], base, force, &total_symbols));
+                        local.push(parse_one(kg, &files[i], base, force, snippets, &total_symbols));
                     }
                     local
                 })
@@ -344,6 +347,9 @@ pub(crate) fn index_paths(
             ];
             if let Some(doc) = &d.doc {
                 obs.push(format!("doc: {doc}"));
+            }
+            if !d.snippet.is_empty() {
+                obs.push(format!("snippet: {}", d.snippet));
             }
             ebuf.push(Entity {
                 name: q.clone(),
@@ -576,6 +582,143 @@ pub fn handle_code_get_symbol(args: Option<&Value>) -> Result<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// code_embed / code_semantic_search (HNSW ANN over code symbols)
+// ---------------------------------------------------------------------------
+
+/// Cap on items in a single `code_embed` call.
+const MAX_EMBED_ITEMS: usize = 1_000;
+
+/// Parse a JSON array of numbers into an `f32` embedding vector.
+fn parse_embedding_f32(val: &Value) -> Result<Vec<f32>> {
+    let arr = val
+        .as_array()
+        .ok_or_else(|| MCSError::InvalidParams("'embedding' must be an array of numbers".into()))?;
+    if arr.is_empty() {
+        return Err(MCSError::InvalidParams("embedding must not be empty".into()));
+    }
+    arr.iter()
+        .map(|v| {
+            v.as_f64()
+                .map(|n| n as f32)
+                .ok_or_else(|| MCSError::InvalidParams("embedding values must be numbers".into()))
+        })
+        .collect()
+}
+
+/// Attach client-supplied embeddings to indexed code symbols so they become
+/// searchable by [`handle_code_semantic_search`]. Embeddings live in the same
+/// per-project database as the symbols, in an HNSW index keyed by symbol entity.
+/// `{ project?, items: [{ name, embedding }] }` — `name` is a symbol name
+/// (fully-qualified `file::sym`, as returned by the other `code_*` tools).
+pub fn handle_code_embed(args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let project = project_of(params)?;
+    let items = params
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| MCSError::InvalidParams("'items' must be an array".into()))?;
+    if items.len() > MAX_EMBED_ITEMS {
+        return Err(MCSError::InvalidParams(format!(
+            "Too many items (max {MAX_EMBED_ITEMS})"
+        )));
+    }
+
+    let vs = crate::code_vec_registry::resolve(&project)?;
+
+    let mut upserted = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    for item in items {
+        let name = match item.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n,
+            _ => {
+                errors.push(json!({"name": item.get("name"), "error": "invalid name"}));
+                continue;
+            }
+        };
+        let emb = match item.get("embedding").map(parse_embedding_f32) {
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                errors.push(json!({"name": name, "error": e.to_string()}));
+                continue;
+            }
+            None => {
+                errors.push(json!({"name": name, "error": "missing embedding"}));
+                continue;
+            }
+        };
+        match vs.upsert_embedding(name, &emb, "code") {
+            Ok(()) => upserted += 1,
+            Err(e) => errors.push(json!({"name": name, "error": e.to_string()})),
+        }
+    }
+
+    to_json(&json!({
+        "project": project,
+        "dims": vs.dims(),
+        "upserted": upserted,
+        "failed": errors.len(),
+        "errors": errors,
+    }))
+}
+
+/// Semantic (vector) search over code symbols using the per-project HNSW index.
+/// `{ project?, embedding: [..dims], limit?, kind?, lang? }` — `embedding` is a
+/// query vector of the configured dimension (default 768). Returns the nearest
+/// symbols as location rows plus a `score` (ANN distance; smaller = closer).
+pub fn handle_code_semantic_search(args: Option<&Value>) -> Result<Value> {
+    let params = args.ok_or_else(|| MCSError::InvalidParams("Missing parameters".into()))?;
+    let project = project_of(params)?;
+    let embedding = parse_embedding_f32(
+        params
+            .get("embedding")
+            .ok_or_else(|| MCSError::InvalidParams("Missing 'embedding' parameter".into()))?,
+    )?;
+    let kind = params.get("kind").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let lang = params.get("lang").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT);
+
+    let kg = crate::code_registry::resolve(&project)?;
+    let vs = crate::code_vec_registry::resolve(&project)?;
+
+    // Over-fetch then resolve names, fetch full entities, and apply kind/lang
+    // filters — preserving the ANN distance order (ascending = closer).
+    let fetch = limit.saturating_mul(5).min(100);
+    let hits = vs.search_embeddings(&embedding, fetch)?;
+    let mut names: Vec<String> = Vec::with_capacity(hits.len());
+    let mut dist_by_name: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::with_capacity(hits.len());
+    for (id, dist) in hits {
+        if let Some(name) = vs.id_to_name().get(&id).map(|r| r.value().clone()) {
+            dist_by_name.entry(name.clone()).or_insert(dist);
+            names.push(name);
+        }
+    }
+
+    let entities = kg.batch_get_entities(&names);
+    let rows: Vec<Value> = names
+        .iter()
+        .zip(entities)
+        .filter_map(|(name, e)| e.map(|e| (name, e)))
+        .filter(|(_, e)| is_code_entity(e) && e.entity_type != "code:file")
+        .filter(|(_, e)| kind.is_none_or(|k| kind_of(e) == k))
+        .filter(|(_, e)| lang.is_none_or(|l| obs_val(e, "lang") == Some(l)))
+        .take(limit)
+        .map(|(name, e)| {
+            let mut row = symbol_row(&e);
+            row["score"] = json!(dist_by_name.get(name.as_str()).copied().unwrap_or(0.0));
+            row
+        })
+        .collect();
+
+    to_json(&json!({ "results": rows }))
+}
+
 /// Start watching a project directory for file changes and re-index on
 /// modification. Spawns a background thread that monitors the directory
 /// tree with a debounced file-watcher. The initial index runs synchronously
@@ -592,6 +735,7 @@ pub fn handle_code_watch(args: Option<&Value>) -> Result<Value> {
         .ok_or_else(|| MCSError::InvalidParams("Missing 'path' parameter".into()))?;
     let project = project_of(params)?;
     let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let snippets = params.get("snippets").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let root = std::path::PathBuf::from(path);
     if !root.exists() {
@@ -607,12 +751,13 @@ pub fn handle_code_watch(args: Option<&Value>) -> Result<Value> {
         "path": &watch_path,
         "project": project,
         "force": force,
+        "snippets": snippets,
     });
     let _ = handle_code_index(Some(&index_args))?;
 
     // Pin the canonical handle and spawn the background watcher.
     let kg_arc = crate::code_registry::resolve(&project)?;
-    crate::watcher::spawn_watcher(kg_arc, watch_path.clone(), &project);
+    crate::watcher::spawn_watcher(kg_arc, watch_path.clone(), &project, snippets);
 
     to_json(&json!({
         "status": "watching",

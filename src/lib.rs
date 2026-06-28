@@ -3,6 +3,8 @@ pub mod actions;
 pub mod code;
 #[cfg(feature = "code")]
 pub mod code_registry;
+#[cfg(feature = "code")]
+pub mod code_vec_registry;
 pub mod config;
 pub mod errors;
 pub mod http;
@@ -205,6 +207,11 @@ pub struct Args {
     /// Embedding dimension for vector search (default: 384). Requires --enable-vectors.
     #[arg(long = "embedding-dims", default_value_t = 384)]
     pub embedding_dims: u32,
+
+    /// Embedding dimension for code semantic search — the `code_embed` /
+    /// `code_semantic_search` HNSW index (default: 768). Requires --enable-code.
+    #[arg(long = "code-embedding-dims", default_value_t = 768)]
+    pub code_embedding_dims: u32,
 
     /// Distance metric for the vector index. Requires --enable-vectors.
     #[arg(long = "vec-metric", value_enum, default_value_t = VecMetric::Cos)]

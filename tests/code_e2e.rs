@@ -394,6 +394,72 @@ fn code_index_then_search_get_outline() {
 }
 
 #[test]
+fn code_index_snippets_embed_and_semantic_search() {
+    let mut c = setup();
+    let dir = c.src_dir.to_string_lossy().to_string();
+
+    // Index with snippets so symbol rows carry bounded body text to embed.
+    let idx = c.call_json(
+        "code_index",
+        serde_json::json!({ "path": dir, "project": "sem", "snippets": true }),
+    );
+    assert!(idx["symbols"].as_u64().unwrap() >= 2, "expected symbols: {idx}");
+
+    // Resolve two fully-qualified symbol names and confirm snippets are stored.
+    let qualified = |c: &mut Client, q: &str, suffix: &str| -> String {
+        let res = c.call_json("code_search", serde_json::json!({ "query": q, "project": "sem" }));
+        let row = res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"].as_str().unwrap().ends_with(suffix))
+            .unwrap_or_else(|| panic!("{suffix} not found: {res}"))
+            .clone();
+        assert!(
+            row["snippet"].as_str().unwrap_or("").contains("beta") || suffix != "::alpha",
+            "alpha snippet should include its body: {row}"
+        );
+        row["name"].as_str().unwrap().to_string()
+    };
+    let alpha = qualified(&mut c, "alpha", "::alpha");
+    let beta = qualified(&mut c, "beta", "::beta");
+
+    // Build orthogonal unit embeddings (default code dim = 768).
+    let dims = 768usize;
+    let unit = |i: usize| -> Vec<f64> {
+        let mut v = vec![0.0f64; dims];
+        v[i] = 1.0;
+        v
+    };
+
+    let embed = c.call_json(
+        "code_embed",
+        serde_json::json!({
+            "project": "sem",
+            "items": [
+                { "name": alpha, "embedding": unit(0) },
+                { "name": beta, "embedding": unit(1) },
+            ]
+        }),
+    );
+    assert_eq!(embed["upserted"], 2, "both embeddings upserted: {embed}");
+    assert_eq!(embed["dims"], 768, "default code dims: {embed}");
+
+    // A query closest to alpha's vector should rank alpha first.
+    let search = c.call_json(
+        "code_semantic_search",
+        serde_json::json!({ "project": "sem", "embedding": unit(0), "limit": 5 }),
+    );
+    let rows = search["results"].as_array().unwrap();
+    assert!(!rows.is_empty(), "semantic search returned nothing: {search}");
+    assert!(
+        rows[0]["name"].as_str().unwrap().ends_with("::alpha"),
+        "alpha should be the nearest hit: {search}"
+    );
+    assert!(rows[0]["score"].is_number(), "score present: {search}");
+}
+
+#[test]
 fn code_index_is_incremental() {
     let mut c = setup();
     let dir = c.src_dir.to_string_lossy().to_string();

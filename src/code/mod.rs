@@ -30,6 +30,10 @@ pub const MAX_WALK_FILES: usize = 200_000;
 const MAX_SIGNATURE_CHARS: usize = 512;
 const MAX_DOC_CHARS: usize = 512;
 
+/// Body snippets (the full definition text) are capped so they remain useful as
+/// embedding input without bloating the database. Opt-in per `code_index` call.
+const MAX_SNIPPET_CHARS: usize = 2_000;
+
 /// A symbol definition extracted from a file.
 #[derive(Debug, Clone)]
 pub struct Def {
@@ -44,6 +48,10 @@ pub struct Def {
     pub signature: String,
     /// First line of the associated doc comment, if any.
     pub doc: Option<String>,
+    /// Bounded full-text of the definition (body included), capped to
+    /// [`MAX_SNIPPET_CHARS`]. Used as semantic-search embedding input; only
+    /// populated when the caller requests snippets.
+    pub snippet: String,
 }
 
 /// A reference (call / type use) extracted from a file.
@@ -96,6 +104,22 @@ fn first_line(source: &[u8], start: usize) -> String {
     s
 }
 
+/// Extract the definition's full text (`source[start..end]`), trimmed and capped
+/// to [`MAX_SNIPPET_CHARS`]. Returns an empty string for an empty/invalid range.
+fn clamp_snippet(source: &[u8], start: usize, end: usize) -> String {
+    let end = end.min(source.len());
+    if start >= end {
+        return String::new();
+    }
+    let raw = String::from_utf8_lossy(&source[start..end]);
+    let trimmed = raw.trim();
+    if trimmed.chars().count() > MAX_SNIPPET_CHARS {
+        trimmed.chars().take(MAX_SNIPPET_CHARS).collect::<String>() + "…"
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn clamp_doc(doc: &str) -> Option<String> {
     let line = doc.lines().find(|l| !l.trim().is_empty())?.trim();
     if line.is_empty() {
@@ -110,8 +134,15 @@ fn clamp_doc(doc: &str) -> Option<String> {
 }
 
 /// Parse one in-memory source buffer into defs/refs. Returns an empty result
-/// for unsupported languages or unbuildable tag configs.
+/// for unsupported languages or unbuildable tag configs. Equivalent to
+/// [`parse_source_opts`] with snippets disabled.
 pub fn parse_source(lang: Lang, source: &[u8]) -> ParsedFile {
+    parse_source_opts(lang, source, false)
+}
+
+/// Like [`parse_source`], but `want_snippet` controls whether each def's bounded
+/// body text ([`Def::snippet`]) is extracted (extra allocation per symbol).
+pub fn parse_source_opts(lang: Lang, source: &[u8], want_snippet: bool) -> ParsedFile {
     let Some(config) = lang::config(lang) else {
         return ParsedFile::default();
     };
@@ -143,6 +174,11 @@ pub fn parse_source(lang: Lang, source: &[u8]) -> ParsedFile {
         let kind = config.syntax_type_name(tag.syntax_type_id).to_string();
         if tag.is_definition {
             let end_byte = tag.range.end.saturating_sub(1).max(tag.range.start);
+            let snippet = if want_snippet {
+                clamp_snippet(source, tag.range.start, tag.range.end)
+            } else {
+                String::new()
+            };
             out.defs.push(Def {
                 kind: normalize_def_kind(&kind).to_string(),
                 name,
@@ -150,6 +186,7 @@ pub fn parse_source(lang: Lang, source: &[u8]) -> ParsedFile {
                 line_end: line_of(end_byte),
                 signature: first_line(source, tag.range.start),
                 doc: tag.docs.as_deref().and_then(clamp_doc),
+                snippet,
             });
         } else {
             out.refs.push(Ref {

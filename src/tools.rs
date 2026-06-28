@@ -134,6 +134,8 @@ pub const CODE_TOOL_NAMES: &[&str] = &[
     "code_search",
     "code_get_symbol",
     "code_watch",
+    "code_embed",
+    "code_semantic_search",
 ];
 
 #[inline]

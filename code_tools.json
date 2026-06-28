@@ -1,7 +1,7 @@
 [
   {
     "name": "code_index",
-    "description": "Parse source files with tree-sitter and store their symbols (functions, classes, methods, modules, constants) as entities, plus 'defines' (file→symbol) and 'calls'/'references' (caller→callee) edges. Indexing is incremental: files whose content hash is unchanged since the last run are skipped. Run this once per repository and again after edits to keep the code map fresh (a stale map is worse than grep). Symbols are named '{relpath}::{symbol}' with type 'code:<kind>'; bodies are NOT stored — only signature + line range, so you read the exact lines when you need the code. Each project is stored in its own isolated database. Supports Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, Ruby, PHP. Honors .gitignore and skips target/node_modules/dist/build and oversized files. Call edges are most complete after indexing the whole repository root in one call.",
+    "description": "Parse source files with tree-sitter and store their symbols (functions, classes, methods, modules, constants) as entities, plus 'defines' (file→symbol) and 'calls'/'references' (caller→callee) edges. Indexing is incremental: files whose content hash is unchanged since the last run are skipped. Run this once per repository and again after edits to keep the code map fresh (a stale map is worse than grep). Symbols are named '{relpath}::{symbol}' with type 'code:<kind>'; by default bodies are NOT stored — only signature + line range, so you read the exact lines when you need the code. Pass snippets=true to additionally store each symbol's bounded body text (capped at 2000 chars), which is what you embed for code_semantic_search. Each project is stored in its own isolated database. Supports Rust, Python, JavaScript, TypeScript/TSX, Go, Java, C, C++, Ruby, PHP. Honors .gitignore and skips target/node_modules/dist/build and oversized files. Call edges are most complete after indexing the whole repository root in one call.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -16,6 +16,10 @@
         "force": {
           "type": "boolean",
           "description": "Re-parse every file even if its hash is unchanged (default false)."
+        },
+        "snippets": {
+          "type": "boolean",
+          "description": "Also store each symbol's bounded body text (capped at 2000 chars) as a 'snippet' field, for use as code_semantic_search embedding input. Default false (smaller database; signature + line range only)."
         }
       },
       "required": [
@@ -45,6 +49,10 @@
         "force": {
           "type": "boolean",
           "description": "Re-parse every file in the initial index even if unchanged (default false). Subsequent watch-triggered re-indexes only touch changed files."
+        },
+        "snippets": {
+          "type": "boolean",
+          "description": "Store bounded symbol body snippets on the initial index and on every watch-triggered re-index (default false). See code_index."
         }
       },
       "required": [
@@ -136,6 +144,84 @@
       },
       "required": [
         "name"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "code_embed",
+    "description": "Attach embedding vectors to indexed code symbols so they can be found by code_semantic_search. The server does NOT compute embeddings — you supply them: read each symbol's text (its 'snippet' from a snippets=true code_index, plus signature/doc) and embed it with your model, then upsert here in batches. Embeddings live in the same per-project database as the symbols, in an HNSW (usearch) index. All vectors must match the configured dimension (default 768, set via --code-embedding-dims). Note: re-indexing a file reassigns its symbol ids, so re-run code_embed for changed files after code_index.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Project identifier whose symbols to embed. Optional — defaults to 'default'. Must match the project used in code_index."
+        },
+        "items": {
+          "type": "array",
+          "description": "Batch of { name, embedding } objects (max 1000 per call).",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Symbol name, fully-qualified as returned by other code_* tools (e.g. 'src/kg.rs::create_entities')."
+              },
+              "embedding": {
+                "type": "array",
+                "description": "Embedding vector; length must equal the configured code embedding dimension (default 768).",
+                "items": { "type": "number" }
+              }
+            },
+            "required": ["name", "embedding"]
+          }
+        }
+      },
+      "required": [
+        "items"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "code_semantic_search",
+    "description": "Semantic (vector) search over code symbols using the per-project HNSW index built by code_embed. Supply a query embedding (same model and dimension you used in code_embed, default 768) and get back the nearest symbols as location rows (name, kind, file, line range, signature, doc, snippet) plus a 'score' (ANN distance; smaller = closer). Complements code_search (exact/FTS by name) with meaning-based matching. Requires that you have embedded symbols with code_embed first; otherwise returns no results.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "embedding": {
+          "type": "array",
+          "description": "Query embedding vector; length must equal the configured code embedding dimension (default 768).",
+          "items": { "type": "number" }
+        },
+        "kind": {
+          "type": "string",
+          "description": "Optional filter: function | method | class | module | constant."
+        },
+        "lang": {
+          "type": "string",
+          "description": "Optional language filter: rust | python | javascript | typescript | tsx | go | java | c | cpp | ruby | php."
+        },
+        "project": {
+          "type": "string",
+          "description": "Project identifier whose index to search. Optional — defaults to 'default'."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max results (default 20, max 200)."
+        }
+      },
+      "required": [
+        "embedding"
       ]
     },
     "annotations": {
