@@ -295,6 +295,29 @@ pub fn with_scratch<R>(f: impl FnOnce(&mut Vec<f32>) -> R) -> R {
     })
 }
 
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
+/// `INSERT OR REPLACE … VALUES (?,?,?,?,?),(…),…` with `rows` tuples. Full
+/// batch chunks share one SQL string, so `prepare_cached` reuses the plan.
+fn multi_row_insert_sql(rows: usize) -> String {
+    debug_assert!(rows > 0);
+    let mut sql = String::from(
+        "INSERT OR REPLACE INTO vector_embedding (entity_id, dims, blob, model, created_us) VALUES ",
+    );
+    for i in 0..rows {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,?,?,?,?)");
+    }
+    sql
+}
+
 fn serialize_embedding(emb: &[f32]) -> Vec<u8> {
     let header = BlobHeader {
         dims: emb.len() as u32,
@@ -519,15 +542,23 @@ impl VectorStore {
         self.upsert_one(&conn, entity_name, embedding, model)
     }
 
+    /// Rows per multi-row `INSERT`: 5 bind variables each, so 500 rows use
+    /// 2500 variables — comfortably under SQLite's 32766 cap — and a fixed
+    /// size lets full chunks share one cached prepared statement.
+    const BATCH_ROWS_PER_STMT: usize = 500;
+
     /// Insert or replace many embeddings under a single lock and a single
-    /// SQLite transaction — one WAL commit instead of one per item. Per-item
-    /// failures (unknown entity, wrong dims) land in that item's result slot
-    /// and do not abort the rest of the batch. If the final commit itself
-    /// fails, every item that had succeeded is reported failed; the in-memory
-    /// index may then be ahead of the DB until the next reopen (when it is
-    /// rebuilt from the DB), matching the crash semantics the single-item
-    /// path already has under async durability.
+    /// SQLite transaction, written as multi-row `INSERT OR REPLACE … VALUES
+    /// (…),(…),…` statements — one WAL commit and ~`n/500` statements instead
+    /// of `n` of each. Per-item failures (unknown entity, wrong dims) land in
+    /// that item's result slot and do not abort the rest of the batch. If a
+    /// row-write or the final commit fails, every item that had succeeded is
+    /// reported failed; the in-memory index may then be ahead of the DB until
+    /// the next reopen (when it is rebuilt from the DB), matching the crash
+    /// semantics of the single-item path under async durability.
     pub fn upsert_embeddings_batch(&self, items: &[(&str, Vec<f32>, &str)]) -> Vec<Result<()>> {
+        use rusqlite::types::Value as SqlValue;
+
         let mut conn = self.db.lock();
         let tx = match conn.transaction() {
             Ok(tx) => tx,
@@ -539,30 +570,65 @@ impl VectorStore {
                     .collect();
             }
         };
-        let mut results: Vec<Result<()>> = items
-            .iter()
-            .map(|(name, emb, model)| self.upsert_one(&tx, name, emb, model))
-            .collect();
-        if let Err(e) = tx.commit() {
-            let msg = format!("commit batch transaction: {e}");
-            for r in &mut results {
-                if r.is_ok() {
-                    *r = Err(MCSError::MemoryError(msg.clone()));
+
+        let now = now_micros();
+        let mut results: Vec<Result<()>> = Vec::with_capacity(items.len());
+        // (item index, bound row values) for items that passed validation +
+        // index insertion; only these become INSERT rows.
+        let mut ok_indices: Vec<usize> = Vec::with_capacity(items.len());
+        let mut rows: Vec<[SqlValue; 5]> = Vec::with_capacity(items.len());
+        for (i, (name, emb, model)) in items.iter().enumerate() {
+            match self.resolve_and_index(&tx, name, emb) {
+                Ok(entity_id) => {
+                    ok_indices.push(i);
+                    rows.push([
+                        SqlValue::Integer(entity_id),
+                        SqlValue::Integer(i64::from(self.dims)),
+                        SqlValue::Blob(serialize_embedding(emb)),
+                        SqlValue::Text((*model).to_string()),
+                        SqlValue::Integer(now),
+                    ]);
+                    results.push(Ok(()));
                 }
+                Err(e) => results.push(Err(e)),
+            }
+        }
+
+        let mut write_error: Option<String> = None;
+        for chunk in rows.chunks(Self::BATCH_ROWS_PER_STMT) {
+            let sql = multi_row_insert_sql(chunk.len());
+            let outcome = tx.prepare_cached(&sql).and_then(|mut stmt| {
+                stmt.execute(rusqlite::params_from_iter(
+                    chunk.iter().flat_map(|row| row.iter()),
+                ))
+            });
+            if let Err(e) = outcome {
+                write_error = Some(format!("batch insert: {e}"));
+                break;
+            }
+        }
+        if write_error.is_none() {
+            if let Err(e) = tx.commit() {
+                write_error = Some(format!("commit batch transaction: {e}"));
+            }
+        }
+        if let Some(msg) = write_error {
+            for &i in &ok_indices {
+                results[i] = Err(MCSError::MemoryError(msg.clone()));
             }
         }
         results
     }
 
-    /// The single-embedding upsert core; `conn` is either a plain connection
-    /// (implicit per-statement transaction) or an open batch transaction.
-    fn upsert_one(
+    /// Validate one embedding, resolve its entity, and insert it into the ANN
+    /// index (growing capacity in chunks) — everything an upsert does except
+    /// the SQLite row write. Returns the entity id to write.
+    fn resolve_and_index(
         &self,
         conn: &Connection,
         entity_name: &str,
         embedding: &[f32],
-        model: &str,
-    ) -> Result<()> {
+    ) -> Result<EntityId> {
         if embedding.len() != self.dims as usize {
             return Err(MCSError::InvalidParams(format!(
                 "Embedding dimension mismatch: got {}, expected {}",
@@ -593,23 +659,30 @@ impl VectorStore {
             .insert(entity_name.to_string(), entity_id);
         self.id_to_name.insert(entity_id, entity_name.to_string());
 
-        let blob = serialize_embedding(embedding);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64;
+        if !existed {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(entity_id)
+    }
 
+    /// The single-embedding upsert core; `conn` is either a plain connection
+    /// (implicit per-statement transaction) or an open batch transaction.
+    fn upsert_one(
+        &self,
+        conn: &Connection,
+        entity_name: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        let entity_id = self.resolve_and_index(conn, entity_name, embedding)?;
+        let blob = serialize_embedding(embedding);
         let mut stmt = conn
             .prepare_cached(
                 "INSERT OR REPLACE INTO vector_embedding (entity_id, dims, blob, model, created_us) VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(sqlite_err)?;
-        stmt.execute(params![entity_id, self.dims, blob, model, now])
+        stmt.execute(params![entity_id, self.dims, blob, model, now_micros()])
             .map_err(sqlite_err)?;
-
-        if !existed {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
         Ok(())
     }
 
@@ -1487,6 +1560,41 @@ mod tests {
 
         let results = env.vs.search_embeddings(&make_embedding(8, 0.9), 10).unwrap();
         assert_eq!(results.len(), 5, "all batch rows must be searchable");
+    }
+
+    #[test]
+    fn test_batch_upsert_crosses_multi_row_statement_chunks() {
+        // > BATCH_ROWS_PER_STMT rows: two full multi-row INSERTs plus a
+        // remainder, all in one transaction; every row must land and reload.
+        let n = VectorStore::BATCH_ROWS_PER_STMT * 2 + 7;
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("chunks.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let cfg = VectorConfig::new(8);
+        let names: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+        {
+            let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
+            let entities: Vec<Entity> = names
+                .iter()
+                .map(|name| Entity {
+                    name: name.clone(),
+                    entity_type: "t".into(),
+                    observations: vec![],
+                })
+                .collect();
+            kg.create_entities(&entities).unwrap();
+            let items: Vec<(&str, Vec<f32>, &str)> = names
+                .iter()
+                .map(|nm| (nm.as_str(), make_embedding(8, 0.5), "m"))
+                .collect();
+            let results = vs.upsert_embeddings_batch(&items);
+            assert_eq!(results.len(), n);
+            assert!(results.iter().all(Result::is_ok), "all rows must succeed");
+            assert_eq!(vs.count(), n);
+        }
+        let vs2 = VectorStore::with_config(&db_path, &cfg).unwrap();
+        assert_eq!(vs2.count(), n, "all chunked rows must be durably committed");
     }
 
     #[test]
