@@ -58,7 +58,7 @@ impl SplitMix64 {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1487,8 +1487,8 @@ mod tests {
             sum += g;
             sum2 += g * g;
         }
-        let mean = sum / n as f64;
-        let var = sum2 / n as f64 - mean * mean;
+        let mean = sum / f64::from(n);
+        let var = sum2 / f64::from(n) - mean * mean;
         assert!(mean.abs() < 0.02, "gaussian mean {mean}");
         assert!((var - 1.0).abs() < 0.03, "gaussian variance {var}");
     }
@@ -1744,10 +1744,10 @@ mod tests {
     #[test]
     fn mse_zero_vector_roundtrips_to_zero() {
         let q = TurboQuantMse::new(16, 3, SEED);
-        let code = q.encode(&vec![0.0; 16]);
+        let code = q.encode(&[0.0; 16]);
         assert_eq!(code.norm, 0.0);
         assert!(q.decode(&code).iter().all(|&v| v == 0.0));
-        let prep = q.prepare_query(&vec![1.0; 16]);
+        let prep = q.prepare_query(&[1.0; 16]);
         assert_eq!(q.dot(&prep, &code), 0.0);
     }
 
@@ -1862,11 +1862,11 @@ mod tests {
     #[test]
     fn prod_zero_vector_roundtrips_to_zero() {
         let q = TurboQuantProd::new(24, 3, SEED);
-        let code = q.encode(&vec![0.0; 24]);
+        let code = q.encode(&[0.0; 24]);
         assert_eq!(code.norm, 0.0);
         assert_eq!(code.residual_norm, 0.0);
         assert!(q.decode(&code).iter().all(|&v| v == 0.0));
-        assert_eq!(q.dot(&q.prepare_query(&vec![1.0; 24]), &code), 0.0);
+        assert_eq!(q.dot(&q.prepare_query(&[1.0; 24]), &code), 0.0);
     }
 
     #[test]

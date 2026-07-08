@@ -16,7 +16,7 @@ use mcp_memory::turboquant::{
 struct Rng(u64);
 
 impl Rng {
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -89,7 +89,7 @@ fn theorem1_mse_distortion_matches_theory() {
                 .map(|(a, b)| f64::from(a - b) * f64::from(a - b))
                 .sum::<f64>();
         }
-        let d_mse = total / trials as f64;
+        let d_mse = total / f64::from(trials);
         let optimal = gaussian_quantizer_mse(&lloyd_max_gaussian(bits));
         let shannon = 0.25f64.powi(bits as i32);
         assert!(
@@ -122,7 +122,7 @@ fn theorem1_within_constant_factor_of_lower_bound() {
                 .map(|(a, b)| f64::from(a - b) * f64::from(a - b))
                 .sum::<f64>();
         }
-        let ratio = (total / trials as f64) / 0.25f64.powi(bits as i32);
+        let ratio = (total / f64::from(trials)) / 0.25f64.powi(bits as i32);
         let bound = 3.0f64.sqrt() * std::f64::consts::PI / 2.0;
         assert!(
             ratio < bound * 1.1,

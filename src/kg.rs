@@ -2919,7 +2919,7 @@ mod tests {
 
         let merged = kg.merge_entities("source", "target").unwrap();
         assert_eq!(merged.name, "target");
-        assert_eq!(kg.get_entity("source").unwrap().is_none(), true);
+        assert!(kg.get_entity("source").unwrap().is_none());
     }
 
     #[test]
@@ -3047,9 +3047,9 @@ mod tests {
             entity_type: "t".into(),
             observations: vec!["obs".into()],
         };
-        let first = kg.create_entities(&[e.clone()]).unwrap();
+        let first = kg.create_entities(std::slice::from_ref(&e)).unwrap();
         assert_eq!(first.len(), 1);
-        let second = kg.create_entities(&[e.clone()]).unwrap();
+        let second = kg.create_entities(&[e]).unwrap();
         assert!(second.is_empty());
         assert_eq!(kg.get_entity_count().unwrap(), 1);
     }
@@ -3169,10 +3169,10 @@ mod tests {
         let r = Relation {
             from: "A".into(), to: "B".into(), relation_type: "e".into(),
         };
-        let first = kg.create_relations(&[r.clone()]).unwrap();
+        let first = kg.create_relations(std::slice::from_ref(&r)).unwrap();
         assert_eq!(first.len(), 1);
 
-        let second = kg.create_relations(&[r.clone()]).unwrap();
+        let second = kg.create_relations(&[r]).unwrap();
         assert!(second.is_empty());
         assert_eq!(kg.get_relation_count().unwrap(), 1);
     }
@@ -3227,14 +3227,14 @@ mod tests {
         let r = Relation {
             from: "A".into(), to: "B".into(), relation_type: "e".into(),
         };
-        kg.create_relations(&[r.clone()]).unwrap();
+        kg.create_relations(std::slice::from_ref(&r)).unwrap();
         assert_eq!(kg.get_relation_count().unwrap(), 1);
 
-        kg.delete_relations(&[r.clone()]).unwrap();
+        kg.delete_relations(std::slice::from_ref(&r)).unwrap();
         assert_eq!(kg.get_relation_count().unwrap(), 0);
 
         // Recreate after delete
-        let re = kg.create_relations(&[r.clone()]).unwrap();
+        let re = kg.create_relations(&[r]).unwrap();
         assert_eq!(re.len(), 1);
         assert_eq!(kg.get_relation_count().unwrap(), 1);
     }
@@ -3256,7 +3256,7 @@ mod tests {
 
         // Deleting entity A should also delete the relation
         kg.delete_entities(&["A".into()]).unwrap();
-        assert_eq!(kg.get_entity("A").unwrap().is_none(), true);
+        assert!(kg.get_entity("A").unwrap().is_none());
         assert_eq!(kg.get_relation_count().unwrap(), 0);
     }
 

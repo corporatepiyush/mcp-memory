@@ -42,7 +42,7 @@ struct SearchGate {
 }
 
 impl SearchGate {
-    fn new(n: usize) -> Self {
+    const fn new(n: usize) -> Self {
         Self {
             permits: Mutex::new(n),
             cv: parking_lot::Condvar::new(),
@@ -607,11 +607,10 @@ impl VectorStore {
                 break;
             }
         }
-        if write_error.is_none() {
-            if let Err(e) = tx.commit() {
+        if write_error.is_none()
+            && let Err(e) = tx.commit() {
                 write_error = Some(format!("commit batch transaction: {e}"));
             }
-        }
         if let Some(msg) = write_error {
             for &i in &ok_indices {
                 results[i] = Err(MCSError::MemoryError(msg.clone()));
