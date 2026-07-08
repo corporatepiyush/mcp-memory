@@ -128,6 +128,11 @@ plain and later serve it with vectors enabled.
 | stdio | `--transport stdio` | Newline-delimited JSON-RPC over stdin/stdout (default; for Claude Desktop / Claude Code) |
 | http | `--transport http --bind 0.0.0.0:8080` | MCP Streamable HTTP (POST/GET `/mcp`, SSE) |
 
+The stdio transport dispatches up to `--stdio-concurrency` requests in parallel (default 8), so
+clients that pipeline requests get concurrent execution; responses are correlated by JSON-RPC id
+and may arrive in completion order. Set `--stdio-concurrency 1` for strict request/response
+ordering (e.g. when pipelining order-dependent writes without awaiting each response).
+
 ### Authentication
 
 The `http` transport accepts an optional bearer token (stdio is never authenticated). Set it with
@@ -215,15 +220,17 @@ startup.
 - **Hybrid search** — `hybrid_search` runs vector and FTS5 search in parallel, fuses them with
   Reciprocal Rank Fusion, and optionally boosts by graph centrality.
 
-### HNSW vs IVF-Flat
+### HNSW vs IVF-Flat vs TurboQuant
 
 | Backend | When to use | Notes |
 |---|---|---|
 | `hnsw` *(default)* | Best recall/latency for most workloads | usearch graph index; `f16`/`bf16`/`i8` quantization |
 | `ivf` | Large, batch-ingested, periodically-rebuilt corpora | k-means partitioned; cheaper to build, lighter memory. **Exact until trained**, so results are always correct |
+| `turbo` | Memory-bound corpora; online ingestion | [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research): data-oblivious quantization to `--tq-bits` bits/coordinate (~8× smaller than `f32` at 4 bits) with **unbiased** inner-product estimates and near-optimal distortion. Zero training/indexing time; brute-force scan over compact codes. Requires `--embedding-dims` 384–1536 |
 
 The IVF index trains automatically when a populated database is opened; after a large batch
-ingestion into a fresh database, call `vector_reindex` to keep recall high (no-op for HNSW).
+ingestion into a fresh database, call `vector_reindex` to keep recall high (no-op for HNSW and
+TurboQuant — the latter is data-oblivious, so there is never anything to train).
 
 ### Tuning
 
@@ -232,7 +239,7 @@ All require `--enable-vectors`:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--embedding-dims` | `384` | Vector dimension; all embeddings must match |
-| `--vec-index` | `hnsw` | ANN backend: `hnsw` or `ivf` |
+| `--vec-index` | `hnsw` | ANN backend: `hnsw`, `ivf`, or `turbo` |
 | `--vec-metric` | `cos` | Distance metric: `cos`, `ip` (dot product), or `l2sq` |
 | `--vec-quantization` | `f32` | HNSW scalar storage: `f32`, `f16`, `bf16`, or `i8` |
 | `--vec-connectivity` | `16` | HNSW graph degree `M` (higher = better recall, more memory) |
@@ -240,6 +247,7 @@ All require `--enable-vectors`:
 | `--vec-expansion-search` | `50` | HNSW `efSearch` (higher = better recall, slower queries) |
 | `--ivf-nlist` | `256` | IVF number of Voronoi cells / centroids |
 | `--ivf-nprobe` | `8` | IVF cells probed per query (higher = better recall, slower) |
+| `--tq-bits` | `4` | TurboQuant bits per coordinate, 1–8 (higher = better recall, more memory). TurboQuant requires `--embedding-dims` in 384–1536 |
 
 ```sh
 # HNSW with half-precision storage
@@ -250,6 +258,10 @@ mcp-memory --enable-vectors --transport http --bind 0.0.0.0:8080 \
 # IVF-Flat for a large corpus
 mcp-memory --enable-vectors --embedding-dims 768 \
   --vec-index ivf --ivf-nlist 1024 --ivf-nprobe 16
+
+# TurboQuant: ~8x memory reduction with unbiased inner-product scoring
+mcp-memory --enable-vectors --embedding-dims 768 \
+  --vec-index turbo --tq-bits 4
 ```
 
 ## MCP compliance

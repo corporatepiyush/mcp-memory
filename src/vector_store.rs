@@ -14,30 +14,92 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::errors::{MCSError, Result};
 use crate::ivf::{IvfFlatIndex, Metric as IvfMetric};
 use crate::kg::push_json_str;
+use crate::turboquant::TurboQuantIndex;
 
 pub type EntityId = i64;
 
-/// Unifies the two ANN backends behind one small surface so [`VectorStore`] does
-/// not branch on the index kind at every call site. Distances follow usearch's
-/// convention (smaller = closer) for both backends.
-enum AnnIndex {
-    Hnsw(Arc<Index>),
-    Ivf(Box<IvfFlatIndex>),
+/// Number of concurrent searcher threads reserved inside the usearch HNSW
+/// index. usearch hard-fails a search ("Reserve capacity ahead of searches!")
+/// when more threads query than were reserved, so [`SearchGate`] caps
+/// concurrent searches at exactly this number — correctness never depends on
+/// how many transport threads (stdio pipeline, HTTP handlers) pile in.
+fn search_thread_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .saturating_mul(2)
+            .clamp(8, 64)
+    })
 }
 
-impl AnnIndex {
-    /// Current allocated capacity (HNSW) or live count (IVF; it grows on demand).
-    fn capacity(&self) -> usize {
-        match self {
-            AnnIndex::Hnsw(i) => i.capacity(),
-            AnnIndex::Ivf(i) => i.len(),
+/// Counting gate bounding concurrent HNSW searches to the reserved thread
+/// capacity. Cheap: uncontended acquire is one mutex lock.
+struct SearchGate {
+    permits: Mutex<usize>,
+    cv: parking_lot::Condvar,
+}
+
+impl SearchGate {
+    fn new(n: usize) -> Self {
+        Self {
+            permits: Mutex::new(n),
+            cv: parking_lot::Condvar::new(),
         }
     }
 
-    /// Ensure room for `target` vectors. No-op for IVF (a growable `Vec`).
+    fn run<T>(&self, f: impl FnOnce() -> T) -> T {
+        let mut p = self.permits.lock();
+        while *p == 0 {
+            self.cv.wait(&mut p);
+        }
+        *p -= 1;
+        drop(p);
+        // Release on all exits, including a panicking `f`.
+        struct Release<'a>(&'a SearchGate);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                *self.0.permits.lock() += 1;
+                self.0.cv.notify_one();
+            }
+        }
+        let _release = Release(self);
+        f()
+    }
+}
+
+/// Unifies the ANN backends behind one small surface so [`VectorStore`] does
+/// not branch on the index kind at every call site. Distances follow usearch's
+/// convention (smaller = closer) for all backends.
+enum AnnIndex {
+    Hnsw {
+        index: Arc<Index>,
+        gate: SearchGate,
+    },
+    Ivf(Box<IvfFlatIndex>),
+    Turbo(Box<TurboQuantIndex>),
+}
+
+impl AnnIndex {
+    /// Current allocated capacity (HNSW) or live count (IVF/TurboQuant; both
+    /// grow on demand).
+    fn capacity(&self) -> usize {
+        match self {
+            AnnIndex::Hnsw { index, .. } => index.capacity(),
+            AnnIndex::Ivf(i) => i.len(),
+            AnnIndex::Turbo(i) => i.len(),
+        }
+    }
+
+    /// Ensure room for `target` vectors. No-op for IVF/TurboQuant (growable
+    /// `Vec`s). Always reserves [`search_thread_cap`] searcher threads —
+    /// reserving 1 (as this once did) makes usearch reject any concurrent
+    /// search with "Reserve capacity ahead of searches!".
     fn reserve(&self, target: usize) -> Result<()> {
-        if let AnnIndex::Hnsw(i) = self {
-            i.reserve_capacity_and_threads(target, 1)
+        if let AnnIndex::Hnsw { index, .. } = self {
+            index
+                .reserve_capacity_and_threads(target, search_thread_cap())
                 .map_err(|e| MCSError::MemoryError(format!("usearch reserve: {e}")))?;
         }
         Ok(())
@@ -46,10 +108,14 @@ impl AnnIndex {
     /// Add `id`/`vector` to the index (caller has already removed any prior entry).
     fn add(&self, id: u64, vector: &[f32]) -> Result<()> {
         match self {
-            AnnIndex::Hnsw(i) => i
+            AnnIndex::Hnsw { index, .. } => index
                 .add(id, vector)
                 .map_err(|e| MCSError::MemoryError(format!("usearch add: {e}"))),
             AnnIndex::Ivf(i) => i
+                .upsert(id, vector)
+                .map(|_| ())
+                .map_err(MCSError::MemoryError),
+            AnnIndex::Turbo(i) => i
                 .upsert(id, vector)
                 .map(|_| ())
                 .map_err(MCSError::MemoryError),
@@ -59,29 +125,32 @@ impl AnnIndex {
     /// Remove `id`; returns whether it existed.
     fn remove(&self, id: u64) -> Result<bool> {
         match self {
-            AnnIndex::Hnsw(i) => i
+            AnnIndex::Hnsw { index, .. } => index
                 .remove(id)
                 .map(|n| n > 0)
                 .map_err(|e| MCSError::MemoryError(format!("usearch remove: {e}"))),
             AnnIndex::Ivf(i) => Ok(i.remove(id)),
+            AnnIndex::Turbo(i) => Ok(i.remove(id)),
         }
     }
 
     /// Nearest `top_k` ids with distances (ascending). `nprobe` applies to IVF only.
     fn search(&self, query: &[f32], top_k: usize, nprobe: Option<usize>) -> Result<Vec<(u64, f32)>> {
         match self {
-            AnnIndex::Hnsw(i) => {
-                let m = i
+            AnnIndex::Hnsw { index, gate } => gate.run(|| {
+                let m = index
                     .search(query, top_k)
                     .map_err(|e| MCSError::MemoryError(format!("usearch search: {e}")))?;
                 let cap = m.keys.len().min(m.distances.len());
                 Ok((0..cap).map(|j| (m.keys[j], m.distances[j])).collect())
-            }
+            }),
             AnnIndex::Ivf(i) => i.search(query, top_k, nprobe).map_err(MCSError::MemoryError),
+            AnnIndex::Turbo(i) => i.search(query, top_k).map_err(MCSError::MemoryError),
         }
     }
 
-    /// (Re)train the IVF centroids. No-op for HNSW.
+    /// (Re)train the IVF centroids. No-op for HNSW and TurboQuant (the latter
+    /// is data-oblivious — there is nothing to train).
     fn train(&self) -> Result<()> {
         if let AnnIndex::Ivf(i) = self {
             i.train().map_err(MCSError::MemoryError)?;
@@ -91,29 +160,33 @@ impl AnnIndex {
 
     const fn kind(&self) -> IndexKind {
         match self {
-            AnnIndex::Hnsw(_) => IndexKind::Hnsw,
+            AnnIndex::Hnsw { .. } => IndexKind::Hnsw,
             AnnIndex::Ivf(_) => IndexKind::Ivf,
+            AnnIndex::Turbo(_) => IndexKind::TurboQuant,
         }
     }
 
     fn memory_bytes(&self) -> usize {
         match self {
-            AnnIndex::Hnsw(i) => i.memory_usage(),
+            AnnIndex::Hnsw { index, .. } => index.memory_usage(),
             AnnIndex::Ivf(i) => i.memory_bytes(),
+            AnnIndex::Turbo(i) => i.memory_bytes(),
         }
     }
 
-    /// (graph_bytes, vectors_bytes). IVF has no graph, so its graph component is 0.
+    /// (graph_bytes, vectors_bytes). IVF and TurboQuant have no graph, so their
+    /// graph component is 0.
     fn memory_breakdown(&self) -> (usize, usize) {
         match self {
-            AnnIndex::Hnsw(i) => {
-                let s = i.memory_stats();
+            AnnIndex::Hnsw { index, .. } => {
+                let s = index.memory_stats();
                 (
                     s.graph_allocated + s.graph_reserved,
                     s.vectors_allocated + s.vectors_reserved,
                 )
             }
             AnnIndex::Ivf(i) => (0, i.memory_bytes()),
+            AnnIndex::Turbo(i) => (0, i.memory_bytes()),
         }
     }
 }
@@ -134,6 +207,11 @@ pub enum IndexKind {
     /// and lighter in memory; suits large, batch-ingested, periodically-rebuilt
     /// corpora. Exact (brute-force) until trained.
     Ivf,
+    /// TurboQuant (arXiv:2504.19874): data-oblivious per-coordinate quantization
+    /// with unbiased inner-product estimates. Stores only `tq_bits`-per-coordinate
+    /// codes (plus two norms), needs zero training, and scans codes exhaustively
+    /// with asymmetric distance estimation.
+    TurboQuant,
 }
 
 /// Tunable parameters for the vector index. Built from CLI flags;
@@ -159,6 +237,8 @@ pub struct VectorConfig {
     pub ivf_nlist: usize,
     /// IVF default cells probed per query. IVF only.
     pub ivf_nprobe: usize,
+    /// TurboQuant bits per coordinate (1-8). TurboQuant only.
+    pub tq_bits: u32,
 }
 
 impl VectorConfig {
@@ -174,6 +254,7 @@ impl VectorConfig {
             expansion_search: 50,
             ivf_nlist: 256,
             ivf_nprobe: 8,
+            tq_bits: 4,
         }
     }
 }
@@ -277,7 +358,15 @@ impl VectorStore {
                 };
                 let index = Index::new(&index_opts)
                     .map_err(|e| MCSError::MemoryError(format!("usearch init: {e}")))?;
-                AnnIndex::Hnsw(Arc::new(index))
+                // Reserve searcher threads up front so concurrent searches on
+                // a store that never inserted (or hasn't grown yet) also work.
+                index
+                    .reserve_capacity_and_threads(1024, search_thread_cap())
+                    .map_err(|e| MCSError::MemoryError(format!("usearch reserve: {e}")))?;
+                AnnIndex::Hnsw {
+                    index: Arc::new(index),
+                    gate: SearchGate::new(search_thread_cap()),
+                }
             }
             IndexKind::Ivf => AnnIndex::Ivf(Box::new(IvfFlatIndex::new(
                 dims as usize,
@@ -285,6 +374,27 @@ impl VectorStore {
                 cfg.ivf_nlist,
                 cfg.ivf_nprobe,
             ))),
+            IndexKind::TurboQuant => {
+                // The estimator's distortion guarantees scale as 1/d (weak at
+                // low dimension) and the D×D projection grows quadratically
+                // (dims pad to the next power of two: 1536 → 2048 → 16 MiB),
+                // so the backend is gated to the embedding sizes it is
+                // designed for.
+                if !(384..=1536).contains(&dims) {
+                    return Err(MCSError::MemoryError(format!(
+                        "TurboQuant requires --embedding-dims between 384 and 1536, got {dims}"
+                    )));
+                }
+                // Fixed seed: codes are rebuilt from the SQLite blobs on every
+                // open, but a stable seed keeps searches reproducible across
+                // restarts.
+                AnnIndex::Turbo(Box::new(TurboQuantIndex::new(
+                    dims as usize,
+                    IvfMetric::from_usearch(cfg.metric),
+                    cfg.tq_bits,
+                    0x7042_9042_5045_5254, // "TURBOQUANT"-flavored constant
+                )))
+            }
         };
 
         let name_to_id = Arc::new(DashMap::new());
@@ -405,6 +515,54 @@ impl VectorStore {
     }
 
     pub fn upsert_embedding(&self, entity_name: &str, embedding: &[f32], model: &str) -> Result<()> {
+        let conn = self.db.lock();
+        self.upsert_one(&conn, entity_name, embedding, model)
+    }
+
+    /// Insert or replace many embeddings under a single lock and a single
+    /// SQLite transaction — one WAL commit instead of one per item. Per-item
+    /// failures (unknown entity, wrong dims) land in that item's result slot
+    /// and do not abort the rest of the batch. If the final commit itself
+    /// fails, every item that had succeeded is reported failed; the in-memory
+    /// index may then be ahead of the DB until the next reopen (when it is
+    /// rebuilt from the DB), matching the crash semantics the single-item
+    /// path already has under async durability.
+    pub fn upsert_embeddings_batch(&self, items: &[(&str, Vec<f32>, &str)]) -> Vec<Result<()>> {
+        let mut conn = self.db.lock();
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                let msg = format!("begin batch transaction: {e}");
+                return items
+                    .iter()
+                    .map(|_| Err(MCSError::MemoryError(msg.clone())))
+                    .collect();
+            }
+        };
+        let mut results: Vec<Result<()>> = items
+            .iter()
+            .map(|(name, emb, model)| self.upsert_one(&tx, name, emb, model))
+            .collect();
+        if let Err(e) = tx.commit() {
+            let msg = format!("commit batch transaction: {e}");
+            for r in &mut results {
+                if r.is_ok() {
+                    *r = Err(MCSError::MemoryError(msg.clone()));
+                }
+            }
+        }
+        results
+    }
+
+    /// The single-embedding upsert core; `conn` is either a plain connection
+    /// (implicit per-statement transaction) or an open batch transaction.
+    fn upsert_one(
+        &self,
+        conn: &Connection,
+        entity_name: &str,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
         if embedding.len() != self.dims as usize {
             return Err(MCSError::InvalidParams(format!(
                 "Embedding dimension mismatch: got {}, expected {}",
@@ -413,9 +571,8 @@ impl VectorStore {
             )));
         }
 
-        let conn = self.db.lock();
         let entity = self
-            .get_entity_id_and_name(&conn, entity_name)?
+            .get_entity_id_and_name(conn, entity_name)?
             .ok_or_else(|| {
                 MCSError::InvalidParams(format!("Entity '{entity_name}' not found in KG"))
             })?;
@@ -442,11 +599,13 @@ impl VectorStore {
             .unwrap_or_default()
             .as_micros() as i64;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO vector_embedding (entity_id, dims, blob, model, created_us) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![entity_id, self.dims, blob, model, now],
-        )
-        .map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO vector_embedding (entity_id, dims, blob, model, created_us) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(sqlite_err)?;
+        stmt.execute(params![entity_id, self.dims, blob, model, now])
+            .map_err(sqlite_err)?;
 
         if !existed {
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -887,6 +1046,22 @@ mod tests {
         }
     }
 
+    fn setup_turbo(dims: u32, bits: u32) -> TestEnv {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let mut cfg = VectorConfig::new(dims);
+        cfg.index_kind = IndexKind::TurboQuant;
+        cfg.tq_bits = bits;
+        let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
+        TestEnv {
+            kg,
+            vs,
+            _dir: dir,
+        }
+    }
+
     fn create_test_entity(kg: &GraphHandle, name: &str, etype: &str) {
         kg.create_entities(&[Entity {
             name: name.into(),
@@ -1198,6 +1373,215 @@ mod tests {
         // The exact match (e0 == all-zeros) should be the nearest.
         let top = vs2.id_to_name.get(&results[0].0).map(|r| r.value().clone());
         assert_eq!(top.as_deref(), Some("e0"));
+    }
+
+    // ── TurboQuant backend (via VectorStore) ──────────────────────────────
+
+    #[test]
+    fn test_turbo_store_upsert_search_delete() {
+        let env = setup_turbo(384, 4);
+        assert_eq!(env.vs.index_kind(), IndexKind::TurboQuant);
+        create_test_entity(&env.kg, "alice", "person");
+        create_test_entity(&env.kg, "bob", "person");
+        // Distinct directions (the cosine metric ignores pure magnitude, so
+        // the constant `make_embedding` vectors would tie).
+        let mut emb_a = make_embedding(384, 0.1);
+        emb_a[0] = 1.0;
+        let mut emb_b = make_embedding(384, 0.1);
+        emb_b[383] = 1.0;
+        env.vs.upsert_embedding("alice", &emb_a, "m").unwrap();
+        env.vs.upsert_embedding("bob", &emb_b, "m").unwrap();
+        assert_eq!(env.vs.count(), 2);
+
+        let results = env.vs.search_embeddings(&emb_a, 10).unwrap();
+        assert_eq!(results.len(), 2);
+        let top_name = env.vs.id_to_name.get(&results[0].0).map(|r| r.value().clone());
+        assert_eq!(top_name.as_deref(), Some("alice"));
+        assert!(results[0].1 < results[1].1);
+
+        assert!(env.vs.delete_embedding("alice").unwrap());
+        assert_eq!(env.vs.count(), 1);
+        let results = env.vs.search_embeddings(&emb_a, 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_turbo_store_replace_and_memory_accounting() {
+        let env = setup_turbo(384, 2);
+        create_test_entity(&env.kg, "alice", "person");
+        env.vs.upsert_embedding("alice", &make_embedding(384, 1.0), "").unwrap();
+        env.vs.upsert_embedding("alice", &make_embedding(384, 0.5), "").unwrap();
+        assert_eq!(env.vs.count(), 1);
+        // Codes-only backend: memory is reported, no graph component.
+        assert!(env.vs.index_memory_bytes() > 0);
+        let (graph_bytes, vec_bytes) = env.vs.index_memory_breakdown();
+        assert_eq!(graph_bytes, 0);
+        assert!(vec_bytes > 0);
+        // reindex is a no-op for the data-oblivious backend.
+        env.vs.reindex().unwrap();
+        assert_eq!(env.vs.count(), 1);
+    }
+
+    #[test]
+    fn test_hnsw_concurrent_searches_all_succeed() {
+        // Regression: reserve used threads=1, so any two concurrent searches
+        // made usearch fail with "Reserve capacity ahead of searches!". All
+        // concurrent searches must now succeed with correct top-1 results.
+        use std::sync::Arc as StdArc;
+        let env = setup(8);
+        let n = 64;
+        for i in 0..n {
+            create_test_entity(&env.kg, &format!("c{i}"), "t");
+            let mut e = make_embedding(8, 0.05);
+            e[i % 8] = 1.0 + (i / 8) as f32 * 0.1;
+            env.vs.upsert_embedding(&format!("c{i}"), &e, "m").unwrap();
+        }
+        let vs = StdArc::new(env.vs);
+        let mut handles = Vec::new();
+        for t in 0..32u64 {
+            let vs = StdArc::clone(&vs);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20usize {
+                    let idx = ((t as usize) * 20 + i) % 64;
+                    let mut q = make_embedding(8, 0.05);
+                    q[idx % 8] = 1.0 + (idx / 8) as f32 * 0.1;
+                    let r = vs
+                        .search_embeddings(&q, 1)
+                        .expect("concurrent search must not fail");
+                    assert!(!r.is_empty(), "search returned nothing");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_batch_upsert_single_transaction() {
+        let env = setup(8);
+        for i in 0..5 {
+            create_test_entity(&env.kg, &format!("b{i}"), "t");
+        }
+        // Mixed batch: 5 valid, one unknown entity, one wrong dims.
+        let mut items: Vec<(&str, Vec<f32>, &str)> = Vec::new();
+        let names: Vec<String> = (0..5).map(|i| format!("b{i}")).collect();
+        for name in &names {
+            items.push((name.as_str(), make_embedding(8, 0.5), "m"));
+        }
+        items.push(("missing-entity", make_embedding(8, 0.5), "m"));
+        items.push(("b0", make_embedding(4, 0.5), "m"));
+
+        let results = env.vs.upsert_embeddings_batch(&items);
+        assert_eq!(results.len(), 7);
+        assert!(results[..5].iter().all(Result::is_ok), "valid items must succeed");
+        assert!(results[5].is_err(), "unknown entity must fail its slot");
+        assert!(results[6].is_err(), "dim mismatch must fail its slot");
+        assert_eq!(env.vs.count(), 5, "count reflects only successful items");
+
+        // Batch replaces existing rows without inflating the count.
+        let again: Vec<(&str, Vec<f32>, &str)> =
+            names.iter().map(|n| (n.as_str(), make_embedding(8, 0.9), "m2")).collect();
+        assert!(env.vs.upsert_embeddings_batch(&again).iter().all(Result::is_ok));
+        assert_eq!(env.vs.count(), 5);
+
+        let results = env.vs.search_embeddings(&make_embedding(8, 0.9), 10).unwrap();
+        assert_eq!(results.len(), 5, "all batch rows must be searchable");
+    }
+
+    #[test]
+    fn test_batch_upsert_persists_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("batch.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let cfg = VectorConfig::new(8);
+        {
+            let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
+            for i in 0..20 {
+                create_test_entity(&kg, &format!("p{i}"), "t");
+            }
+            let names: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+            let items: Vec<(&str, Vec<f32>, &str)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let mut e = make_embedding(8, 0.1);
+                    e[i % 8] = 1.0;
+                    (n.as_str(), e, "m")
+                })
+                .collect();
+            assert!(vs.upsert_embeddings_batch(&items).iter().all(Result::is_ok));
+            assert_eq!(vs.count(), 20);
+        }
+        // The transaction must be durably committed: everything reloads.
+        let vs2 = VectorStore::with_config(&db_path, &cfg).unwrap();
+        assert_eq!(vs2.count(), 20, "batch rows must survive reopen");
+    }
+
+    #[test]
+    fn test_batch_upsert_empty_is_noop() {
+        let env = setup(4);
+        assert!(env.vs.upsert_embeddings_batch(&[]).is_empty());
+        assert_eq!(env.vs.count(), 0);
+    }
+
+    #[test]
+    fn test_turbo_rejects_out_of_range_dims() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for dims in [8u32, 383, 1537, 4096] {
+            let mut cfg = VectorConfig::new(dims);
+            cfg.index_kind = IndexKind::TurboQuant;
+            let err = match VectorStore::with_config(&dir.path().join("t.db"), &cfg) {
+                Err(e) => e,
+                Ok(_) => panic!("dims {dims} outside 384..=1536 must be rejected"),
+            };
+            assert!(
+                err.to_string().contains("384"),
+                "error should state the valid range: {err}"
+            );
+        }
+        // Boundary values are accepted.
+        for dims in [384u32, 1536] {
+            let mut cfg = VectorConfig::new(dims);
+            cfg.index_kind = IndexKind::TurboQuant;
+            let db = dir.path().join(format!("ok{dims}.db"));
+            VectorStore::with_config(&db, &cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_turbo_persistence_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("turbo.db");
+        let lru = NonZeroUsize::new(10000).unwrap();
+        let kg = GraphHandle::new(&db_path, Durability::Async, SqliteTuning::default(), lru, 4).unwrap();
+        let mut cfg = VectorConfig::new(384);
+        cfg.index_kind = IndexKind::TurboQuant;
+        cfg.tq_bits = 4;
+
+        {
+            let vs = VectorStore::with_config(&db_path, &cfg).unwrap();
+            for i in 0..10 {
+                let name = format!("e{i}");
+                create_test_entity(&kg, &name, "t");
+                let mut emb = make_embedding(384, 0.1);
+                emb[i % 384] = 1.0 + i as f32 * 0.1;
+                vs.upsert_embedding(&name, &emb, "").unwrap();
+            }
+            assert_eq!(vs.count(), 10);
+        }
+
+        // Reopen: embeddings reload from SQLite and are re-encoded with the
+        // fixed seed, so search behaves identically.
+        let vs2 = VectorStore::with_config(&db_path, &cfg).unwrap();
+        assert_eq!(vs2.count(), 10);
+        let mut q = make_embedding(384, 0.1);
+        q[3] = 1.3;
+        let results = vs2.search_embeddings(&q, 3).unwrap();
+        assert!(!results.is_empty());
+        let top = vs2.id_to_name.get(&results[0].0).map(|r| r.value().clone());
+        assert_eq!(top.as_deref(), Some("e3"));
     }
 
     // ── New retrieval helpers (backend-agnostic) ──────────────────────────

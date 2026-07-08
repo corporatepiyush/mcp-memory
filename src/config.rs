@@ -1,6 +1,6 @@
+use crate::Transport;
 use crate::errors::{MCSError, Result};
 use crate::tools::ToolCategory;
-use crate::Transport;
 use std::sync::Arc;
 
 /// How aggressively to push WAL writes to durable storage before acknowledging
@@ -32,7 +32,9 @@ impl std::str::FromStr for Durability {
         match s {
             "async" | "Async" => Ok(Durability::Async),
             "sync" | "Sync" => Ok(Durability::Sync),
-            _ => Err(format!("unknown durability '{s}'; expected 'async' or 'sync'")),
+            _ => Err(format!(
+                "unknown durability '{s}'; expected 'async' or 'sync'"
+            )),
         }
     }
 }
@@ -58,9 +60,9 @@ pub struct SqliteTuning {
 impl Default for SqliteTuning {
     fn default() -> Self {
         Self {
-            mmap_size: 268_435_456,          // 256 MiB
-            page_size: 4096,                 // 4 KiB — matches Linux page/fs block
-            cache_size_kb: 50_000,           // ~50 MiB
+            mmap_size: 268_435_456, // 256 MiB
+            page_size: 4096,        // 4 KiB — matches Linux page/fs block
+            cache_size_kb: 50_000,  // ~50 MiB
             busy_timeout_ms: 5000,
             journal_size_limit: 134_217_728, // 128 MiB
         }
@@ -90,6 +92,10 @@ pub struct Config {
     pub lru_cache_size: usize,
     /// Size of the read-only connection pool (concurrent reads). Always >= 1.
     pub read_pool_size: usize,
+    /// Max stdio requests dispatched concurrently (>= 1). Responses are
+    /// written in completion order (JSON-RPC ids correlate them); 1 restores
+    /// strict request/response ordering.
+    pub stdio_concurrency: usize,
     /// PEM certificate chain for serving the `http` transport over TLS (HTTPS).
     /// `None` (the default) keeps the transport plaintext. Engaged only when
     /// both `tls_cert` and `tls_key` are set.
@@ -215,6 +221,7 @@ impl Config {
             wal_flush_ms: args.wal_flush_ms,
             lru_cache_size: args.lru_cache_size,
             read_pool_size: resolve_read_pool_size(args.read_pool_size),
+            stdio_concurrency: args.stdio_concurrency.max(1),
             tls_cert,
             tls_key,
             vectors_enabled: enabled_categories.contains(&ToolCategory::Vectors),
@@ -239,7 +246,8 @@ impl Default for Config {
             busy_timeout_ms: SqliteTuning::default().busy_timeout_ms,
             wal_flush_ms: 250,
             lru_cache_size: 10000,
-            read_pool_size: 4,
+            read_pool_size: 8,
+            stdio_concurrency: 8,
             tls_cert: None,
             tls_key: None,
             vectors_enabled: false,
@@ -260,7 +268,10 @@ mod tests {
         assert!((1..=32).contains(&auto), "auto pool {auto} out of [1,32]");
         assert_eq!(
             auto,
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 32)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 32)
         );
     }
 
@@ -272,4 +283,3 @@ mod tests {
         assert_eq!(resolve_read_pool_size(100), 100);
     }
 }
-

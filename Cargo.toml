@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server giving LLM agents persistent memory: a SQLite knowledge graph with FTS5 search, tree-sitter code indexing (10 languages) with semantic code search, and optional vector + hybrid search (usearch HNSW or IVF-Flat) with batch upsert, more-like-this, recommendations, and MMR diversification"
@@ -90,6 +90,12 @@ path = "src/main.rs"
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+
+# Tests validate statistical distortion bounds with numeric hot loops
+# (Hadamard rotations, D×D matvecs, Lloyd-Max iterations); at opt-level 0
+# they are 10-50x slower. Level 1 keeps compiles fast and code debuggable.
+[profile.dev]
+opt-level = 1
 
 [profile.release]
 opt-level = 3

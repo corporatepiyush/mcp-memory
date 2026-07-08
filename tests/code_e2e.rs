@@ -498,7 +498,9 @@ fn code_tools_present_when_enabled() {
         use std::io::{BufRead, BufReader, Write};
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        writeln!(stdin, "{}", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+            .unwrap();
         stdin.flush().unwrap();
         let mut buf = String::new();
         BufReader::new(stdout).read_line(&mut buf).unwrap();

@@ -313,8 +313,15 @@ impl IvfFlatIndex {
             .into_iter()
             .map(|pos| (g.ids[pos], g.dist_to_row(query, q_norm, pos)))
             .collect();
-        scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
+        let cmp = |a: &(u64, f32), b: &(u64, f32)| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        // Partial selection: O(n) to isolate the top_k, then sort only those.
+        if scored.len() > top_k {
+            scored.select_nth_unstable_by(top_k - 1, cmp);
+            scored.truncate(top_k);
+        }
+        scored.sort_unstable_by(cmp);
         Ok(scored)
     }
 

@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod server;
 pub mod tls;
 pub mod tools;
+pub mod turboquant;
 pub mod types;
 pub mod watcher;
 pub mod vector_actions;
@@ -30,6 +31,10 @@ pub enum VecIndex {
     Hnsw,
     /// IVF-Flat: k-means partitioned, lighter memory, fast to build/rebuild.
     Ivf,
+    /// TurboQuant (arXiv:2504.19874): data-oblivious quantization to `--tq-bits`
+    /// bits per coordinate with unbiased inner-product estimates; smallest
+    /// memory, zero training/indexing time, brute-force scan over codes.
+    Turbo,
 }
 
 impl From<VecIndex> for IndexKind {
@@ -37,6 +42,7 @@ impl From<VecIndex> for IndexKind {
         match v {
             VecIndex::Hnsw => IndexKind::Hnsw,
             VecIndex::Ivf => IndexKind::Ivf,
+            VecIndex::Turbo => IndexKind::TurboQuant,
         }
     }
 }
@@ -157,6 +163,13 @@ pub struct Args {
     #[arg(long = "lru-cache-size", default_value_t = 10000)]
     pub lru_cache_size: usize,
 
+    /// Max stdio requests dispatched concurrently (default: 8). Responses
+    /// are correlated by JSON-RPC id and may arrive in completion order;
+    /// set 1 for strict request/response ordering when pipelining
+    /// order-dependent writes.
+    #[arg(long = "stdio-concurrency", default_value_t = 8)]
+    pub stdio_concurrency: usize,
+
     /// Number of read-only SQLite connections backing concurrent reads. WAL
     /// mode allows readers to run in parallel with each other and the single
     /// writer; a larger pool raises read concurrency at the cost of a little
@@ -204,7 +217,8 @@ pub struct Args {
     #[arg(long = "enable-code", default_value_t = false)]
     pub enable_code: bool,
 
-    /// Embedding dimension for vector search (default: 384). Requires --enable-vectors.
+    /// Embedding dimension for vector search (default: 384). Requires
+    /// --enable-vectors. The `turbo` backend accepts 384-1536 only.
     #[arg(long = "embedding-dims", default_value_t = 384)]
     pub embedding_dims: u32,
 
@@ -245,6 +259,11 @@ pub struct Args {
     /// Requires --vec-index ivf.
     #[arg(long = "ivf-nprobe", default_value_t = 8)]
     pub ivf_nprobe: usize,
+
+    /// TurboQuant: bits per coordinate, 1-8 (default: 4 ≈ 8x smaller than f32
+    /// with near-lossless recall). Requires --vec-index turbo.
+    #[arg(long = "tq-bits", default_value_t = 4)]
+    pub tq_bits: u32,
 }
 
 impl Args {
@@ -283,6 +302,7 @@ impl Args {
             expansion_search: self.vec_expansion_search,
             ivf_nlist: self.ivf_nlist,
             ivf_nprobe: self.ivf_nprobe,
+            tq_bits: self.tq_bits,
         }
     }
 }

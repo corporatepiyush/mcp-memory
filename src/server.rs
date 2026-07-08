@@ -300,9 +300,16 @@ impl MCPServer {
         spawn_maintenance(self.kg.clone());
         spawn_wal_flush(self.kg.clone(), self.config.wal_flush_ms);
         let stdin = tokio::io::stdin();
-        let mut reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
-        let mut stdout = tokio::io::stdout();
-        serve_line_conn(&mut reader, &mut stdout, Arc::clone(&self.kg), self.vs.clone()).await
+        let reader = BufReader::with_capacity(BUFFER_CAPACITY, stdin);
+        let stdout = tokio::io::stdout();
+        serve_line_conn(
+            reader,
+            stdout,
+            Arc::clone(&self.kg),
+            self.vs.clone(),
+            self.config.stdio_concurrency,
+        )
+        .await
     }
 
     /// MCP Streamable HTTP transport (POST/GET `/mcp`, JSON or SSE responses).
@@ -371,50 +378,80 @@ fn spawn_maintenance(kg: Arc<GraphHandle>) {
 /// The dispatch path (graph lock + optional fsync) is offloaded to
 /// [`tokio::task::spawn_blocking`] to keep the async reactor responsive (C3).
 async fn serve_line_conn<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+    mut reader: R,
+    mut writer: W,
     kg: Arc<GraphHandle>,
     vs: Option<Arc<VectorStore>>,
+    concurrency: usize,
 ) -> Result<()>
 where
     R: AsyncBufReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let mut line = String::with_capacity(1024);
     let mut read_buf = Vec::with_capacity(1024);
-    let mut out = Vec::with_capacity(BUFFER_CAPACITY);
+    let concurrency = concurrency.max(1);
+
+    // Requests dispatch on blocking threads, up to `concurrency` in flight
+    // (the semaphore also back-pressures the read loop); a dedicated writer
+    // task serializes responses. Responses may therefore be written in
+    // completion order, not arrival order — JSON-RPC clients match on id, and
+    // `concurrency = 1` restores strict ordering for clients that pipeline
+    // order-dependent writes. Each response is one atomic channel message, so
+    // lines never interleave.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(concurrency * 2);
+    let writer_task = tokio::spawn(async move {
+        let mut out = Vec::with_capacity(BUFFER_CAPACITY);
+        while let Some(resp) = rx.recv().await {
+            out.clear();
+            out.extend_from_slice(resp.as_bytes());
+            out.extend_from_slice(NEWLINE);
+            if writer.write_all(&out).await.is_err() {
+                break;
+            }
+            if writer.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
     loop {
-        match read_line_capped(reader, &mut read_buf, &mut line, MAX_REQUEST_BYTES).await {
+        match read_line_capped(&mut reader, &mut read_buf, &mut line, MAX_REQUEST_BYTES).await {
             Ok(LineRead::Eof) => break,
             Ok(LineRead::Line) => {
+                let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+                    break; // semaphore closed: unreachable, but don't spin
+                };
                 let line_copy = line.clone();
                 let kg_clone = Arc::clone(&kg);
                 let vs_clone = vs.clone();
-                let resp = tokio::task::spawn_blocking(move || {
-                    dispatch_line(&line_copy, &kg_clone, vs_clone.as_deref())
-                })
-                .await
-                .map_err(|join_err| {
-                    error!("dispatch task panicked: {join_err}");
-                    MCSError::IoError(std::io::Error::other("dispatch task panicked"))
-                })?;
-                if let Some(resp) = resp {
-                    out.clear();
-                    out.extend_from_slice(resp.as_bytes());
-                    out.extend_from_slice(NEWLINE);
-                    writer.write_all(&out).await.map_err(MCSError::IoError)?;
-                    writer.flush().await.map_err(MCSError::IoError)?;
-                }
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let resp = tokio::task::spawn_blocking(move || {
+                        dispatch_line(&line_copy, &kg_clone, vs_clone.as_deref())
+                    })
+                    .await;
+                    drop(permit);
+                    match resp {
+                        Ok(Some(resp)) => {
+                            let _ = tx.send(resp).await;
+                        }
+                        Ok(None) => {} // notification: no response
+                        Err(join_err) => {
+                            // The request's id was lost with the panic, so no
+                            // error response can be correlated; log and let the
+                            // client time out that one call.
+                            error!("dispatch task panicked: {join_err}");
+                        }
+                    }
+                });
             }
             Ok(LineRead::TooLong) => {
                 let err = MCSError::InvalidParams("Request exceeds maximum size of 16MB".into());
                 let response = JsonRpcResponse::error(None, err.error_code(), err.to_string());
-                out.clear();
-                serde_json::to_writer(&mut out, &response).map_err(MCSError::JsonError)?;
-                out.extend_from_slice(NEWLINE);
-                writer.write_all(&out).await.map_err(MCSError::IoError)?;
-                writer.flush().await.map_err(MCSError::IoError)?;
+                let resp = serde_json::to_string(&response).map_err(MCSError::JsonError)?;
+                let _ = tx.send(resp).await;
                 break;
             }
             Err(e) => {
@@ -423,6 +460,10 @@ where
             }
         }
     }
+    // Let in-flight dispatches finish and drain their responses: tasks hold
+    // `tx` clones, so the writer exits once the last one completes.
+    drop(tx);
+    let _ = writer_task.await;
     Ok(())
 }
 

@@ -384,6 +384,7 @@ pub fn handle_vector_store_stats(
     let index_kind = match vs.index_kind() {
         crate::vector_store::IndexKind::Hnsw => "hnsw",
         crate::vector_store::IndexKind::Ivf => "ivf",
+        crate::vector_store::IndexKind::TurboQuant => "turboquant",
     };
     let text = serde_json::to_string(&json!({
         "embeddingCount": vs.count(),
@@ -459,8 +460,10 @@ pub fn handle_vector_batch_upsert(
         )));
     }
 
-    let mut upserted = 0usize;
+    // Parse every item first, then store the whole batch under one SQLite
+    // transaction (one WAL commit instead of one per item).
     let mut errors: Vec<Value> = Vec::new();
+    let mut parsed: Vec<(&str, Vec<f32>, &str)> = Vec::with_capacity(items.len());
     for item in items {
         let name = match item.get("entityName").and_then(|v| v.as_str()) {
             Some(n) if !n.is_empty() && n.len() <= MAX_NAME_BYTES => n,
@@ -481,8 +484,12 @@ pub fn handle_vector_batch_upsert(
             }
         };
         let model = item.get("model").and_then(|v| v.as_str()).unwrap_or("");
-        let buf = to_f32(&emb);
-        match vs.upsert_embedding(name, &buf, model) {
+        parsed.push((name, to_f32(&emb), model));
+    }
+
+    let mut upserted = 0usize;
+    for ((name, _, _), result) in parsed.iter().zip(vs.upsert_embeddings_batch(&parsed)) {
+        match result {
             Ok(()) => upserted += 1,
             Err(e) => errors.push(json!({"entityName": name, "error": e.to_string()})),
         }
@@ -740,6 +747,7 @@ pub fn handle_vector_reindex(
     let kind = match vs.index_kind() {
         crate::vector_store::IndexKind::Hnsw => "hnsw",
         crate::vector_store::IndexKind::Ivf => "ivf",
+        crate::vector_store::IndexKind::TurboQuant => "turboquant",
     };
     let text = serde_json::to_string(&json!({
         "reindexed": true,

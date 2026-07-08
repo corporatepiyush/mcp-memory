@@ -62,9 +62,12 @@ fn spawn_vec_server_with(extra: &[&str]) -> VecClient {
         .arg("stdio")
         .arg("--enable-all")
         .arg("--log-level")
-        .arg("error")
-        .arg("--embedding-dims")
-        .arg("4");
+        .arg("error");
+    // Default to tiny embeddings unless the test picks its own dimension
+    // (clap rejects a flag given twice, so this cannot be an override).
+    if !extra.contains(&"--embedding-dims") {
+        cmd.arg("--embedding-dims").arg("4");
+    }
     cmd.args(extra);
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -503,7 +506,7 @@ fn test_vector_e2e_search_top_k() {
             "vector_upsert_embedding",
             serde_json::json!({
                 "entityName": format!("e{i}"),
-                "embedding": make_embedding(4, (i as f64) * 0.2)
+                "embedding": make_embedding(4, f64::from(i) * 0.2)
             }),
         );
     }
@@ -883,4 +886,63 @@ fn test_vector_e2e_ivf_backend_end_to_end() {
     );
     assert!(s.contains("\"a\""), "ivf search should find a: {s}");
     assert!(!s.contains("\"c\"") && !s.contains("\"d\""), "ivf search should not return far cluster: {s}");
+}
+
+#[test]
+fn test_vector_e2e_turboquant_backend_end_to_end() {
+    // Run the whole flow against the TurboQuant quantized backend. The
+    // backend requires dims in 384..=1536, so override the helper's tiny
+    // default (clap takes the last occurrence of a flag).
+    let mut c = spawn_vec_server_with(&[
+        "--vec-index",
+        "turbo",
+        "--tq-bits",
+        "4",
+        "--embedding-dims",
+        "384",
+    ]);
+    c.initialize();
+
+    let stats0 = c.tool_text("vector_store_stats", serde_json::json!({}));
+    assert!(stats0.contains(r#""indexKind":"turboquant""#), "should report turboquant: {stats0}");
+
+    // Two well-separated direction clusters in 384 dims.
+    let emb = |hot: [usize; 2], warm: f32| {
+        let mut v = vec![0.0f32; 384];
+        v[hot[0]] = 1.0;
+        v[hot[1]] = warm;
+        v
+    };
+    seed(&mut c, &[("a", "doc"), ("b", "doc"), ("c", "doc"), ("d", "doc")]);
+    c.tool_text(
+        "vector_batch_upsert",
+        serde_json::json!({"items": [
+            {"entityName": "a", "embedding": emb([0, 1], 1.0)},
+            {"entityName": "b", "embedding": emb([0, 1], 0.9)},
+            {"entityName": "c", "embedding": emb([200, 201], 1.0)},
+            {"entityName": "d", "embedding": emb([200, 201], 0.9)}
+        ]}),
+    );
+
+    // Reindex is a no-op for the data-oblivious quantizer but must succeed.
+    let re = c.tool_text("vector_reindex", serde_json::json!({}));
+    assert!(re.contains(r#""reindexed":true"#), "reindex: {re}");
+    assert!(re.contains(r#""indexKind":"turboquant""#), "reindex kind: {re}");
+
+    // Search near the {a,b} cluster returns those, not the far {c,d} cluster.
+    let s = c.tool_text(
+        "vector_search_entities",
+        serde_json::json!({"embedding": emb([0, 1], 1.0), "topK": 2}),
+    );
+    assert!(s.contains("\"a\""), "turboquant search should find a: {s}");
+    assert!(!s.contains("\"c\"") && !s.contains("\"d\""), "turboquant search should not return far cluster: {s}");
+
+    // Deletion works against the quantized store.
+    let del = c.tool_text("vector_delete_embedding", serde_json::json!({"entityName": "a"}));
+    assert!(del.contains("true") || del.contains("deleted"), "delete: {del}");
+    let s2 = c.tool_text(
+        "vector_search_entities",
+        serde_json::json!({"embedding": emb([0, 1], 1.0), "topK": 4}),
+    );
+    assert!(!s2.contains("\"a\""), "deleted entity must not be returned: {s2}");
 }

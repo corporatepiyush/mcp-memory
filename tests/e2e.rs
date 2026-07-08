@@ -449,3 +449,108 @@ fn e2e_vectors_disabled_by_default() {
         "vector tool must error when disabled: {resp}"
     );
 }
+
+#[test]
+fn e2e_pipelined_requests_all_answered_and_correlated() {
+    // The stdio transport dispatches up to --stdio-concurrency requests in
+    // flight and may write responses in completion order. Fire a burst of
+    // pipelined requests in one write and verify every id gets exactly one
+    // well-formed response, regardless of arrival order.
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut c = spawn_server();
+    c.tool_text(
+        "create_entities",
+        serde_json::json!({"entities": [
+            {"name": "P", "entityType": "t", "observations": ["o"]}
+        ]}),
+    );
+
+    let mut batch = String::new();
+    for id in 100u64..160 {
+        // Alternate cheap and heavier calls so completions interleave.
+        let req = if id % 2 == 0 {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "get_entity", "arguments": {"name": "P"}}})
+        } else {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "search_nodes", "arguments": {"query": "o"}}})
+        };
+        batch.push_str(&serde_json::to_string(&req).unwrap());
+        batch.push('\n');
+    }
+    c.stdin.write_all(batch.as_bytes()).unwrap();
+    c.stdin.flush().unwrap();
+
+    // One persistent reader: pipelined responses share the buffer.
+    let mut reader = BufReader::new(&mut c.stdout);
+    let mut seen: HashSet<u64> = HashSet::new();
+    for _ in 0..60 {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read response line");
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("parse response");
+        let id = v["id"].as_u64().expect("response id");
+        assert!((100..160).contains(&id), "unexpected id {id}");
+        assert!(v.get("result").is_some(), "id {id} errored: {line}");
+        assert!(seen.insert(id), "duplicate response for id {id}");
+    }
+    assert_eq!(seen.len(), 60, "every pipelined request must be answered once");
+}
+
+#[test]
+fn e2e_strict_ordering_with_concurrency_one() {
+    // --stdio-concurrency 1 must preserve request order, so pipelined
+    // dependent writes (create entity, then relate it) work.
+    use std::io::{BufRead, BufReader, Write};
+
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let db_path = format!("/tmp/test_e2e_{n}.db");
+    let bin = std::env::var("CARGO_BIN_EXE_MCP_MEMORY")
+        .unwrap_or_else(|_| "target/debug/mcp-memory".into());
+    let mut child = Command::new(&bin)
+        .args(["-f", &db_path, "--transport", "stdio", "--log-level", "error",
+               "--enable-graph-read", "--enable-graph-write",
+               "--stdio-concurrency", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let reqs = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "create_entities", "arguments": {"entities": [
+                {"name": "A", "entityType": "t", "observations": []},
+                {"name": "B", "entityType": "t", "observations": []}]}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "create_relations", "arguments": {"relations": [
+                {"from": "A", "to": "B", "relationType": "linked"}]}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "find_path", "arguments": {"from": "A", "to": "B"}}}),
+    ];
+    let batch: String = reqs
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap() + "\n")
+        .collect();
+    stdin.write_all(batch.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    let mut reader = BufReader::new(stdout);
+    for expect_id in 1u64..=3 {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"].as_u64(), Some(expect_id), "order violated: {line}");
+        let is_err = v["result"]["isError"].as_bool().unwrap_or(false);
+        assert!(v.get("result").is_some() && !is_err, "id {expect_id} failed: {line}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{db_path}{ext}"));
+    }
+}
