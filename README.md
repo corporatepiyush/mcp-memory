@@ -157,6 +157,49 @@ mcp-memory --enable-all --transport http --bind 0.0.0.0:8080 \
   --tls-cert ./cert.pem --tls-key ./key.pem
 ```
 
+### Web UI (graph viewer)
+
+The `http` transport serves a **Neo4j-Browser-style knowledge-graph viewer** — open
+[`http://<bind>/ui`](http://127.0.0.1:8080/ui) in any browser to explore the graph interactively:
+
+- A **force-directed** layout with pan / zoom (scroll or the on-canvas ＋ / − / ⤢ controls) and
+  drag-to-pin nodes.
+- **Captioned circular nodes** coloured by entity type (the Neo4j categorical palette), a live
+  **legend**, and curved multi-edges with **relationship-type labels + arrowheads**.
+- **Double-click a node to expand its relationships** — incremental graph traversal that pulls the
+  node's neighbourhood from the server and merges it into the view (start small, expand outward).
+- **Paginated browse + full-text search.** Page through the graph with Prev / Next, or search all
+  entities (FTS5, prefix / search-as-you-type) — both paginated, so large graphs stay responsive.
+- A **node inspector** (type, observations, relationships — click a relationship to jump), plus
+  **Isolate** / **Dismiss** actions, a label filter, and Esc-to-deselect.
+
+It is served as three static assets — `index.html`, `graph.css`, `graph.js` — with **no external
+dependencies** (no CDNs, no telemetry; everything renders locally on a `<canvas>`). The viewer is a
+distinct browser front-end: it talks only to the `/ui/*` HTTP routes below and adds **no MCP tools**
+and no stdio behaviour.
+
+| Route | Purpose |
+|-------|---------|
+| `GET /ui` | The viewer page (app shell + `/ui/graph.css` + `/ui/graph.js`; carries no graph data, so it needs no auth). |
+| `GET /ui/graph` | A page of the graph: `{ entities, relations, entityTypes, stats, page }`. Query params: `entityType` (filter), `offset`, `limit` (≤ 1,000), `token`. |
+| `GET /ui/search` | A page of FTS5 matches (matched nodes only): same shape as `/ui/graph`. Query params: `q` (prefix-matched), `entityType`, `offset`, `limit` (≤ 1,000), `token`. |
+| `GET /ui/expand` | One node's neighbourhood `{ entities, relations }` for double-click traversal. Query params: `name` (required), `depth` (1–3), `direction` (`outgoing`/`incoming`/`both`), `token`. |
+
+Every data response carries a `page` cursor — `{ offset, limit, returned, hasMore }` — that drives
+the Prev / Next controls without a second round-trip.
+
+The viewer reads the graph, so `/ui/graph`, `/ui/search`, and `/ui/expand` require
+**`--enable-graph-read`** (or `--enable-all`); without it they return `403` and the page says so.
+They honor the same bearer token
+as the MCP endpoints: pass it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or
+open `http://<bind>/ui#token=<token>` — the `#`-fragment stays client-side (never sent to the server
+or written to logs) and the page forwards it as a header.
+
+```sh
+mcp-memory --enable-graph-read --transport http --bind 127.0.0.1:8080
+# then open http://127.0.0.1:8080/ui in a browser
+```
+
 ## Code intelligence (`--enable-code`)
 
 Point the server at a source tree and it parses it with **tree-sitter** into a persistent,
@@ -392,6 +435,10 @@ pre-populated, on a **MacBook Pro (Apple M1 Pro, 32 GB)**. Averages; run
 main.rs → MCPServer { kg, vs: Option<VectorStore> }
   ├── run_stdio()  — newline-delimited JSON-RPC over stdio
   └── run_http()   — MCP Streamable HTTP (axum, POST/GET /mcp)
+        ├── GET /ui        — graph viewer shell + /ui/graph.css + /ui/graph.js (static)
+        ├── GET /ui/graph  — a paged view of the graph for the viewer (gated by graph-read)
+        ├── GET /ui/search — paged FTS5 search for the viewer (gated)
+        ├── GET /ui/expand — a node's neighbourhood for double-click traversal (gated)
         └── process_request()
               ├── "initialize"      → protocol version + capabilities
               ├── "tools/list"      → tool list (filtered by enabled categories)

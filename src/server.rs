@@ -43,8 +43,11 @@ static GRAPH_READ_ENABLED: std::sync::atomic::AtomicBool =
 static GRAPH_WRITE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether read-only knowledge-graph access is enabled. Exposed to the HTTP
+/// transport so the browser graph viewer (`/ui`) can be gated behind the same
+/// `graph-read` permission that governs `read_graph`.
 #[inline]
-fn graph_read_enabled() -> bool {
+pub(crate) fn graph_read_enabled() -> bool {
     GRAPH_READ_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 #[inline]

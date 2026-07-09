@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>mcp-memory · knowledge graph</title>
+<link rel="stylesheet" href="/ui/graph.css" />
+</head>
+<body>
+<div id="app">
+  <header id="toolbar">
+    <span class="brand">mcp&#8209;memory <small>graph</small></span>
+
+    <div class="group">
+      <label class="ctl">Label
+        <select id="typeFilter"><option value="">all labels</option></select>
+      </label>
+      <label class="ctl">Page size
+        <input id="limit" type="number" min="1" max="1000" value="300" />
+      </label>
+    </div>
+
+    <div class="group search-group">
+      <input id="search" type="search" placeholder="search graph… (Enter)" autocomplete="off" spellcheck="false" />
+      <button id="searchBtn" class="primary" title="Search the whole graph (FTS)">Search</button>
+      <button id="overview" title="Clear search and show the graph overview">Overview</button>
+    </div>
+
+    <span class="spacer"></span>
+
+    <div class="group pager" id="pager">
+      <button id="prev" title="Previous page" disabled>‹</button>
+      <span class="page-label" id="pageLabel">—</span>
+      <button id="next" title="Next page" disabled>›</button>
+    </div>
+    <span class="stats" id="stats">—</span>
+  </header>
+
+  <main>
+    <canvas id="cv"></canvas>
+
+    <div id="hint">
+      <b>double&#8209;click</b> a node to expand its relationships ·
+      drag&nbsp;to&nbsp;move · scroll&nbsp;to&nbsp;zoom · click&nbsp;for&nbsp;details
+    </div>
+
+    <div id="legend"></div>
+    <div id="tooltip"></div>
+
+    <div id="zoom">
+      <button id="zoomIn" title="Zoom in">＋</button>
+      <button id="zoomOut" title="Zoom out">−</button>
+      <button id="zoomFit" title="Fit to screen">⤢</button>
+    </div>
+
+    <aside id="inspector">
+      <div class="ins-head">
+        <span class="dot" id="insDot"></span>
+        <span class="ins-name" id="insName"></span>
+        <button class="icon" id="insClose" title="Close (Esc)">✕</button>
+      </div>
+      <div class="ins-actions">
+        <button id="insExpand" title="Load this node's relationships">⤢ Expand</button>
+        <button id="insIsolate" title="Show only this node and its neighbors">Isolate</button>
+        <button id="insDismiss" class="danger" title="Remove this node from the view">Dismiss</button>
+      </div>
+      <div class="ins-body" id="insBody"></div>
+    </aside>
+
+    <div id="overlay">
+      <div class="card">
+        <h2 id="ovTitle">Loading…</h2>
+        <p id="ovMsg"></p>
+        <div class="tokrow" id="ovTokRow" style="display:none">
+          <input id="ovToken" type="password" placeholder="bearer token" autocomplete="off" />
+          <button class="primary" id="ovGo">Connect</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="/ui/graph.js"></script>
+</body>
+</html>
