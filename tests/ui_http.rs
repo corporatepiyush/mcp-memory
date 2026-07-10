@@ -403,3 +403,55 @@ fn test_ui_search_prefix_and_permission() {
     let (status, _, _) = get(srv.port, "/ui/search?q=x", None);
     assert_eq!(status, 403, "search must require graph-read");
 }
+
+#[test]
+fn test_ui_graph_omits_observation_bodies() {
+    let srv = spawn_http_server(&["--enable-all"], None);
+    seed_graph(srv.port, None); // Alice has one observation ("likes hiking")
+
+    let (status, _, body) = get(srv.port, "/ui/graph", None);
+    assert_eq!(status, 200, "graph should succeed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let alice = v["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Alice")
+        .expect("Alice present");
+    // The list payload carries a count, not the bodies — those lazy-load via /ui/node.
+    assert_eq!(alice["obsCount"], 1, "Alice's observation count should be present");
+    assert!(
+        alice.get("observations").is_none(),
+        "list payload must omit observation bodies: {alice}"
+    );
+}
+
+#[test]
+fn test_ui_node_lazy_loads_observations() {
+    let srv = spawn_http_server(&["--enable-all"], None);
+    seed_graph(srv.port, None);
+
+    let (status, headers, body) = get(srv.port, "/ui/node?name=Alice", None);
+    assert_eq!(status, 200, "node fetch should succeed: {body}");
+    assert!(
+        headers.to_lowercase().contains("content-type: application/json"),
+        "node data must be JSON, headers: {headers}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["name"], "Alice");
+    assert_eq!(v["entityType"], "person");
+    // The single-node endpoint carries the full observation bodies.
+    let obs: Vec<&str> = v["observations"].as_array().unwrap().iter().map(|o| o.as_str().unwrap()).collect();
+    assert_eq!(obs, vec!["likes hiking"], "node fetch should return observation bodies");
+
+    // Unknown entity → 404.
+    let (status, _, _) = get(srv.port, "/ui/node?name=DoesNotExist", None);
+    assert_eq!(status, 404, "unknown entity should be 404");
+}
+
+#[test]
+fn test_ui_node_requires_graph_read() {
+    let srv = spawn_http_server(&["--enable-graph-write"], None);
+    let (status, _, _) = get(srv.port, "/ui/node?name=Alice", None);
+    assert_eq!(status, 403, "graph-read disabled must forbid /ui/node");
+}

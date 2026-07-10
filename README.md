@@ -181,14 +181,19 @@ and no stdio behaviour.
 | Route | Purpose |
 |-------|---------|
 | `GET /ui` | The viewer page (app shell + `/ui/graph.css` + `/ui/graph.js`; carries no graph data, so it needs no auth). |
-| `GET /ui/graph` | A page of the graph: `{ entities, relations, entityTypes, stats, page }`. Query params: `entityType` (filter), `offset`, `limit` (≤ 1,000), `token`. |
+| `GET /ui/graph` | A page of the graph: `{ entities, relations, entityTypes, stats, page }`. Entities carry `obsCount` (not the observation bodies — those are lazy-loaded). Query params: `entityType` (filter), `offset`, `limit` (≤ 1,000), `token`. |
 | `GET /ui/search` | A page of FTS5 matches (matched nodes only): same shape as `/ui/graph`. Query params: `q` (prefix-matched), `entityType`, `offset`, `limit` (≤ 1,000), `token`. |
+| `GET /ui/node` | One entity with its observation **bodies**, lazy-loaded by the inspector on select. Query params: `name` (required), `token`. |
 | `GET /ui/expand` | One node's neighbourhood `{ entities, relations }` for double-click traversal. Query params: `name` (required), `depth` (1–3), `direction` (`outgoing`/`incoming`/`both`), `token`. |
 
 Every data response carries a `page` cursor — `{ offset, limit, returned, hasMore }` — that drives
-the Prev / Next controls without a second round-trip.
+the Prev / Next controls without a second round-trip. The list endpoints omit observation bodies
+(they ship only `obsCount`) to keep payloads small; the inspector fetches the bodies for the one
+selected node via `/ui/node`. Responses are gzip/brotli-compressed when the client advertises it,
+and the canvas uses a **Barnes-Hut** (O(_n_ log _n_)) force layout with viewport culling so large
+pages and hub expansions stay at interactive frame rates.
 
-The viewer reads the graph, so `/ui/graph`, `/ui/search`, and `/ui/expand` require
+The viewer reads the graph, so `/ui/graph`, `/ui/search`, `/ui/node`, and `/ui/expand` require
 **`--enable-graph-read`** (or `--enable-all`); without it they return `403` and the page says so.
 They honor the same bearer token
 as the MCP endpoints: pass it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or

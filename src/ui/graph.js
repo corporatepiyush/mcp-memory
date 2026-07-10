@@ -54,6 +54,10 @@
   let selected = null, hover = null, pinnedDrag = null;
   let alpha = 0, raf = null, busyReq = false;
   let dpr = Math.max(1, window.devicePixelRatio || 1);
+  // Cap on nodes held in the canvas at once. Browse pages are already bounded
+  // (≤1000, server-enforced); this bounds *expansion* so double-clicking a hub
+  // can't push the force layout into tens of thousands of nodes.
+  const MAX_RENDER_NODES = 3000;
 
   const toScreen = (wx, wy) => ({ x: (wx + view.x) * view.k, y: (wy + view.y) * view.k });
   const toWorld = (sx, sy) => ({ x: sx / view.k - view.x, y: sy / view.k - view.y });
@@ -63,7 +67,7 @@
     const r = cv.getBoundingClientRect();
     cv.width = Math.round(r.width * dpr);
     cv.height = Math.round(r.height * dpr);
-    draw();
+    requestDraw();
   }
   window.addEventListener("resize", resize);
 
@@ -143,15 +147,24 @@
     if (!res.ok) { flash("expand failed (" + res.status + ")"); if (res.status === 401 || res.status === 403) await handleError(res); kick(); return; }
     const data = await res.json();
     node.expanded = true;
-    const added = mergeGraph(data, node);
-    flash(added ? `+${added} node${added === 1 ? "" : "s"}` : "no new relationships");
+    const { added, capped } = mergeGraph(data, node);
+    if (capped) flash(`node limit ${fmt(MAX_RENDER_NODES)} reached — dismiss or isolate to explore further`);
+    else flash(added ? `+${added} node${added === 1 ? "" : "s"}` : "no new relationships");
   }
 
   // ── Graph (re)building ─────────────────────────────────────────────────────
   function makeNode(e, x, y) {
+    const hasObs = Array.isArray(e.observations);
     return {
-      id: e.name, type: e.entityType || "", obs: e.observations || [],
+      id: e.name, type: e.entityType || "",
+      // The browse/search list payloads omit observation *bodies* (they carry
+      // only `obsCount`); the inspector lazy-loads bodies via /ui/node on select.
+      // `obs === null` means "bodies not loaded yet"; `obsCount` is always known.
+      obs: hasObs ? e.observations : null,
+      obsCount: hasObs ? e.observations.length : (e.obsCount | 0),
+      color: colorForType(e.entityType || ""), // cache: avoid a Map lookup per node per frame
       x, y, vx: 0, vy: 0, deg: 0, fixed: false, expanded: false, _loading: false,
+      _lblR: -1, _lbl: "", // cached fitted label + the screen-radius bucket it was measured at
     };
   }
   function recomputeDegrees() {
@@ -170,12 +183,23 @@
     for (const g of groups.values()) g.forEach((l, i) => { l._slot = i - (g.length - 1) / 2; });
   }
 
+  // Even, overlap-free seed positions (sunflower/phyllotaxis spiral) for a fresh
+  // page. Gives the layout real structure on the first frame so we don't need an
+  // expensive synchronous pre-roll before fitting — the animation settles from a
+  // sane start instead of from random noise.
+  function spiralPos(i) {
+    const a = i * 2.399963229728653; // golden angle
+    const r = SPRING_LEN * 0.9 * Math.sqrt(i + 0.5);
+    return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+  }
   function setGraph(data) {
     page = data.page || { offset: browse.offset, limit: browse.limit, returned: (data.entities || []).length, hasMore: false };
     const prev = new Map(nodes.map((n) => [n.id, n]));
+    let seed = 0;
     nodes = (data.entities || []).map((e) => {
       const p = prev.get(e.name);
-      const n = makeNode(e, p ? p.x : (Math.random() - 0.5) * 700, p ? p.y : (Math.random() - 0.5) * 700);
+      const s = p ? null : spiralPos(seed++);
+      const n = makeNode(e, p ? p.x : s.x, p ? p.y : s.y);
       if (p) n.fixed = p.fixed;
       return n;
     });
@@ -200,9 +224,10 @@
 
   // Merge an expansion result; returns the number of newly added nodes.
   function mergeGraph(data, origin) {
-    let added = 0;
+    let added = 0, capped = false;
     for (const e of (data.entities || [])) {
       if (nodeById.has(e.name)) continue;
+      if (nodes.length >= MAX_RENDER_NODES) { capped = true; break; } // bound the layout
       const ang = Math.random() * Math.PI * 2, rad = 60 + Math.random() * 40;
       const n = makeNode(e, origin.x + Math.cos(ang) * rad, origin.y + Math.sin(ang) * rad);
       nodes.push(n); nodeById.set(n.id, n); added++;
@@ -210,7 +235,7 @@
     const seen = new Set(links.map((l) => l.source.id + SEP + l.type + SEP + l.target.id));
     for (const r of (data.relations || [])) {
       const s = nodeById.get(r.from), t = nodeById.get(r.to);
-      if (!s || !t) continue;
+      if (!s || !t) continue; // an endpoint was past the node cap — skip the edge
       const key = r.from + SEP + (r.relationType || "") + SEP + r.to;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -219,7 +244,7 @@
     recomputeDegrees(); buildLegend(); updateStats();
     if (selected === origin) selectNode(origin); // refresh inspector relation list
     alpha = Math.max(alpha, 0.45); kick(); // gentle reheat — keep existing layout calm
-    return added;
+    return { added, capped };
   }
 
   function dismiss(node) {
@@ -286,19 +311,53 @@
   const radius = (n) => 15 + Math.min(24, Math.sqrt(n.deg) * 4);
   const anyLoading = () => nodes.some((n) => n._loading);
 
+  // ── Barnes-Hut quadtree: O(n log n) repulsion instead of O(n²) all-pairs, so
+  //    large graphs (and hub expansions) stay at interactive frame rates.
+  const THETA2 = 0.81; // (θ=0.9)² — cells smaller than θ·distance are lumped into one body
+  function insert(q, n, depth) {
+    q.cx = (q.cx * q.mass + n.x) / (q.mass + 1);
+    q.cy = (q.cy * q.mass + n.y) / (q.mass + 1);
+    q.mass++;
+    if (q.mass === 1) { q.node = n; return; }
+    if (q.size < 1e-3 || depth > 48) return; // coincident cluster — stop subdividing
+    if (!q.quads) { q.quads = [null, null, null, null]; const old = q.node; q.node = null; if (old) place(q, old, depth); }
+    place(q, n, depth);
+  }
+  function place(q, n, depth) {
+    const half = q.size / 2;
+    const i = (n.x >= q.x + half ? 1 : 0) + (n.y >= q.y + half ? 2 : 0);
+    let c = q.quads[i];
+    if (!c) c = q.quads[i] = { x: q.x + (i & 1 ? half : 0), y: q.y + (i & 2 ? half : 0), size: half, cx: 0, cy: 0, mass: 0, node: null, quads: null };
+    insert(c, n, depth + 1);
+  }
+  function buildTree(ns) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of ns) { if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y; if (n.x > maxX) maxX = n.x; if (n.y > maxY) maxY = n.y; }
+    if (!isFinite(minX)) return null;
+    const size = Math.max(maxX - minX, maxY - minY, 1);
+    const root = { x: minX, y: minY, size, cx: 0, cy: 0, mass: 0, node: null, quads: null };
+    for (const n of ns) insert(root, n, 0);
+    return root;
+  }
+  function repulse(q, n, alpha) {
+    if (!q || q.mass === 0) return;
+    let dx = n.x - q.cx, dy = n.y - q.cy, d2 = dx * dx + dy * dy;
+    if (q.quads && q.size * q.size >= THETA2 * d2) { // cell too close to approximate → recurse
+      for (const c of q.quads) if (c) repulse(c, n, alpha);
+      return;
+    }
+    if (q.node === n && q.mass === 1) return; // the node's own leaf
+    if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+    const f = (REPULSION * q.mass / d2) * alpha, inv = 1 / Math.sqrt(d2);
+    n.vx += dx * inv * f; n.vy += dy * inv * f;
+  }
+
   function step() {
     if (alpha < 0.02) return false;
     const n = nodes.length;
-    for (let i = 0; i < n; i++) {
-      const a = nodes[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = nodes[j];
-        let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
-        if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
-        const f = (REPULSION / d2) * alpha, inv = 1 / Math.sqrt(d2);
-        const fx = dx * inv * f, fy = dy * inv * f;
-        a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
-      }
+    if (n > 1) {
+      const tree = buildTree(nodes);
+      for (let i = 0; i < n; i++) repulse(tree, nodes[i], alpha);
     }
     for (const l of links) {
       const dx = l.target.x - l.source.x, dy = l.target.y - l.source.y;
@@ -320,6 +379,15 @@
     const busy = step();
     draw();
     raf = (busy || pinnedDrag || anyLoading()) ? requestAnimationFrame(loop) : null;
+  }
+  // Coalesce one-off redraws (hover, pan, zoom, selection) into a single rAF so
+  // several events in one frame don't each paint. A no-op while the sim loop is
+  // already running (it paints every frame).
+  let drawPending = false;
+  function requestDraw() {
+    if (raf || drawPending) return;
+    drawPending = true;
+    requestAnimationFrame(() => { drawPending = false; draw(); });
   }
 
   // ── Rendering ──────────────────────────────────────────────────────────────
@@ -349,9 +417,15 @@
     const focus = selected || hover;
     const nbrs = focus ? neighborsOf(focus) : null;
     const showRelLabels = view.k > 0.75;
+    // Viewport-cull margin — generous enough to cover node radius, curved edges
+    // and relationship pills that bow just outside the strict box.
+    const M = 80;
 
     for (const l of links) {
       const a = toScreen(l.source.x, l.source.y), b = toScreen(l.target.x, l.target.y);
+      // Skip edges wholly off one side of the viewport (both endpoints outside).
+      if ((a.x < -M && b.x < -M) || (a.x > W + M && b.x > W + M) ||
+          (a.y < -M && b.y < -M) || (a.y > H + M && b.y > H + M)) continue;
       const ec = edgeControl(l), c = toScreen(ec.x, ec.y);
       const active = focus && (l.source === focus || l.target === focus);
       ctx.lineWidth = active ? 2 : 1.2;
@@ -367,10 +441,11 @@
     ctx.textAlign = "center"; ctx.textBaseline = "middle";
     for (const n of nodes) {
       const s = toScreen(n.x, n.y), r = radius(n) * view.k;
+      if (s.x < -M || s.x > W + M || s.y < -M || s.y > H + M) continue; // off-screen
       const dim = focus && n !== focus && !(nbrs && nbrs.has(n));
       ctx.globalAlpha = dim ? 0.3 : 1;
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = colorForType(n.type); ctx.fill();
+      ctx.fillStyle = n.color; ctx.fill();
       if (n === selected) { ctx.lineWidth = 3; ctx.strokeStyle = "rgba(1,139,255,.9)"; ctx.stroke(); }
       else if (q && matches(n, q)) { ctx.lineWidth = 3; ctx.strokeStyle = "#f0a020"; ctx.stroke(); }
       else { ctx.lineWidth = 1.5; ctx.strokeStyle = "rgba(0,0,0,.12)"; ctx.stroke(); }
@@ -380,7 +455,13 @@
         ctx.globalAlpha = 1;
         ctx.fillStyle = "#2a2c34";
         ctx.font = `${Math.max(9, Math.min(13, r * 0.5))}px -apple-system, system-ui, sans-serif`;
-        ctx.fillText(fit(ctx, n.id, r * 1.8), s.x, s.y);
+        // Cache the fitted (truncated) label per integer screen-radius. fit()'s
+        // measureText is a canvas hotspot; the screen radius is constant frame to
+        // frame while the layout settles (it only changes on zoom or degree),
+        // so this reduces measureText from every-node-every-frame to near-zero.
+        const rb = r | 0;
+        if (n._lblR !== rb) { n._lbl = fit(ctx, n.id, r * 1.8); n._lblR = rb; }
+        ctx.fillText(n._lbl, s.x, s.y);
       }
     }
     ctx.globalAlpha = 1;
@@ -455,18 +536,19 @@
       if (pinnedDrag) {
         const w = toWorld(sx, sy);
         pinnedDrag.x = w.x; pinnedDrag.y = w.y; pinnedDrag.vx = 0; pinnedDrag.vy = 0;
-        if (!raf) loop(); else draw();
-      } else { view.x += dx / view.k; view.y += dy / view.k; draw(); }
+        if (!raf) loop(); // the sim loop paints each frame while a node is pinned
+      } else { view.x += dx / view.k; view.y += dy / view.k; requestDraw(); }
       return;
     }
     const n = nodeAt(sx, sy);
-    if (n !== hover) { hover = n; draw(); }
+    if (n !== hover) { hover = n; requestDraw(); }
     const tt = $("tooltip");
     if (n) {
+      const oc = n.obsCount | 0;
       tt.style.display = "block";
       tt.style.left = Math.min(sx + 14, rect.width - 300) + "px";
       tt.style.top = (sy + 16) + "px";
-      const o = n.obs.length ? `<div class="tt-sub">${n.obs.length} observation${n.obs.length > 1 ? "s" : ""} · double-click to expand</div>` : `<div class="tt-sub">double-click to expand</div>`;
+      const o = oc ? `<div class="tt-sub">${fmt(oc)} observation${oc > 1 ? "s" : ""} · double-click to expand</div>` : `<div class="tt-sub">double-click to expand</div>`;
       tt.innerHTML = `<div class="tt-name">${escapeHtml(n.id)}</div><div class="tt-sub">${escapeHtml(n.type || "—")} · degree ${n.deg}</div>${o}`;
       cv.style.cursor = "pointer";
     } else { tt.style.display = "none"; cv.style.cursor = dragging ? "grabbing" : "grab"; }
@@ -493,7 +575,7 @@
     view.k = Math.min(4, Math.max(0.05, view.k * factor));
     const after = toWorld(sx, sy);
     view.x += after.x - before.x; view.y += after.y - before.y;
-    draw();
+    requestDraw();
   }
   const zoomCenter = (f) => zoomAt(cv.width / dpr / 2, cv.height / dpr / 2, f);
 
@@ -501,9 +583,9 @@
   function selectNode(n) {
     selected = n;
     const ins = $("inspector");
-    if (!n) { ins.classList.remove("show"); $("zoom").classList.remove("shift"); draw(); return; }
+    if (!n) { ins.classList.remove("show"); $("zoom").classList.remove("shift"); requestDraw(); return; }
     $("insName").textContent = n.id;
-    $("insDot").style.background = colorForType(n.type);
+    $("insDot").style.background = n.color;
     const rels = [];
     for (const l of links) {
       if (l.source === n) rels.push({ dir: "out", other: l.target.id, type: l.type });
@@ -514,25 +596,54 @@
         ? `<div class="rel"><span class="rt">${escapeHtml(r.type)}</span><span class="arrow">→</span><a data-goto="${escapeHtml(r.other)}">${escapeHtml(r.other)}</a></div>`
         : `<div class="rel dir-in"><a data-goto="${escapeHtml(r.other)}">${escapeHtml(r.other)}</a><span class="rt">${escapeHtml(r.type)}</span><span class="arrow">→</span></div>`
     ).join("") : `<div class="meta">No relations loaded — double-click to expand.</div>`;
-    const obsHtml = n.obs.length ? n.obs.map((o) => `<div class="obs">${escapeHtml(o)}</div>`).join("") : `<div class="meta">No observations.</div>`;
+    // Observation bodies are lazy-loaded (list payloads carry only obsCount).
+    const oc = n.obsCount | 0;
+    let obsHtml;
+    if (n.obs === null && oc > 0) {
+      obsHtml = `<div class="meta">Loading ${fmt(oc)} observation${oc === 1 ? "" : "s"}…</div>`;
+      loadObservations(n);
+    } else {
+      const obs = n.obs || [];
+      obsHtml = obs.length ? obs.map((o) => `<div class="obs">${escapeHtml(o)}</div>`).join("") : `<div class="meta">No observations.</div>`;
+    }
     $("insBody").innerHTML =
-      `<span class="pill" style="background:${colorForType(n.type)}">${escapeHtml(n.type || "—")}</span>` +
-      `<div class="meta">degree ${n.deg} · ${n.obs.length} observation${n.obs.length === 1 ? "" : "s"}</div>` +
+      `<span class="pill" style="background:${n.color}">${escapeHtml(n.type || "—")}</span>` +
+      `<div class="meta">degree ${n.deg} · ${fmt(oc)} observation${oc === 1 ? "" : "s"}</div>` +
       `<div class="sec">Observations</div>${obsHtml}` +
       `<div class="sec">Relationships (${rels.length})</div>${relHtml}`;
     ins.classList.add("show"); $("zoom").classList.add("shift");
     $("insBody").querySelectorAll("[data-goto]").forEach((a) =>
       a.addEventListener("click", () => { const t = nodeById.get(a.getAttribute("data-goto")); if (t) { centerOn(t); selectNode(t); } }));
-    draw();
+    requestDraw();
+  }
+  // Lazy-fetch observation bodies for the inspected node; re-render if it's still
+  // selected when they arrive. On failure, mark as loaded-empty so we don't retry.
+  async function loadObservations(n) {
+    try {
+      const res = await api("/ui/node?name=" + encodeURIComponent(n.id));
+      if (!res.ok) { n.obs = []; if (selected === n) selectNode(n); return; }
+      const data = await res.json();
+      n.obs = data.observations || [];
+      n.obsCount = n.obs.length;
+    } catch { n.obs = []; }
+    if (selected === n) selectNode(n);
   }
   function centerOn(n) {
     const W = cv.width / dpr, H = cv.height / dpr;
     view.x = W / (2 * view.k) - n.x; view.y = H / (2 * view.k) - n.y;
-    draw();
+    requestDraw();
   }
   function fitView(reset) {
-    if (!nodes.length) { view.x = 0; view.y = 0; view.k = 1; draw(); return; }
-    if (reset) { const a = alpha; alpha = 1; for (let i = 0; i < 80; i++) step(); alpha = a; }
+    if (!nodes.length) { view.x = 0; view.y = 0; view.k = 1; requestDraw(); return; }
+    // A short Barnes-Hut warmup relaxes the (already spiral-seeded) layout enough
+    // to fit sensibly, without the old 80-iteration synchronous O(n²) pre-roll
+    // that froze the main thread on every load. The rAF loop finishes settling.
+    if (reset) {
+      const a = alpha; alpha = 1;
+      const iters = nodes.length > 400 ? 12 : 30;
+      for (let i = 0; i < iters; i++) step();
+      alpha = a;
+    }
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of nodes) { minX = Math.min(minX, n.x); minY = Math.min(minY, n.y); maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y); }
     const W = cv.width / dpr, H = cv.height / dpr, pad = 110;
@@ -540,7 +651,7 @@
     view.k = Math.min(2.2, Math.max(0.05, Math.min((W - pad) / gw, (H - pad) / gh)));
     view.x = W / (2 * view.k) - (minX + maxX) / 2;
     view.y = H / (2 * view.k) - (minY + maxY) / 2;
-    draw();
+    requestDraw();
   }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -551,7 +662,7 @@
   $("overview").addEventListener("click", showOverview);
   $("typeFilter").addEventListener("change", () => { browse.entityType = $("typeFilter").value; browse.offset = 0; load(); });
   $("limit").addEventListener("change", () => { const v = parseInt($("limit").value, 10); if (v > 0) { browse.limit = Math.min(1000, v); browse.offset = 0; load(); } });
-  $("search").addEventListener("input", draw); // live-highlight loaded nodes as you type
+  $("search").addEventListener("input", requestDraw); // live-highlight loaded nodes as you type
   $("search").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
   $("prev").addEventListener("click", () => gotoPage(-1));
   $("next").addEventListener("click", () => gotoPage(1));

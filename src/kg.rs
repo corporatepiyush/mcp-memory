@@ -154,23 +154,146 @@ fn select_all_types(conn: &Connection, kind: i64) -> Result<Vec<(String, usize)>
     Ok(rows)
 }
 
-fn entity_by_id(conn: &Connection, id: i64) -> Result<Entity> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT e.name, t.name,
-               COALESCE((SELECT json_group_array(o.body ORDER BY o.idx) FROM observation o WHERE o.entity_id = e.id), '[]')
-             FROM entity e JOIN type_dict t ON t.id = e.type_id WHERE e.id = ?1 AND e.flags = 0",
-        )
-        .map_err(sqlite_err)?;
-    let (name, etype, obs_json): (String, String, String) = stmt
-        .query_row(params![id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .map_err(sqlite_err)?;
-    let observations: Vec<String> = serde_json::from_str(&obs_json).unwrap_or_default();
-    Ok(Entity {
-        name,
-        entity_type: etype,
-        observations,
-    })
+/// Comma-separated decimal list of ids for an inline `IN (...)` / `VALUES`
+/// clause. The ids are `i64` row ids read straight from the database — never
+/// user text — so inlining them as SQL literals is injection-safe and, unlike
+/// bound `?` parameters, is *not* subject to SQLite's `SQLITE_MAX_VARIABLE_NUMBER`
+/// (~32k) ceiling. Traversals and pages over large id/relation sets can thus
+/// build one statement instead of overflowing the parameter limit (which used to
+/// make the query error out and be silently swallowed into an empty result).
+fn int_csv(ids: &[i64]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(ids.len() * 8);
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{id}");
+    }
+    s
+}
+
+/// Build a `(from,to,type), …` literal list for a relation-triple `VALUES` CTE.
+/// Same rationale as [`int_csv`]: the triples are DB row ids, so inlining them is
+/// injection-safe and sidesteps the bound-parameter ceiling that a large
+/// neighbourhood (3 params per edge) would otherwise breach — which previously
+/// errored the relations query and was silently swallowed into `[]`.
+fn rel_values_literal(rels: &HashSet<(i64, i64, i64)>) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(rels.len() * 16);
+    for (i, (f, t, tp)) in rels.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "({f},{t},{tp})");
+    }
+    s
+}
+
+/// Load full entities (name, type, observations) for a set of ids in a single
+/// query, returning an id→[`Entity`] map. Replaces the old per-id fetches (an
+/// N+1 pattern) on the search path.
+fn batch_entities_by_ids(conn: &Connection, ids: &[i64]) -> FxHashMap<i64, Entity> {
+    let mut map = FxHashMap::default();
+    if ids.is_empty() {
+        return map;
+    }
+    let sql = format!(
+        "SELECT e.id, e.name, t.name,
+                COALESCE((SELECT json_group_array(o.body ORDER BY o.idx)
+                          FROM observation o WHERE o.entity_id = e.id), '[]')
+         FROM entity e JOIN type_dict t ON t.id = e.type_id
+         WHERE e.id IN ({}) AND e.flags = 0",
+        int_csv(ids)
+    );
+    if let Ok(mut stmt) = conn.prepare(&sql)
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+    {
+        for (id, name, etype, obs_json) in rows.flatten() {
+            let observations: Vec<String> = serde_json::from_str(&obs_json).unwrap_or_default();
+            map.insert(id, Entity { name, entity_type: etype, observations });
+        }
+    }
+    map
+}
+
+/// Like [`batch_entities_by_ids`], but for the viewer's list payloads: skips the
+/// observation *bodies* (the canvas never renders them in bulk — they are
+/// lazy-loaded for the single inspected node) and returns only name, type, and
+/// the denormalised `obs_count`. Keeps the search payload — and the reader-lock
+/// hold — small.
+fn batch_entity_lite_by_ids(
+    conn: &Connection,
+    ids: &[i64],
+) -> FxHashMap<i64, (String, String, i64)> {
+    let mut map = FxHashMap::default();
+    if ids.is_empty() {
+        return map;
+    }
+    let sql = format!(
+        "SELECT e.id, e.name, t.name, e.obs_count
+         FROM entity e JOIN type_dict t ON t.id = e.type_id
+         WHERE e.id IN ({}) AND e.flags = 0",
+        int_csv(ids)
+    );
+    if let Ok(mut stmt) = conn.prepare(&sql)
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+    {
+        for (id, name, etype, oc) in rows.flatten() {
+            map.insert(id, (name, etype, oc));
+        }
+    }
+    map
+}
+
+/// Collect entity ids matching an FTS query — name matches first (by rank), then
+/// observation matches — de-duplicated, each source capped at `cap` rows. Shared
+/// by the MCP and viewer search paths so both agree on ordering.
+fn fts_candidate_ids(conn: &Connection, query: &str, cap: usize) -> Vec<i64> {
+    let mut ids: Vec<i64> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let cap_i64 = cap as i64;
+
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT rowid FROM name_fts WHERE name_fts MATCH ?1 ORDER BY rank LIMIT ?2")
+        && let Ok(rows) = stmt.query_map(params![query, cap_i64], |row| row.get::<_, i64>(0))
+    {
+        for id in rows.flatten() {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT entity_id FROM obs_fts JOIN observation ON obs_fts.rowid = observation.id
+         WHERE obs_fts MATCH ?1
+         GROUP BY entity_id
+         LIMIT ?2",
+    ) && let Ok(rows) = stmt.query_map(params![query, cap_i64], |row| row.get::<_, i64>(0))
+    {
+        for id in rows.flatten() {
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids
 }
 
 /// Direction of relation traversal.
@@ -1452,65 +1575,94 @@ impl GraphHandle {
         }
         let conn = self.readers.get();
 
-        // Single pass: collect IDs from name_fts then obs_fts, deduping with a set.
-        let mut entity_ids: Vec<i64> = Vec::new();
-        let mut seen: HashSet<i64> = HashSet::new();
+        // Collect ordered candidate ids, then load them all in ONE query instead
+        // of an `entity_by_id` per candidate (the old N+1). Ordering (name matches
+        // first, then observation matches) and the post-filter offset semantics
+        // are preserved exactly.
+        let cap = offset.saturating_add(limit);
+        let candidates = fts_candidate_ids(&conn, query, cap);
+        let mut by_id = batch_entities_by_ids(&conn, &candidates);
 
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT rowid FROM name_fts WHERE name_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-        ) {
-            let limit_i64 = (limit + offset) as i64;
-            if let Ok(rows) = stmt.query_map(params![query, limit_i64], |row| {
-                row.get::<_, i64>(0)
-            }) {
-                for row in rows.flatten() {
-                    if seen.insert(row) {
-                        entity_ids.push(row);
-                    }
-                }
-            }
-        }
-
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT entity_id FROM obs_fts JOIN observation ON obs_fts.rowid = observation.id
-             WHERE obs_fts MATCH ?1
-             GROUP BY entity_id
-             LIMIT ?2",
-        ) {
-            let limit_i64 = (limit + offset) as i64;
-            if let Ok(rows) = stmt.query_map(params![query, limit_i64], |row| {
-                row.get::<_, i64>(0)
-            }) {
-                for row in rows.flatten() {
-                    if seen.insert(row) {
-                        entity_ids.push(row);
-                    }
-                }
-            }
-        }
-
-        // Apply filter_type, offset, limit.
         let mut results = Vec::new();
         let mut count: usize = 0;
-        for eid in entity_ids {
-            if let Ok(entity) = entity_by_id(&conn, eid) {
-                if let Some(ft) = filter_type
-                    && !ft.is_empty() && entity.entity_type != ft {
-                        continue;
-                    }
-                if count < offset {
-                    count += 1;
-                    continue;
-                }
-                if results.len() >= limit {
-                    break;
-                }
-                results.push(entity);
-                count += 1;
+        for eid in candidates {
+            let Some(entity) = by_id.remove(&eid) else { continue };
+            if let Some(ft) = filter_type
+                && !ft.is_empty()
+                && entity.entity_type != ft
+            {
+                continue;
             }
+            if count < offset {
+                count += 1;
+                continue;
+            }
+            if results.len() >= limit {
+                break;
+            }
+            results.push(entity);
+            count += 1;
         }
 
         results
+    }
+
+    /// The viewer's search payload: a JSON array of `{name, entityType, obsCount}`
+    /// (no observation bodies — see [`batch_entity_lite_by_ids`]), in the same
+    /// order and with the same post-filter offset semantics as
+    /// [`Self::search_nodes_filtered`]. Returns `(entities_json, returned,
+    /// has_more)`; `has_more` is detected by fetching one extra match past the
+    /// page. Builds the JSON directly to avoid a `Vec<Entity>` round-trip.
+    pub fn search_nodes_lite_json(
+        &self,
+        query: &str,
+        filter_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> (String, usize, bool) {
+        use std::fmt::Write as _;
+        if query.is_empty() {
+            return ("[]".to_string(), 0, false);
+        }
+        let conn = self.readers.get();
+        // One extra row past the page lets us report `hasMore` after filtering.
+        let cap = offset.saturating_add(limit).saturating_add(1);
+        let candidates = fts_candidate_ids(&conn, query, cap);
+        let by_id = batch_entity_lite_by_ids(&conn, &candidates);
+        let ft = filter_type.filter(|s| !s.is_empty());
+
+        let mut arr = String::from("[");
+        let mut count: usize = 0; // entities passing the type filter, seen so far
+        let mut returned: usize = 0;
+        let mut has_more = false;
+        for eid in candidates {
+            let Some((name, etype, oc)) = by_id.get(&eid) else { continue };
+            if let Some(f) = ft
+                && etype != f
+            {
+                continue;
+            }
+            if count < offset {
+                count += 1;
+                continue;
+            }
+            if returned >= limit {
+                has_more = true;
+                break;
+            }
+            if returned > 0 {
+                arr.push(',');
+            }
+            arr.push_str("{\"name\":");
+            push_json_str(&mut arr, name);
+            arr.push_str(",\"entityType\":");
+            push_json_str(&mut arr, etype);
+            let _ = write!(arr, ",\"obsCount\":{oc}}}");
+            returned += 1;
+            count += 1;
+        }
+        arr.push(']');
+        (arr, returned, has_more)
     }
 
     pub fn read_graph_filtered(
@@ -1519,6 +1671,31 @@ impl GraphHandle {
         offset: usize,
         limit: usize,
     ) -> Result<String> {
+        self.read_graph_page(filter_type, offset, limit, true)
+            .map(|(json, _)| json)
+    }
+
+    /// Observation-free page for the browser viewer: entities carry `obsCount`
+    /// (the denormalised count) instead of the observation bodies, which the
+    /// canvas never renders in bulk — the inspector lazy-loads them for the one
+    /// selected node via `GET /ui/node`. Returns `(json, returned)` so the caller
+    /// can build the pagination cursor without re-parsing the payload.
+    pub fn read_graph_filtered_lite(
+        &self,
+        filter_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(String, usize)> {
+        self.read_graph_page(filter_type, offset, limit, false)
+    }
+
+    fn read_graph_page(
+        &self,
+        filter_type: Option<&str>,
+        offset: usize,
+        limit: usize,
+        include_obs: bool,
+    ) -> Result<(String, usize)> {
         let conn = self.readers.get();
 
         let limit_sql: i64 = if limit == usize::MAX {
@@ -1561,29 +1738,40 @@ impl GraphHandle {
         };
 
         if ids.is_empty() {
-            return Ok(r#"{"entities":[],"relations":[]}"#.to_string());
+            return Ok((r#"{"entities":[],"relations":[]}"#.to_string(), 0));
         }
 
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // Inline the page's ids as SQL integer literals rather than bound `?`
+        // parameters: a full-graph read (limit = usize::MAX) can exceed SQLite's
+        // ~32k variable cap, which would error the query. The ids are DB row ids,
+        // so this is injection-safe. See [`int_csv`].
+        let idlist = int_csv(&ids);
+        let returned = ids.len();
+
+        // The viewer omits observation bodies (they inflate the payload, the
+        // reader-lock hold, and browser memory for a graph the canvas only lays
+        // out); it ships `obsCount` instead. The MCP `read_graph` keeps the full
+        // observations shape.
+        let obs_field = if include_obs {
+            "'observations', COALESCE((SELECT json_group_array(o.body ORDER BY o.idx)
+                        FROM observation o WHERE o.entity_id = e.id), json('[]'))"
+        } else {
+            "'obsCount', e.obs_count"
+        };
 
         let entities_json: String = {
             let sql = format!(
                 "SELECT COALESCE(json_group_array(json_object(
                     'name', e.name,
                     'entityType', t.name,
-                    'observations', COALESCE((
-                        SELECT json_group_array(o.body ORDER BY o.idx)
-                        FROM observation o WHERE o.entity_id = e.id
-                    ), json('[]'))
+                    {obs_field}
                 ) ORDER BY e.id), json('[]'))
                 FROM entity e
                 JOIN type_dict t ON t.id = e.type_id
-                WHERE e.id IN ({placeholders}) AND e.flags = 0"
+                WHERE e.id IN ({idlist}) AND e.flags = 0"
             );
-            conn.query_row(&sql, rusqlite::params_from_iter(&ids), |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(sqlite_err)?
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
         };
 
         let relations_json: String = {
@@ -1597,15 +1785,10 @@ impl GraphHandle {
                 JOIN entity e1 ON e1.id = r.from_id
                 JOIN entity e2 ON e2.id = r.to_id
                 JOIN type_dict t ON t.id = r.type_id
-                WHERE r.from_id IN ({placeholders}) AND r.to_id IN ({placeholders})
+                WHERE r.from_id IN ({idlist}) AND r.to_id IN ({idlist})
                   AND e1.flags = 0 AND e2.flags = 0"
             );
-            let all_params: Vec<&dyn ToSql> = ids
-                .iter()
-                .map(|id| id as &dyn ToSql)
-                .chain(ids.iter().map(|id| id as &dyn ToSql))
-                .collect();
-            conn.query_row(&sql, all_params.as_slice(), |row| row.get::<_, String>(0))
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
                 .map_err(sqlite_err)?
         };
 
@@ -1615,7 +1798,7 @@ impl GraphHandle {
         out.push_str(",\"relations\":");
         out.push_str(&relations_json);
         out.push('}');
-        Ok(out)
+        Ok((out, returned))
     }
 
     pub fn open_nodes(&self, names: &[String]) -> String {
@@ -2115,61 +2298,47 @@ impl GraphHandle {
             current_depth += 1;
         }
 
-        let entities_json: String = {
-            if all_entity_ids.is_empty() {
-                "[]".to_string()
-            } else {
-                let ids: Vec<i64> = all_entity_ids.iter().copied().collect();
-                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-                let sql = format!(
-                    "SELECT COALESCE(json_group_array(json_object(
-                        'name', e.name,
-                        'entityType', t.name,
-                        'observations', COALESCE((
-                            SELECT json_group_array(o.body ORDER BY o.idx)
-                            FROM observation o WHERE o.entity_id = e.id
-                        ), json('[]'))
-                    ) ORDER BY e.id), json('[]'))
-                    FROM entity e
-                    JOIN type_dict t ON t.id = e.type_id
-                    WHERE e.id IN ({}) AND e.flags = 0",
-                    placeholders.join(",")
-                );
-                conn.query_row(&sql, rusqlite::params_from_iter(&ids), |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap_or_else(|_| "[]".to_string())
-            }
+        let entities_json: String = if all_entity_ids.is_empty() {
+            "[]".to_string()
+        } else {
+            let ids: Vec<i64> = all_entity_ids.iter().copied().collect();
+            let sql = format!(
+                "SELECT COALESCE(json_group_array(json_object(
+                    'name', e.name,
+                    'entityType', t.name,
+                    'observations', COALESCE((
+                        SELECT json_group_array(o.body ORDER BY o.idx)
+                        FROM observation o WHERE o.entity_id = e.id
+                    ), json('[]'))
+                ) ORDER BY e.id), json('[]'))
+                FROM entity e
+                JOIN type_dict t ON t.id = e.type_id
+                WHERE e.id IN ({}) AND e.flags = 0",
+                int_csv(&ids)
+            );
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
         };
 
-        let relations_json: String = {
-            if all_rel_pairs.is_empty() {
-                "[]".to_string()
-            } else {
-                let vals: Vec<String> = all_rel_pairs.iter().map(|_| "(?, ?, ?)".to_string()).collect();
-                let sql = format!(
-                    "WITH r(from_id, to_id, type_id) AS (VALUES {})
-                    SELECT COALESCE(json_group_array(json_object(
-                        'from', e1.name,
-                        'to', e2.name,
-                        'relationType', t.name
-                    )), json('[]'))
-                    FROM r
-                    JOIN entity e1 ON e1.id = r.from_id
-                    JOIN entity e2 ON e2.id = r.to_id
-                    JOIN type_dict t ON t.id = r.type_id
-                    WHERE e1.flags = 0 AND e2.flags = 0",
-                    vals.join(", ")
-                );
-                let params: Vec<&dyn ToSql> = all_rel_pairs.iter()
-                    .flat_map(|(f, t, tp)| {
-                        vec![f as &dyn ToSql, t as &dyn ToSql, tp as &dyn ToSql]
-                    })
-                    .collect();
-                let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
-                stmt.query_row(params.as_slice(), |row| row.get::<_, String>(0))
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
+        let relations_json: String = if all_rel_pairs.is_empty() {
+            "[]".to_string()
+        } else {
+            let sql = format!(
+                "WITH r(from_id, to_id, type_id) AS (VALUES {})
+                SELECT COALESCE(json_group_array(json_object(
+                    'from', e1.name,
+                    'to', e2.name,
+                    'relationType', t.name
+                )), json('[]'))
+                FROM r
+                JOIN entity e1 ON e1.id = r.from_id
+                JOIN entity e2 ON e2.id = r.to_id
+                JOIN type_dict t ON t.id = r.type_id
+                WHERE e1.flags = 0 AND e2.flags = 0",
+                rel_values_literal(&all_rel_pairs)
+            );
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
         };
 
         let mut out = String::with_capacity(32 + entities_json.len() + relations_json.len());
@@ -2189,6 +2358,21 @@ impl GraphHandle {
     pub fn entity_type_counts(&self) -> Vec<(String, usize)> {
         let conn = self.readers.get();
         select_all_types(&conn, 0).unwrap_or_default()
+    }
+
+    /// The viewer's shared page metadata — entity-type legend and the graph-wide
+    /// entity/relation totals — gathered on a *single* reader connection. The
+    /// `/ui/graph` and `/ui/search` handlers used to take three or four separate
+    /// reader-pool acquisitions per request (`entity_type_counts` +
+    /// `get_entity_count` + `get_relation_count`); folding them into one lock
+    /// acquisition cuts pool churn and shortens the reader hold, which is what
+    /// bounds concurrent read throughput.
+    pub fn ui_meta(&self) -> (Vec<(String, usize)>, usize, usize) {
+        let conn = self.readers.get();
+        let types = select_all_types(&conn, 0).unwrap_or_default();
+        let entities = read_graph_stat(&conn, "entities").unwrap_or(0).max(0) as usize;
+        let relations = read_graph_stat(&conn, "relations").unwrap_or(0).max(0) as usize;
+        (types, entities, relations)
     }
 
     pub fn relation_type_counts(&self) -> Vec<(String, usize)> {
@@ -2537,61 +2721,47 @@ impl GraphHandle {
             cur_depth += 1;
         }
 
-        let entities_json: String = {
-            if all_ids.is_empty() {
-                "[]".to_string()
-            } else {
-                let ids: Vec<i64> = all_ids.iter().copied().collect();
-                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-                let sql = format!(
-                    "SELECT COALESCE(json_group_array(json_object(
-                        'name', e.name,
-                        'entityType', t.name,
-                        'observations', COALESCE((
-                            SELECT json_group_array(o.body ORDER BY o.idx)
-                            FROM observation o WHERE o.entity_id = e.id
-                        ), json('[]'))
-                    ) ORDER BY e.id), json('[]'))
-                    FROM entity e
-                    JOIN type_dict t ON t.id = e.type_id
-                    WHERE e.id IN ({}) AND e.flags = 0",
-                    placeholders.join(",")
-                );
-                conn.query_row(&sql, rusqlite::params_from_iter(&ids), |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap_or_else(|_| "[]".to_string())
-            }
+        let entities_json: String = if all_ids.is_empty() {
+            "[]".to_string()
+        } else {
+            let ids: Vec<i64> = all_ids.iter().copied().collect();
+            let sql = format!(
+                "SELECT COALESCE(json_group_array(json_object(
+                    'name', e.name,
+                    'entityType', t.name,
+                    'observations', COALESCE((
+                        SELECT json_group_array(o.body ORDER BY o.idx)
+                        FROM observation o WHERE o.entity_id = e.id
+                    ), json('[]'))
+                ) ORDER BY e.id), json('[]'))
+                FROM entity e
+                JOIN type_dict t ON t.id = e.type_id
+                WHERE e.id IN ({}) AND e.flags = 0",
+                int_csv(&ids)
+            );
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
         };
 
-        let relations_json: String = {
-            if all_rels.is_empty() {
-                "[]".to_string()
-            } else {
-                let vals: Vec<String> = all_rels.iter().map(|_| "(?, ?, ?)".to_string()).collect();
-                let sql = format!(
-                    "WITH r(from_id, to_id, type_id) AS (VALUES {})
-                    SELECT COALESCE(json_group_array(json_object(
-                        'from', e1.name,
-                        'to', e2.name,
-                        'relationType', t.name
-                    )), json('[]'))
-                    FROM r
-                    JOIN entity e1 ON e1.id = r.from_id
-                    JOIN entity e2 ON e2.id = r.to_id
-                    JOIN type_dict t ON t.id = r.type_id
-                    WHERE e1.flags = 0 AND e2.flags = 0",
-                    vals.join(", ")
-                );
-                let params: Vec<&dyn ToSql> = all_rels.iter()
-                    .flat_map(|(f, t, tp)| {
-                        vec![f as &dyn ToSql, t as &dyn ToSql, tp as &dyn ToSql]
-                    })
-                    .collect();
-                let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
-                stmt.query_row(params.as_slice(), |row| row.get::<_, String>(0))
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
+        let relations_json: String = if all_rels.is_empty() {
+            "[]".to_string()
+        } else {
+            let sql = format!(
+                "WITH r(from_id, to_id, type_id) AS (VALUES {})
+                SELECT COALESCE(json_group_array(json_object(
+                    'from', e1.name,
+                    'to', e2.name,
+                    'relationType', t.name
+                )), json('[]'))
+                FROM r
+                JOIN entity e1 ON e1.id = r.from_id
+                JOIN entity e2 ON e2.id = r.to_id
+                JOIN type_dict t ON t.id = r.type_id
+                WHERE e1.flags = 0 AND e2.flags = 0",
+                rel_values_literal(&all_rels)
+            );
+            conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
         };
 
         let mut out = String::with_capacity(32 + entities_json.len() + relations_json.len());

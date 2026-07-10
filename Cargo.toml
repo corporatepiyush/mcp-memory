@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory"
-version = "5.2.0"
+version = "5.2.1"
 edition = "2024"
 authors = ["Piyush"]
 description = "MCP server giving LLM agents persistent memory: a SQLite knowledge graph with FTS5 search, tree-sitter code indexing (10 languages) with semantic code search, and optional vector + hybrid search (usearch HNSW or IVF-Flat) with batch upsert, more-like-this, recommendations, and MMR diversification"
@@ -28,6 +28,9 @@ axum = "0.8"
 # src/tls.rs) — no cmake/aws-lc toolchain required.
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Response compression for the HTTP transport (graph JSON + embedded UI assets).
+# The default predicate skips SSE, so the `/mcp` streams stay uncompressed.
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip", "compression-br"] }
 futures = "0.3"
 subtle = "2.6"
 lru = "0.12"

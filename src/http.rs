@@ -30,8 +30,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 use tracing::{error, info};
 
 use crate::errors::{MCSError, Result};
@@ -74,7 +75,13 @@ pub fn router(state: HttpState) -> Router {
         .route("/ui/graph.js", get(ui_js_handler))
         .route("/ui/graph", get(ui_graph_handler))
         .route("/ui/search", get(ui_search_handler))
+        .route("/ui/node", get(ui_node_handler))
         .route("/ui/expand", get(ui_expand_handler))
+        // Compress responses when the client advertises support. The graph JSON
+        // and the embedded HTML/CSS/JS are highly compressible; the default
+        // predicate skips already-compressed types and, importantly, SSE
+        // (`text/event-stream`), so the `/mcp` streams are left untouched.
+        .layer(CompressionLayer::new())
         .layer(DefaultBodyLimit::max(server::MAX_REQUEST_BYTES))
         .with_state(state)
 }
@@ -343,66 +350,120 @@ async fn ui_search_handler(
     .await
 }
 
-/// Attach the viewer's shared metadata to a `{entities, relations}` payload: the
-/// entity-type legend, the graph-wide totals, and the pagination cursor
-/// (`offset` / `limit` / `returned` / `hasMore`) that drives the Prev/Next
-/// controls without a second round-trip.
-fn augment_payload(
-    graph: &mut Value,
-    type_counts: Vec<(String, usize)>,
+/// `GET /ui/node` — one entity with its observation bodies, for the inspector to
+/// lazy-load when a node is selected. The list endpoints (`/ui/graph`,
+/// `/ui/search`) deliberately omit observation bodies (they only carry
+/// `obsCount`) to keep those payloads small; this fetches the bodies for the
+/// single node the user is looking at. Same auth + `graph-read` gate. Query
+/// params: `name` (required) and `token` (auth fallback).
+async fn ui_node_handler(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(resp) = ui_data_gate(&state, &headers, &params) {
+        return resp;
+    }
+    let Some(name) = params.get("name").filter(|s| !s.is_empty()).cloned() else {
+        return (StatusCode::BAD_REQUEST, "missing 'name' parameter").into_response();
+    };
+    let kg = state.kg;
+    match tokio::task::spawn_blocking(move || kg.get_entity(&name)).await {
+        Ok(Ok(Some(entity))) => match serde_json::to_string(&entity) {
+            Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
+            Err(e) => {
+                error!("/ui/node serialize error: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        },
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "entity not found").into_response(),
+        Ok(Err(e)) => {
+            error!("/ui/node error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        Err(join_err) => {
+            error!("/ui/node task panicked: {join_err}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// The viewer's shared page metadata, spliced onto every list payload: the
+/// entity-type legend, the graph-wide totals, and the pagination cursor that
+/// drives Prev/Next without a second round-trip.
+struct PageMeta<'a> {
+    type_counts: &'a [(String, usize)],
     entities_total: usize,
     relations_total: usize,
     offset: usize,
     limit: usize,
     returned: usize,
     has_more: bool,
-) {
-    if let Value::Object(m) = graph {
-        let types: Vec<Value> = type_counts
-            .into_iter()
-            .map(|(t, c)| json!({ "type": t, "count": c }))
-            .collect();
-        m.insert("entityTypes".into(), Value::Array(types));
-        m.insert(
-            "stats".into(),
-            json!({ "entities": entities_total, "relations": relations_total }),
-        );
-        m.insert(
-            "page".into(),
-            json!({ "offset": offset, "limit": limit, "returned": returned, "hasMore": has_more }),
-        );
-    }
 }
 
-/// Assemble the `/ui/graph` JSON: a page of the graph from
-/// [`GraphHandle::read_graph_filtered`] plus the shared viewer metadata.
-/// `hasMore` compares this page against the scope total (the filtered type's
-/// count, or the whole-graph entity count) so the viewer can enable Next.
+/// Splice [`PageMeta`] onto a `{entities,…,relations,…}` JSON object *in place,
+/// without reparsing it*. `graph` is a complete object built by us, so it ends in
+/// `}`; we pop that brace, append the extra keys, and re-close. This replaces a
+/// full `serde_json::from_str` → mutate → `to_string` round-trip over what is
+/// often the largest payload the server emits.
+fn splice_meta(graph: &mut String, m: &PageMeta) {
+    use std::fmt::Write as _;
+    debug_assert!(graph.ends_with('}'));
+    graph.pop();
+    graph.push_str(",\"entityTypes\":[");
+    for (i, (t, c)) in m.type_counts.iter().enumerate() {
+        if i > 0 {
+            graph.push(',');
+        }
+        graph.push_str("{\"type\":");
+        crate::kg::push_json_str(graph, t);
+        let _ = write!(graph, ",\"count\":{c}}}");
+    }
+    let _ = write!(
+        graph,
+        "],\"stats\":{{\"entities\":{e},\"relations\":{r}}},\
+         \"page\":{{\"offset\":{o},\"limit\":{l},\"returned\":{ret},\"hasMore\":{hm}}}}}",
+        e = m.entities_total,
+        r = m.relations_total,
+        o = m.offset,
+        l = m.limit,
+        ret = m.returned,
+        hm = m.has_more,
+    );
+}
+
+/// Assemble the `/ui/graph` JSON: an observation-free page of the graph from
+/// [`GraphHandle::read_graph_filtered_lite`] plus the shared viewer metadata
+/// (gathered in one reader acquisition via [`GraphHandle::ui_meta`]). `hasMore`
+/// compares this page against the scope total (the filtered type's count, or the
+/// whole-graph entity count) so the viewer can enable Next.
 fn build_graph_payload(
     kg: &GraphHandle,
     entity_type: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> Result<String> {
-    let graph_str = kg.read_graph_filtered(entity_type, offset, limit)?;
-    let mut graph: Value = serde_json::from_str(&graph_str).map_err(MCSError::JsonError)?;
-
-    let type_counts = kg.entity_type_counts();
-    let entities_total = kg.get_entity_count().unwrap_or(0);
-    let relations_total = kg.get_relation_count().unwrap_or(0);
+    let (mut graph, returned) = kg.read_graph_filtered_lite(entity_type, offset, limit)?;
+    let (type_counts, entities_total, relations_total) = kg.ui_meta();
     let scope_total = match entity_type {
-        Some(t) if !t.is_empty() => {
-            type_counts.iter().find(|(n, _)| n == t).map_or(0, |(_, c)| *c)
-        }
+        Some(t) if !t.is_empty() => type_counts.iter().find(|(n, _)| n == t).map_or(0, |(_, c)| *c),
         _ => entities_total,
     };
-    let returned = graph.get("entities").and_then(Value::as_array).map_or(0, |a| a.len());
     let has_more = offset.saturating_add(returned) < scope_total;
 
-    augment_payload(
-        &mut graph, type_counts, entities_total, relations_total, offset, limit, returned, has_more,
+    splice_meta(
+        &mut graph,
+        &PageMeta {
+            type_counts: &type_counts,
+            entities_total,
+            relations_total,
+            offset,
+            limit,
+            returned,
+            has_more,
+        },
     );
-    serde_json::to_string(&graph).map_err(MCSError::JsonError)
+    Ok(graph)
 }
 
 /// Turn a free-text search box query into a safe FTS5 MATCH expression: keep
@@ -424,10 +485,11 @@ fn fts_query(raw: &str) -> String {
         .join(" ")
 }
 
-/// Assemble the `/ui/search` JSON: a page of FTS5 matches from
-/// [`GraphHandle::search_nodes_filtered`] as `{entities, relations: []}` (the
+/// Assemble the `/ui/search` JSON: an observation-free page of FTS5 matches from
+/// [`GraphHandle::search_nodes_lite_json`] as `{entities, relations: []}` (the
 /// matched nodes; the user double-clicks to expand their relationships) plus the
-/// shared viewer metadata. Fetches `limit + 1` to detect `hasMore` cheaply.
+/// shared viewer metadata. `hasMore` is detected server-side by fetching one
+/// extra match past the page.
 fn build_search_payload(
     kg: &GraphHandle,
     query: &str,
@@ -436,19 +498,28 @@ fn build_search_payload(
     limit: usize,
 ) -> Result<String> {
     let fts = fts_query(query);
-    let mut hits = kg.search_nodes_filtered(&fts, entity_type, offset, limit.saturating_add(1));
-    let has_more = hits.len() > limit;
-    hits.truncate(limit);
-    let returned = hits.len();
+    let (entities_json, returned, has_more) =
+        kg.search_nodes_lite_json(&fts, entity_type, offset, limit);
 
-    let mut graph = json!({ "entities": hits, "relations": [] });
-    let type_counts = kg.entity_type_counts();
-    let entities_total = kg.get_entity_count().unwrap_or(0);
-    let relations_total = kg.get_relation_count().unwrap_or(0);
-    augment_payload(
-        &mut graph, type_counts, entities_total, relations_total, offset, limit, returned, has_more,
+    let mut graph = String::with_capacity(entities_json.len() + 48);
+    graph.push_str("{\"entities\":");
+    graph.push_str(&entities_json);
+    graph.push_str(",\"relations\":[]}");
+
+    let (type_counts, entities_total, relations_total) = kg.ui_meta();
+    splice_meta(
+        &mut graph,
+        &PageMeta {
+            type_counts: &type_counts,
+            entities_total,
+            relations_total,
+            offset,
+            limit,
+            returned,
+            has_more,
+        },
     );
-    serde_json::to_string(&graph).map_err(MCSError::JsonError)
+    Ok(graph)
 }
 
 /// `GET /ui/expand` — the neighbourhood of one entity, for the viewer's
