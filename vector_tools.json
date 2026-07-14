@@ -1,0 +1,210 @@
+[
+  {
+    "name": "vector_upsert_embedding",
+    "description": "Upsert a vector embedding for an existing entity in the knowledge graph. The entity must already exist. Embedding dimension must match the configured embedding size (default 384). Use this to store pre-computed embeddings for semantic/vector search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": {
+          "type": "string",
+          "description": "The name of the entity to attach the embedding to (must already exist in the KG)"
+        },
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "The embedding vector as an array of f64 values"
+        },
+        "model": {
+          "type": "string",
+          "description": "Optional model identifier (e.g. 'text-embedding-3-small')"
+        }
+      },
+      "required": ["entityName", "embedding"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "vector_search_entities",
+    "description": "Search entities by vector similarity. Finds the top-K entities whose stored embeddings are closest (cosine similarity) to the query embedding. Optionally filter by entity type.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "embedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "The query embedding vector (f64 array, must match configured dimension)"
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of results to return (default 10)"
+        },
+        "entityType": {
+          "type": "string",
+          "description": "Optional: only return entities of this type"
+        }
+      },
+      "required": ["embedding"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_delete_embedding",
+    "description": "Delete the vector embedding for a given entity. The entity itself is NOT removed from the knowledge graph — only its embedding is deleted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": {
+          "type": "string",
+          "description": "The name of the entity whose embedding to delete"
+        }
+      },
+      "required": ["entityName"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "hybrid_search",
+    "description": "Combined vector + full-text search with Reciprocal Rank Fusion. Runs vector search on the query embedding and FTS5 text search on the query text simultaneously, then fuses results by rank. Optionally boosts results by graph centrality.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queryText": {
+          "type": "string",
+          "description": "Text query for FTS5 search against entity names and observations"
+        },
+        "queryEmbedding": {
+          "type": "array",
+          "items": { "type": "number" },
+          "description": "Query embedding vector for vector similarity search"
+        },
+        "textWeight": {
+          "type": "number",
+          "description": "Weight for text search rank in RRF fusion (default 0.5)"
+        },
+        "vecWeight": {
+          "type": "number",
+          "description": "Weight for vector search rank in RRF fusion (default 0.5)"
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Number of fused results to return (default 10)"
+        }
+      },
+      "required": ["queryText", "queryEmbedding"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_refresh_graph_cache",
+    "description": "Rebuild the in-memory petgraph adjacency cache from the SQLite relation table. Use this after adding/removing relations via KG tools if you want the petgraph-based centrality boost in hybrid_search to be up-to-date.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "vector_store_stats",
+    "description": "Return statistics about the vector store: embeddingCount, dims, indexKind ('hnsw' or 'ivf'), petgraphNodes/petgraphEdges, the index capacity (indexCapacity), and its resident memory in bytes (indexMemoryBytes) broken down into the graph component (indexGraphBytes; 0 for IVF) and the stored vectors (indexVectorsBytes).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_batch_upsert",
+    "description": "Bulk-upsert many embeddings in one call — the ingestion primitive for RAG pipelines. Each item attaches an embedding to an existing entity. Items are processed independently: per-item failures (missing entity, wrong dimension) are reported in the 'errors' array rather than aborting the batch. Returns {upserted, failed, errors}. Max 1024 items per call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Embeddings to upsert",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entityName": { "type": "string", "description": "Existing entity to attach the embedding to" },
+              "embedding": { "type": "array", "items": { "type": "number" }, "description": "Embedding vector (must match configured dimension)" },
+              "model": { "type": "string", "description": "Optional model identifier" }
+            },
+            "required": ["entityName", "embedding"]
+          }
+        }
+      },
+      "required": ["items"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "vector_get_embedding",
+    "description": "Fetch the stored embedding vector for an entity. Returns {entityName, dims, model, embedding}, or {found:false} when the entity has no embedding. Useful for inspection, caching, or feeding an entity's vector into another search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": { "type": "string", "description": "The entity whose embedding to fetch" }
+      },
+      "required": ["entityName"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_search_by_entity",
+    "description": "'More like this': find entities most similar to a given entity by using that entity's own stored embedding as the query. The entity itself is excluded by default (excludeSelf). Ideal for recommendations and related-item lookups without recomputing an embedding.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityName": { "type": "string", "description": "The reference entity (must have an embedding)" },
+        "topK": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results (default 10)" },
+        "entityType": { "type": "string", "description": "Optional: only return entities of this type" },
+        "excludeSelf": { "type": "boolean", "description": "Exclude the reference entity from results (default true)" }
+      },
+      "required": ["entityName"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_recommend",
+    "description": "Example-based recommendation. Builds a query vector from the mean of the 'positive' example entities' embeddings, minus the mean of any 'negative' examples, then returns the nearest entities. All example entities are excluded from results. Classic 'find more like these, not like those' retrieval.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "positive": { "type": "array", "items": { "type": "string" }, "description": "Entity names whose embeddings are liked (at least one required)" },
+        "negative": { "type": "array", "items": { "type": "string" }, "description": "Optional entity names whose embeddings are disliked" },
+        "topK": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of results (default 10)" },
+        "entityType": { "type": "string", "description": "Optional: only return entities of this type" }
+      },
+      "required": ["positive"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_mmr_search",
+    "description": "Diversified semantic search via Maximal Marginal Relevance (MMR). Retrieves a candidate pool (fetchK) for the query embedding, then greedily selects topK results balancing relevance to the query against novelty versus already-selected results. 'lambda' in [0,1] trades relevance (1.0) for diversity (0.0); default 0.5. Reduces near-duplicate hits — a standard RAG context-selection step. 'score' is the MMR score.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "embedding": { "type": "array", "items": { "type": "number" }, "description": "Query embedding vector" },
+        "topK": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Number of diversified results (default 10)" },
+        "fetchK": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Candidate pool size to diversify from (default max(20, 4*topK))" },
+        "lambda": { "type": "number", "minimum": 0, "maximum": 1, "description": "Relevance/diversity trade-off (default 0.5)" },
+        "entityType": { "type": "string", "description": "Optional: only return entities of this type" }
+      },
+      "required": ["embedding"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "vector_reindex",
+    "description": "Rebuild/retrain the ANN index over the current vectors. For the IVF-Flat backend this re-runs k-means to refresh the Voronoi cells and improve recall after large batch ingestion; for HNSW it is a no-op. Returns {reindexed, indexKind, embeddingCount}.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  }
+]

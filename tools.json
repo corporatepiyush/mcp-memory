@@ -1,0 +1,396 @@
+[
+  {
+    "name": "create_entities",
+    "description": "Create multiple new entities in the knowledge graph. Entities that already exist (by name) are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "The unique name of the entity" },
+              "entityType": { "type": "string", "description": "The type of the entity (e.g. person, organization, event)" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "An array of observation contents associated with the entity" }
+            },
+            "required": ["name", "entityType", "observations"]
+          }
+        }
+      },
+      "required": ["entities"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "create_relations",
+    "description": "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice. Relations that already exist (same from, to, relationType) are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string", "description": "The name of the entity where the relation starts" },
+              "to": { "type": "string", "description": "The name of the entity where the relation ends" },
+              "relationType": { "type": "string", "description": "The type of the relation" }
+            },
+            "required": ["from", "to", "relationType"]
+          }
+        }
+      },
+      "required": ["relations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "add_observations",
+    "description": "Add new observations to existing entities in the knowledge graph. Observations that already exist on the entity are silently skipped.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entityName": { "type": "string", "description": "The name of the entity to add observations to" },
+              "contents": { "type": "array", "items": { "type": "string" }, "description": "An array of observation contents to add" }
+            },
+            "required": ["entityName", "contents"]
+          }
+        }
+      },
+      "required": ["observations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
+  },
+  {
+    "name": "delete_entities",
+    "description": "Delete multiple entities and their associated relations from the knowledge graph. Relations referencing deleted entities (from either endpoint) are also removed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityNames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "An array of entity names to delete"
+        }
+      },
+      "required": ["entityNames"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "delete_observations",
+    "description": "Delete specific observations from entities in the knowledge graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "deletions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entityName": { "type": "string", "description": "The name of the entity containing the observations" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "An array of observations to delete" }
+            },
+            "required": ["entityName", "observations"]
+          }
+        }
+      },
+      "required": ["deletions"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "delete_relations",
+    "description": "Delete multiple relations from the knowledge graph. Each relation must match on from, to, and relationType to be deleted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "relations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": { "type": "string", "description": "The name of the entity where the relation starts" },
+              "to": { "type": "string", "description": "The name of the entity where the relation ends" },
+              "relationType": { "type": "string", "description": "The type of the relation" }
+            },
+            "required": ["from", "to", "relationType"]
+          }
+        }
+      },
+      "required": ["relations"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true }
+  },
+  {
+    "name": "read_graph",
+    "description": "Read the knowledge graph. With no arguments, returns all entities and relations. Optionally filter by entityType and paginate with offset/limit; when filtered, only relations whose both endpoints fall in the returned page are included.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entityType": { "type": "string", "description": "Only return entities of this type (optional)" },
+        "offset": { "type": "integer", "minimum": 0, "description": "Number of matching entities to skip (optional)" },
+        "limit": { "type": "integer", "minimum": 0, "description": "Maximum number of entities to return (optional)" }
+      }
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "search_nodes",
+    "description": "Search for entities in the knowledge graph. Matches against entity names, types, and observation content (case-insensitive), returned best-match-first by relevance. Also returns any relations connected to matching entities. Optionally restrict by entityType and paginate with offset/limit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": "Search query to match against entity names, types, and observation content" },
+        "entityType": { "type": "string", "description": "Only return entities of this type (optional)" },
+        "offset": { "type": "integer", "minimum": 0, "description": "Number of ranked matches to skip (optional)" },
+        "limit": { "type": "integer", "minimum": 0, "description": "Maximum number of entities to return (optional)" }
+      },
+      "required": ["query"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "open_nodes",
+    "description": "Open specific nodes in the knowledge graph by their entity names. Returns the requested entities along with any relations connected to them (from either endpoint).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "An array of entity names to retrieve"
+        }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "get_entity",
+    "description": "Retrieve a single entity by its exact name. Returns the entity with its observations but no associated relations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The exact name of the entity to retrieve" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "graph_stats",
+    "description": "Return aggregate statistics about the knowledge graph: entity count, relation count, total observations, search index size, and interner utilization.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "search_relations",
+    "description": "Search for relations by optional from/to/relationType filters. Omitted or empty fields match all values.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "Filter by the source entity name (optional)" },
+        "to": { "type": "string", "description": "Filter by the target entity name (optional)" },
+        "relationType": { "type": "string", "description": "Filter by relation type (optional)" }
+      }
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "find_path",
+    "description": "Find the shortest path (via relations) between two entities using BFS. Returns the sequence of entity names connecting them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "The starting entity name" },
+        "to": { "type": "string", "description": "The target entity name" }
+      },
+      "required": ["from", "to"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "compact",
+    "description": "Trigger storage compaction: merge segments and drop tombstoned/superseded records to reclaim space. Safe to call periodically; runs in the background.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "get_neighbors",
+    "description": "Return the neighborhood of an entity: the entity plus all entities reachable within 'depth' hops, and the relations among them. Use this to expand context around a node in one call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The entity to expand around" },
+        "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Follow outgoing (out), incoming (in), or any (both) edges. Defaults to both." },
+        "relationType": { "type": "string", "description": "Only traverse/return relations of this type (optional)" },
+        "depth": { "type": "integer", "minimum": 0, "maximum": 16, "description": "Number of hops to expand (default 1)" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "describe_entity",
+    "description": "One-shot context bundle for a single entity: the entity with its observations, every incident relation, its distinct neighbor names, and its degree. Replaces a get_entity plus two search_relations calls.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The exact name of the entity to describe" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "list_entity_types",
+    "description": "List all distinct entity types present in the graph with their entity counts, ranked by count descending. Use to discover the schema of the memory before querying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "list_relation_types",
+    "description": "List all distinct relation types present in the graph with their counts, ranked by count descending.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "upsert_entities",
+    "description": "Create-or-merge entities idempotently. Entities that do not exist are created; existing entities keep their type and gain any new (deduplicated) observations. Use this to safely re-assert facts without losing new observations. entityType is only applied on creation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "The unique name of the entity" },
+              "entityType": { "type": "string", "description": "The type of the entity (applied only when creating)" },
+              "observations": { "type": "array", "items": { "type": "string" }, "description": "Observations to add (new ones are merged in)" }
+            },
+            "required": ["name", "entityType", "observations"]
+          }
+        }
+      },
+      "required": ["entities"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true }
+  },
+  {
+    "name": "export_graph",
+    "description": "Export the entire knowledge graph as text in the requested format: 'json' (entities and relations), 'mermaid' (a Mermaid graph diagram), or 'dot' (Graphviz DOT). Defaults to json.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "format": { "type": "string", "enum": ["json", "mermaid", "dot"], "description": "Output format (default json)" }
+      }
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "merge_entities",
+    "description": "Merge source entity into target in O(S + R) time where S = source observations and R = incident relations. Uses add_observations (dedup internally via HashSet) + batch create_relations (dedup via HashSet) + delete_entities. Self-loop relations (source → source becomes target → target) are dropped automatically. All three sub-operations write to the write-ahead log, so a replay from disk reconstructs the merge exactly. Use to collapse duplicate entities the LLM accidentally created.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string", "description": "Entity name to merge FROM (deleted after merge)" },
+        "target": { "type": "string", "description": "Entity name to merge INTO (receives observations + redirected relations)" }
+      },
+      "required": ["source", "target"]
+    },
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false }
+  },
+  {
+    "name": "extract_subgraph",
+    "description": "BFS-based subgraph extraction from N seed nodes out to depth d. Builds adjacency map once (O(R)) then expands BFS queue (worst-case O(V + E) for the reached subgraph). Returns entities and only those relations whose both endpoints are in the reached set. Uses ahash-backed AHashMap/AHashSet for hashing (not SipHash) to minimize per-operation latency. Replaces N serial get_neighbors calls (each O(R) for adjacency) with a single O(R + V) pass.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Seed entity names to expand around (nonexistent names are silently skipped)"
+        },
+        "depth": { "type": "integer", "minimum": 0, "maximum": 16, "description": "BFS expansion depth (0 returns only seeds, default 1)" }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "batch_get_entities",
+    "description": "O(N) batched entity lookup for N names, each resolved via the interned-name → sharded ctrl-byte name table (Swiss-table style, O(1) expected per lookup). Missing names yield null in the corresponding position. Cuts N serial get_entity round-trips (each with its own dispatch + JSON parse + JSON serialize overhead) down to one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Entity names to retrieve (order preserved, null for missing)"
+        }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "find_all_paths",
+    "description": "Exhaustive DFS with backtracking enumerating all simple paths between two entities up to maxDepth hops, capped at maxPaths. Worst-case O(b^d) where b = average branching factor and d = maxDepth; the maxPaths cap prevents combinatorial explosion. Each path is a Vec<String> of entity names inclusive of both endpoints. Unlike find_path (single BFS shortest path), this discovers alternative routes the LLM may not have considered.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "from": { "type": "string", "description": "Starting entity name" },
+        "to": { "type": "string", "description": "Target entity name" },
+        "maxDepth": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Max path length; DFS prunes beyond this bound (default 6, cost grows exponentially)" },
+        "maxPaths": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Stop after finding this many paths (default 50, prevents combinatorial explosion)" }
+      },
+      "required": ["from", "to"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "entity_exists",
+    "description": "Check whether each named entity exists, WITHOUT fetching its observations. Returns an array of booleans parallel to the input names. Use this for cheap de-duplication or presence checks before create/update — far lighter than get_entity/open_nodes, which transfer full records.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "names": { "type": "array", "items": { "type": "string" }, "description": "Entity names to test for existence" }
+      },
+      "required": ["names"]
+    },
+    "annotations": { "readOnlyHint": true }
+  },
+  {
+    "name": "degree",
+    "description": "Return the number of relations incident to an entity in the given direction, without enumerating the neighbors. Transfers only an integer — use it to decide whether to paginate a high-degree hub before calling get_neighbors.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "The entity whose degree to count" },
+        "direction": { "type": "string", "enum": ["in", "out", "both"], "description": "Which edges to count (default both)" }
+      },
+      "required": ["name"]
+    },
+    "annotations": { "readOnlyHint": true }
+  }
+]
